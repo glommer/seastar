@@ -183,8 +183,11 @@ io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
         auto pu = hwloc_get_pu_obj_by_os_index(topology, cpus[shard].cpu_id);
         auto node = hwloc_get_ancestor_obj_by_depth(topology, depth, pu);
         auto node_id = hwloc_bitmap_first(node->nodeset);
+        printf("NODE ID: %d\n", int(node_id));
         numa_nodes[node_id].push_back(shard);
     }
+
+    printf("NODES: %d\n", int(numa_nodes.size()));
 
     unsigned num_io_queues;
     unsigned max_io_requests;
@@ -223,6 +226,7 @@ io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
                 ret.coordinators[coordinator_idx].capacity =  std::max(max_io_requests / num_io_queues , 1u);
                 ret.coordinators[coordinator_idx].id = io_coordinator;
             }
+            printf("Shard: %d, coordinator %d\n", shard, io_coordinator);
         }
     }
     return ret;

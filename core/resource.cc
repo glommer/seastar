@@ -39,6 +39,7 @@ size_t calculate_memory(configuration c, size_t available_memory) {
 #ifdef HAVE_HWLOC
 
 #include "util/defer.hh"
+#include "core/print.hh"
 #include <hwloc.h>
 #include <unordered_map>
 
@@ -167,6 +168,94 @@ std::vector<cpu> allocate(configuration c) {
     return ret;
 }
 
+io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
+    unsigned num_io_queues;
+    unsigned max_io_requests;
+    if (c.io_queues) {
+        num_io_queues = *c.io_queues;
+    } else {
+        num_io_queues = cpus.size();
+    }
+    if (c.max_io_requests) {
+        max_io_requests = *c.max_io_requests;
+    } else {
+        max_io_requests = 128 * num_io_queues;
+    }
+
+    hwloc_topology_t topology;
+    hwloc_topology_init(&topology);
+    auto free_hwloc = defer([&] { hwloc_topology_destroy(topology); });
+    hwloc_topology_load(topology);
+    unsigned depth = find_memory_depth(topology);
+
+    // Not an unordered_multimap, so we can preserver ordering within mapped values
+    std::unordered_map<unsigned, std::vector<unsigned>> numa_nodes;
+    auto shard = int(cpus.size());
+    while (--shard >= 0) {
+        auto pu = hwloc_get_pu_obj_by_os_index(topology, cpus[shard].cpu_id);
+        auto node = hwloc_get_ancestor_obj_by_depth(topology, depth, pu);
+        auto node_id = hwloc_bitmap_first(node->nodeset);
+
+        if (numa_nodes.count(node_id) == 0) {
+            numa_nodes.emplace(node_id, std::vector<unsigned>());
+        }
+        numa_nodes.at(node_id).push_back(shard);
+    }
+
+    io_queue_topology ret;
+
+    ret.shard_to_coordinator.resize(cpus.size());
+    ret.coordinators.resize(num_io_queues);
+
+    // If we have more than one node, we will mandate at least one coordinator
+    // per node. It simplifies the coordinator assignment and in real scenarios
+    // we don't want to be passing things around to the other side of the box
+    // anyway. We could silently adjust, but it is better to avoid surprises.
+    if ((num_io_queues < numa_nodes.size()) || (num_io_queues > cpus.size())) {
+        auto msg = sprint("Invalid number of IO queues. Asked for %d. Minimum value is %d, maximum %d", num_io_queues, numa_nodes.size(), cpus.size());
+        throw std::runtime_error(std::move(msg));
+    }
+
+    // First step is to distribute the io coordinators among the NUMA nodes as
+    // equally as we can. We will do that by round robin assignment to the nodes.
+    unsigned node = 0;
+    std::unordered_map<unsigned, std::vector<unsigned>> node_coordinators;
+    for (auto cid = 0u; cid < num_io_queues; ++cid) {
+        unsigned node_id;
+        // This won't loop forever because we have already established that there are less
+        // io queues than processors.
+        do {
+            node_id = node++ % numa_nodes.size();
+        } while (numa_nodes[node_id].empty());
+        auto& curr_node = numa_nodes[node_id];
+
+        auto io_coordinator = curr_node.back();
+        curr_node.pop_back();
+
+        ret.shard_to_coordinator[io_coordinator] = io_coordinator;
+        ret.coordinators[cid].capacity =  std::max(max_io_requests / num_io_queues , 1u);
+        ret.coordinators[cid].id = io_coordinator;
+
+        if (node_coordinators.count(node_id) == 0) {
+            node_coordinators.emplace(node_id, std::vector<unsigned>());
+        }
+        node_coordinators.at(node_id).push_back(io_coordinator);
+    }
+
+    // If there are more processors than coordinators, we will have to assign them to existing
+    // coordinators. We always do that within the same NUMA node.
+    for (auto& node: numa_nodes) {
+        auto cid_idx = 0;
+        for (auto& remaining_shard: node.second) {
+            auto idx = cid_idx++ % node_coordinators.at(node.first).size();
+            auto io_coordinator = node_coordinators.at(node.first)[idx];
+            ret.shard_to_coordinator[remaining_shard] = io_coordinator;
+        }
+    }
+
+    return ret;
+}
+
 unsigned nr_processing_units() {
     hwloc_topology_t topology;
     hwloc_topology_init(&topology);
@@ -193,6 +282,29 @@ std::vector<cpu> allocate(configuration c) {
     ret.reserve(procs);
     for (unsigned i = 0; i < procs; ++i) {
         ret.push_back(cpu{i, {{mem / procs, 0}}});
+    }
+    return ret;
+}
+
+// Without hwloc, we don't support tuning the number of IO queues. So each CPU gets their.
+io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
+    io_queue_topology ret;
+
+    unsigned max_io_requests;
+    unsigned nr_cpus = unsigned(cpus.size());
+    if (c.max_io_requests) {
+        max_io_requests = *c.max_io_requests;
+    } else {
+        max_io_requests = 128 * nr_cpus;
+    }
+
+    ret.shard_to_coordinator.resize(nr_cpus);
+    ret.coordinators.resize(nr_cpus);
+
+    for (unsigned shard = 0; shard < nr_cpus; ++shard) {
+        ret.shard_to_coordinator[shard] = shard;
+        ret.coordinators[shard].capacity =  std::max(max_io_requests / nr_cpus, 1u);
+        ret.coordinators[shard].id = shard;
     }
     return ret;
 }

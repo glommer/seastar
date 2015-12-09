@@ -167,6 +167,67 @@ std::vector<cpu> allocate(configuration c) {
     return ret;
 }
 
+io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
+
+    hwloc_topology_t topology;
+    hwloc_topology_init(&topology);
+    auto free_hwloc = defer([&] { hwloc_topology_destroy(topology); });
+    hwloc_topology_load(topology);
+    unsigned depth = find_memory_depth(topology);
+
+    std::vector<std::vector<unsigned>> numa_nodes;
+    auto nr_nodes = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_NUMANODE);
+    numa_nodes.resize(nr_nodes ? nr_nodes : 1);
+
+    for (auto shard = 0ul; shard < cpus.size(); ++shard) {
+        auto pu = hwloc_get_pu_obj_by_os_index(topology, cpus[shard].cpu_id);
+        auto node = hwloc_get_ancestor_obj_by_depth(topology, depth, pu);
+        auto node_id = hwloc_bitmap_first(node->nodeset);
+        numa_nodes[node_id].push_back(shard);
+    }
+
+    unsigned num_io_queues;
+    unsigned max_io_requests;
+    if (c.io_queues) {
+        num_io_queues = *c.io_queues;
+    } else {
+        num_io_queues = cpus.size();
+    }
+    if (c.max_io_requests) {
+        max_io_requests = *c.max_io_requests;
+    } else {
+        max_io_requests = 128 * num_io_queues;
+    }
+
+    io_queue_topology ret;
+
+    ret.shard_to_coordinator.resize(cpus.size());
+    ret.coordinators.resize(num_io_queues);
+
+    for (auto nodenr = 0ul; nodenr < numa_nodes.size(); ++nodenr) {
+        auto& node = numa_nodes[nodenr];
+        auto node_io_queues = num_io_queues / numa_nodes.size();
+        auto remaining = num_io_queues % numa_nodes.size();
+        if (nodenr < remaining) {
+            node_io_queues++;
+        }
+
+        for (auto i = 0ul; i < node.size(); ++i) {
+            auto shard = node[i];
+            unsigned idx = unsigned(node.size() / node_io_queues);
+            unsigned coordinator_idx = (i / idx);
+            unsigned io_coordinator = node[idx * coordinator_idx];
+
+            ret.shard_to_coordinator[shard] = io_coordinator;
+            if (shard == io_coordinator) {
+                ret.coordinators[coordinator_idx].capacity =  std::max(max_io_requests / num_io_queues , 1u);
+                ret.coordinators[coordinator_idx].id = io_coordinator;
+            }
+        }
+    }
+    return ret;
+}
+
 unsigned nr_processing_units() {
     hwloc_topology_t topology;
     hwloc_topology_init(&topology);
@@ -193,6 +254,29 @@ std::vector<cpu> allocate(configuration c) {
     ret.reserve(procs);
     for (unsigned i = 0; i < procs; ++i) {
         ret.push_back(cpu{i, {{mem / procs, 0}}});
+    }
+    return ret;
+}
+
+// Without hwloc, we don't support tuning the number of IO queues. So each CPU gets their.
+io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
+    io_queue_topology ret;
+
+    unsigned max_io_requests;
+    unsigned nr_cpus = unsigned(cpus.size());
+    if (c.max_io_requests) {
+        max_io_requests = *c.max_io_requests;
+    } else {
+        max_io_requests = 128 * nr_cpus;
+    }
+
+    ret.shard_to_coordinator.resize(nr_cpus);
+    ret.coordinators.resize(nr_cpus);
+
+    for (unsigned shard = 0; shard < nr_cpus; ++shard) {
+        ret.shard_to_coordinator[shard] = shard;
+        ret.coordinators[shard].capacity =  std::max(max_io_requests / nr_cpus, 1u);
+        ret.coordinators[shard].id = shard;
     }
     return ret;
 }

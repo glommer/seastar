@@ -666,6 +666,37 @@ inline open_flags operator|(open_flags a, open_flags b) {
     return open_flags(static_cast<unsigned int>(a) | static_cast<unsigned int>(b));
 }
 
+class io_queue {
+    // The coordinator is the shard responsible for managing this io_queue. This is its shard_id.
+    unsigned _coordinator = 0;
+    size_t _capacity = -1;
+    size_t _pending_io = 0;
+    std::vector<unsigned> _io_topology;
+    semaphore _has_room;
+
+public:
+    io_queue(unsigned coordinator, size_t capacity, std::vector<unsigned> topology);
+
+    template <typename Func>
+    std::result_of_t<Func()> queue_request(size_t len, Func do_io);
+
+    size_t queued_requests() const {
+        return _has_room.waiters();
+    }
+
+    size_t pending_io() const {
+        return _pending_io;
+    }
+
+    unsigned coordinator() const {
+        return _coordinator;
+    }
+    unsigned coordinator_of_shard(unsigned shard) {
+        return _io_topology[shard];
+    }
+    friend class reactor;
+};
+
 class reactor {
 private:
     struct pollfn {
@@ -705,6 +736,10 @@ private:
     reactor_backend_epoll _backend;
 #endif
     std::vector<pollfn*> _pollers;
+
+    io_queue* _io_queue;
+    friend io_queue;
+
     static constexpr size_t max_aio = 128;
     std::vector<std::function<future<> ()>> _exit_funcs;
     unsigned _id = 0;
@@ -790,6 +825,18 @@ public:
     reactor(const reactor&) = delete;
     ~reactor();
     void operator=(const reactor&) = delete;
+
+    unsigned io_coordinator_of_shard(unsigned shard) {
+        return _io_queue->coordinator_of_shard(shard);
+    }
+
+    size_t pending_io() {
+        return _io_queue->_pending_io;
+    }
+
+    size_t queued_io_requests() {
+        return _io_queue->queued_requests();
+    }
 
     void configure(boost::program_options::variables_map config);
 

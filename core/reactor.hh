@@ -669,12 +669,27 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
+    using clock = std::chrono::steady_clock;
+
     shard_id _coordinator = 0;
     size_t _capacity = -1;
     size_t _pending_io = 0;
     std::vector<shard_id> _io_topology;
     semaphore _has_room;
 
+    unsigned _sampler = 0;
+    unsigned _llidx = 0;
+    std::array<uint32_t, 256> _latencies;
+
+    inline void update_latency(const clock::time_point& start) {
+        if (_sampler++ % 128) {
+            return;
+        }
+        _latencies[_llidx++ % _latencies.size()] = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - start).count();
+    }
+    bool should_sample() const {
+        return (_sampler % 128) == 0;
+    }
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 
@@ -694,6 +709,14 @@ public:
     }
     shard_id coordinator_of_shard(shard_id shard) {
         return _io_topology[shard];
+    }
+
+    // 100 * percentile.
+    // For instance, for 99.9 pass 9990
+    uint32_t query_latency(uint32_t percentile) {
+        auto arr = _latencies;
+        std::sort(arr.begin(), arr.end());
+        return arr[percentile * _latencies.size() / 10000];
     }
     friend class reactor;
 };

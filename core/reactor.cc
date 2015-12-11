@@ -557,11 +557,16 @@ std::result_of_t<Func()> io_queue::queue_request(size_t len, Func do_io) {
     return smp::submit_to(_coordinator, [len, do_io = std::move(do_io)] {
         auto& queue = *(engine()._io_queue);
         queue._pending_io += len;
+        clock::time_point start;
+        if (queue.should_sample()) {
+            start = clock::now();
+        }
         return queue._has_room.wait(1).then([do_io = std::move(do_io)] {
             return do_io();
-        }).finally([&queue, len] {
+        }).finally([&queue, len, start] {
             queue._pending_io -= len;
             queue._has_room.signal(1);
+            queue.update_latency(start);
         });
     });
 }

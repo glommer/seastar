@@ -263,6 +263,12 @@ io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
         assert(0);
     };
 
+    std::set<unsigned> cpu_ids;
+    for (auto& c: cpus) {
+        cpu_ids.insert(c.cpu_id);
+    }
+    topology.restrict_to_cpus(cpu_ids);
+
     auto cpu_sets = topology.distribute_among_cpus(num_io_queues);
     // First step: distribute the IO queues given the information returned in cpu_sets.
     // If there is one IO queue per processor, only this loop will be executed.

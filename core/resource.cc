@@ -101,18 +101,31 @@ struct distribute_objects {
     }
 };
 
-std::vector<cpu> allocate(configuration c) {
-    hwloc_topology_t topology;
-    hwloc_topology_init(&topology);
-    auto free_hwloc = defer([&] { hwloc_topology_destroy(topology); });
-    hwloc_topology_load(topology);
-    if (c.cpu_set) {
+struct hardware_topology {
+    hwloc_topology_t _topology;
+
+    hardware_topology() {
+        hwloc_topology_init(&_topology);
+        hwloc_topology_load(_topology);
+    }
+
+    ~hardware_topology() {
+        hwloc_topology_destroy(_topology);
+    }
+
+    // FIXME: We should move the C operations inside this class instead
+    // of exposing it this way.
+    hwloc_topology_t& operator()() {
+        return _topology;
+    }
+
+    void restrict_to_cpus(const resource::cpuset& cpuset) {
         auto bm = hwloc_bitmap_alloc();
         auto free_bm = defer([&] { hwloc_bitmap_free(bm); });
-        for (auto idx : *c.cpu_set) {
+        for (auto idx: cpuset) {
             hwloc_bitmap_set(bm, idx);
         }
-        auto r = hwloc_topology_restrict(topology, bm,
+        auto r = hwloc_topology_restrict(_topology, bm,
                 HWLOC_RESTRICT_FLAG_ADAPT_DISTANCES
                 | HWLOC_RESTRICT_FLAG_ADAPT_MISC
                 | HWLOC_RESTRICT_FLAG_ADAPT_IO);
@@ -126,13 +139,24 @@ std::vector<cpu> allocate(configuration c) {
             abort();
         }
     }
-    auto machine_depth = hwloc_get_type_depth(topology, HWLOC_OBJ_MACHINE);
-    assert(hwloc_get_nbobjs_by_depth(topology, machine_depth) == 1);
-    auto machine = hwloc_get_obj_by_depth(topology, machine_depth, 0);
+
+    distribute_objects distribute_among_cpus(size_t nobjs) {
+        return distribute_objects(_topology, nobjs);
+    }
+};
+
+std::vector<cpu> allocate(configuration c) {
+    hardware_topology topology;
+    if (c.cpu_set) {
+        topology.restrict_to_cpus(*c.cpu_set);
+    }
+    auto machine_depth = hwloc_get_type_depth(topology(), HWLOC_OBJ_MACHINE);
+    assert(hwloc_get_nbobjs_by_depth(topology(), machine_depth) == 1);
+    auto machine = hwloc_get_obj_by_depth(topology(), machine_depth, 0);
     auto available_memory = machine->memory.total_memory;
     // hwloc doesn't account for kernel reserved memory, so set panic_factor = 2
     size_t mem = calculate_memory(c, available_memory, 2);
-    unsigned available_procs = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_PU);
+    unsigned available_procs = hwloc_get_nbobjs_by_type(topology(), HWLOC_OBJ_PU);
     unsigned procs = c.cpus.value_or(available_procs);
     if (procs > available_procs) {
         throw std::runtime_error("insufficient processing units");
@@ -143,36 +167,36 @@ std::vector<cpu> allocate(configuration c) {
     std::unordered_map<hwloc_obj_t, size_t> topo_used_mem;
     std::vector<std::pair<cpu, size_t>> remains;
     size_t remain;
-    unsigned depth = find_memory_depth(topology);
+    unsigned depth = find_memory_depth(topology());
 
-    auto cpu_sets = distribute_objects(topology, procs);
+    auto cpu_sets = topology.distribute_among_cpus(procs);
 
     // Divide local memory to cpus
     for (auto&& cs : cpu_sets()) {
         auto cpu_id = hwloc_bitmap_first(cs);
         assert(cpu_id != -1);
-        auto pu = hwloc_get_pu_obj_by_os_index(topology, cpu_id);
-        auto node = hwloc_get_ancestor_obj_by_depth(topology, depth, pu); 
+        auto pu = hwloc_get_pu_obj_by_os_index(topology(), cpu_id);
+        auto node = hwloc_get_ancestor_obj_by_depth(topology(), depth, pu);
         cpu this_cpu;
         this_cpu.cpu_id = cpu_id;
         remain = mem_per_proc - alloc_from_node(this_cpu, node, topo_used_mem, mem_per_proc);
 
-        remains.emplace_back(std::move(this_cpu), remain); 
+        remains.emplace_back(std::move(this_cpu), remain);
     }
 
     // Divide the rest of the memory
     for (auto&& r : remains) {
         cpu this_cpu;
-        size_t remain; 
+        size_t remain;
         std::tie(this_cpu, remain) = r;
-        auto pu = hwloc_get_pu_obj_by_os_index(topology, this_cpu.cpu_id);
-        auto node = hwloc_get_ancestor_obj_by_depth(topology, depth, pu); 
+        auto pu = hwloc_get_pu_obj_by_os_index(topology(), this_cpu.cpu_id);
+        auto node = hwloc_get_ancestor_obj_by_depth(topology(), depth, pu);
         auto obj = node;
 
         while (remain) {
             remain -= alloc_from_node(this_cpu, obj, topo_used_mem, remain);
             do {
-                obj = hwloc_get_next_obj_by_depth(topology, depth, obj);
+                obj = hwloc_get_next_obj_by_depth(topology(), depth, obj);
             } while (!obj);
             if (obj == node)
                 break;
@@ -187,15 +211,12 @@ io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
     unsigned num_io_queues = c.io_queues.value_or(cpus.size());
     unsigned max_io_requests = c.max_io_requests.value_or(128 * num_io_queues);
 
-    hwloc_topology_t topology;
-    hwloc_topology_init(&topology);
-    auto free_hwloc = defer([&] { hwloc_topology_destroy(topology); });
-    hwloc_topology_load(topology);
-    unsigned depth = find_memory_depth(topology);
+    hardware_topology topology;
+    unsigned depth = find_memory_depth(topology());
 
     auto node_of_shard = [&topology, &cpus, &depth] (unsigned shard) {
-        auto pu = hwloc_get_pu_obj_by_os_index(topology, cpus[shard].cpu_id);
-        auto node = hwloc_get_ancestor_obj_by_depth(topology, depth, pu);
+        auto pu = hwloc_get_pu_obj_by_os_index(topology(), cpus[shard].cpu_id);
+        auto node = hwloc_get_ancestor_obj_by_depth(topology(), depth, pu);
         return hwloc_bitmap_first(node->nodeset);
     };
 
@@ -242,7 +263,7 @@ io_queue_topology allocate_io_queues(configuration c, std::vector<cpu> cpus) {
         assert(0);
     };
 
-    auto cpu_sets = distribute_objects(topology, num_io_queues);
+    auto cpu_sets = topology.distribute_among_cpus(num_io_queues);
     // First step: distribute the IO queues given the information returned in cpu_sets.
     // If there is one IO queue per processor, only this loop will be executed.
     std::unordered_map<unsigned, std::vector<unsigned>> node_coordinators;

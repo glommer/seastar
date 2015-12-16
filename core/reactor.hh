@@ -522,12 +522,33 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
+    using clock = std::chrono::steady_clock;
+
     shard_id _coordinator;
     size_t _capacity;
     size_t _pending_io = 0;
     std::vector<shard_id> _io_topology;
     semaphore _has_room;
 
+    unsigned _sampler = 0;
+    // Exponential Moving Average over time. This smooths our latency samplings.
+    uint64_t _avg_latency;
+    clock::time_point _last_latency_at;
+
+    inline std::experimental::optional<clock::time_point> start_latency() {
+        if ((_sampler++ % 128) == 0) {
+            return clock::now();
+        } else {
+            return {};
+        }
+    }
+    // Save a function call when we are not sampling
+    void do_update_latency(const clock::time_point& start);
+    inline void update_latency(const std::experimental::optional<clock::time_point>& start) {
+        if (start) {
+            do_update_latency(*start);
+        }
+    }
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 
@@ -548,6 +569,9 @@ public:
     }
     shard_id coordinator_of_shard(shard_id shard) const {
         return _io_topology[shard];
+    }
+    uint64_t mavg_latency() const {
+        return _avg_latency;
     }
     friend class reactor;
 };

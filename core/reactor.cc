@@ -587,7 +587,22 @@ io_queue::io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> 
         , _capacity(capacity)
         , _io_topology(std::move(topology))
         , _has_room(capacity)
+        , _last_latency_at(clock::now())
 {}
+
+void
+io_queue::do_update_latency(const clock::time_point& start) {
+    auto now = clock::now();
+    auto delta = std::chrono::duration_cast<std::chrono::microseconds>(now - _last_latency_at).count();
+    auto curr_latency = std::chrono::duration_cast<std::chrono::microseconds>(now - start).count();
+
+    // This is alpha(delta) = Kexp(-Tau * delta), with K = 1 and Tau = 7 * 10^-7
+    // Those parameters are chosen so that alpha will reach one after one second.
+    auto alpha = std::exp(-0.0000007 * delta);
+
+    _avg_latency = uint64_t(alpha * _avg_latency + (1 - alpha) * curr_latency);
+    _last_latency_at = std::move(now);
+}
 
 template <typename Func>
 future<io_event>
@@ -595,8 +610,12 @@ io_queue::queue_request(shard_id coordinator, size_t len, Func prepare_io) {
     return smp::submit_to(coordinator, [len, prepare_io = std::move(prepare_io)] {
         auto& queue = *(engine()._io_queue);
         queue._pending_io += len;
-        return queue._has_room.wait(1).then([prepare_io = std::move(prepare_io)] {
-            return engine().submit_io(std::move(prepare_io));
+        return queue._has_room.wait(1).then([&queue, prepare_io = std::move(prepare_io)] {
+            auto start = queue.start_latency();
+            return engine().submit_io(std::move(prepare_io)).then([&queue, start = std::move(start)] (auto ev) {
+                queue.update_latency(start);
+                return make_ready_future<io_event>(std::move(ev));
+            });
         }).finally([&queue, len] {
             queue._pending_io -= len;
             queue._has_room.signal(1);
@@ -1235,6 +1254,11 @@ reactor::register_collectd_metrics() {
                     , "gauge", "queued-io-requests")
                     , scollectd::make_typed(scollectd::data_type::GAUGE,
                         [this] { return _io_queue->queued_requests(); } )
+            ),
+            scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
+                    , scollectd::per_cpu_plugin_instance
+                    , "gauge", "mavg-io-latency")
+                    , scollectd::make_typed(scollectd::data_type::GAUGE, _io_queue->_avg_latency)
             ),
             // total_operations value:DERIVE:0:U
             scollectd::add_polled_metric(scollectd::type_instance_id("reactor"

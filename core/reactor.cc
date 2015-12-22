@@ -590,14 +590,67 @@ io_queue::io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> 
         , _has_room(capacity)
 {}
 
+io_queue::kalman::pred
+io_queue::kalman::predict(int64_t u_req, int64_t u_size) const {
+    pred pred;
+    pred.x = F * x_est + B_req * u_req + B_size * u_size;
+    // Pp = F * Pe * F^(T)
+    pred.P = F * P_est * F + Q;
+    if (pred.x < 0) {
+        pred.x = B_req + B_size;
+    }
+    return pred;
+}
+
+void
+io_queue::kalman::measure(io_queue::kalman::pred pred, uint64_t z) {
+    auto inno = z - H * pred.x;
+    // Sk = H * Pp * H^(T)
+    auto Sk = H * pred.P * H + R;
+    // K = H * H^(T) * S^(-1)
+    auto K = (pred.P * H) / Sk;
+    x_est = pred.x + K * inno;
+    P_est = (1 - K * H) * pred.P;
+}
+
+int64_t
+io_queue::kalman_u_req() const {
+    uint64_t cur_req = _capacity - _has_room.current();
+    return cur_req - _req_pending;
+}
+
+int64_t
+io_queue::kalman_u_size(uint64_t len) const {
+    uint64_t cur_pages = len / 4096ul;
+    return cur_pages - _last_pages;
+}
+
+void
+io_queue::do_update_latency(size_t len, const clock::time_point& start) {
+    int64_t u_req = kalman_u_req();
+    _req_pending += u_req;
+
+    auto u_size = kalman_u_size(len);
+    _last_pages += u_size;
+
+    auto pred = _kalman_state.predict(u_req, u_size);
+
+    auto z = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - start).count();
+    _kalman_state.measure(std::move(pred), z);
+}
+
 template <typename Func>
 future<io_event>
 io_queue::queue_request(shard_id coordinator, size_t len, Func prepare_io) {
     return smp::submit_to(coordinator, [len, prepare_io = std::move(prepare_io)] {
         auto& queue = *(engine()._io_queue);
         queue._pending_io += len;
-        return queue._has_room.wait(1).then([prepare_io = std::move(prepare_io)] {
-            return engine().submit_io(std::move(prepare_io));
+        return queue._has_room.wait(1).then([&queue, len, prepare_io = std::move(prepare_io)] {
+            auto start = queue.start_latency();
+            return engine().submit_io(std::move(prepare_io)).then([len, &queue, start = std::move(start)] (auto ev) {
+                queue.update_latency(len, start);
+                return make_ready_future<io_event>(std::move(ev));
+            });
         }).finally([&queue, len] {
             queue._pending_io -= len;
             queue._has_room.signal(1);
@@ -1237,6 +1290,13 @@ reactor::register_collectd_metrics() {
                     , scollectd::make_typed(scollectd::data_type::GAUGE,
                         [this] { return _io_queue->queued_requests(); } )
             ),
+            scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
+                    , scollectd::per_cpu_plugin_instance
+                    , "gauge", "avg-io-latency")
+                    , scollectd::make_typed(scollectd::data_type::GAUGE,
+                        [this] { return _io_queue->avg_latency(128ul << 10); })
+            ),
+
             // total_operations value:DERIVE:0:U
             scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
                     , scollectd::per_cpu_plugin_instance
@@ -1423,6 +1483,7 @@ class reactor::aio_batch_submit_pollfn final : public reactor::pollfn {
 public:
     aio_batch_submit_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() final override {
+        _r._io_queue->should_resample(_r._id);
         return _r.flush_pending_aio();
     }
     virtual bool try_enter_interrupt_mode() override {

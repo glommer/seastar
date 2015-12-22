@@ -522,12 +522,104 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
+    using clock = std::chrono::steady_clock;
     shard_id _coordinator;
     size_t _capacity;
     size_t _pending_io = 0;
     std::vector<shard_id> _io_topology;
     semaphore _has_room;
 
+    uint64_t _do_sample = 0;
+    bool _resample_latency = false;
+
+    // Kalman filter determination of current disk latency (in microseconds)
+    //
+    // This is a standard single-variable implementation of the Kalman filter. We are only
+    // measuring the latency of the request, and assuming the prediction parameters to be constant.
+    //
+    // In reality, each disk will have a different one, and we could measure those as well. However,
+    // doing them in a single-step MIMO filter complicates the model significantly.
+    //
+    // It is assumed here that the disk latency increases linearly as the number of outstanding
+    // requests increase. That is not true in general but since we will try our best by tuning the
+    // IO queue capacity to stay in the beginning of the latency curve, it will be close enough to
+    // the truth for that region.
+    //
+    // We also assume that bigger requests are linearly more expensive. This is also not true, but
+    // is at least a coarse way to tell the predictor that we are expecting a lower / bigger latency
+    // due to changing size.
+    //
+    // With those in mind, the predictor model will be:
+    //
+    //      x_k = F * x_{k-1} + [B_{req} B_{size}] * [u_req u_size]' + N(0, Q),
+    //
+    // with u_req and u_size representing the delta in the number of outstanding request and IO size
+    // (in 4k pages) since the last sampling, while the measurement adjustment will be:
+    //
+    //      z_k = H * x_k + N(0, R).
+    //
+    // During steady state, the control input is not expected to change, and the filter models a latency
+    // that is expected to remain constant (H = F = 1). This is yet another reason why the linear
+    // approximations for the B matrix should work.
+    //
+    // See comments below for the selection of each parameter
+    struct kalman {
+        struct pred {
+            float x;
+            float P;
+        };
+
+        // R represents the measurement covariance, and Q, the model covariance. Both are made large,
+        // because disks are erratic (measurement), and highly different in its characteristics (model).
+        //
+        // Still, we want the confidence on the model to be higher, so that we are not as sensitive to
+        // spikes.
+        float R = 4;
+        float Q = 1;
+        // Those are the multipliers to the control input vector. Those are educated guesses based on
+        // an average SSD.
+        float B_req = 30;
+        float B_size = 50;
+        // latency doesn't change during steady state
+        float F = 1;
+        // H is measure to prediction transformation matrix. What we see is what we get.
+        float H = 1;
+
+        float P_est = 200;
+        float x_est = 60;
+
+        pred predict(int64_t u_req, int64_t u_size) const;
+        void measure(pred pred, uint64_t z);
+    } _kalman_state;
+
+    // Used to determine the control input
+    uint64_t _req_pending = 0;
+    uint64_t _last_pages = 0;
+
+    int64_t kalman_u_req() const ;
+    int64_t kalman_u_size(uint64_t len) const;
+
+    void should_resample(shard_id who) {
+        if ((_coordinator == who) && (_do_sample++ % 4) == 0) {
+            _resample_latency = true;
+        }
+    }
+
+    inline std::experimental::optional<clock::time_point> start_latency() {
+        if (_resample_latency) {
+            return clock::now();
+        } else {
+            return {};
+        }
+    }
+    // Save a function call when we are not sampling
+    void do_update_latency(size_t len, const clock::time_point& start);
+    inline void update_latency(size_t len, const std::experimental::optional<clock::time_point>& start) {
+        if (start) {
+            _resample_latency = false;
+            do_update_latency(len, *start);
+        }
+    }
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 
@@ -548,6 +640,10 @@ public:
     }
     shard_id coordinator_of_shard(shard_id shard) const {
         return _io_topology[shard];
+    }
+    uint64_t avg_latency(size_t len) const {
+        auto pred = _kalman_state.predict(kalman_u_req(), kalman_u_size(len));
+        return pred.x;
     }
     friend class reactor;
 };

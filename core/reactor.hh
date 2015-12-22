@@ -620,6 +620,13 @@ class io_queue {
             do_update_latency(len, *start);
         }
     }
+
+    // If we have queued requests, flush so we can make room for more.
+    // If we are sampling latency of this request, flush so that we won't add
+    // Seastar polling latency to the figure.
+    bool force_aio_flush() const {
+        return (queued_requests() > 0) || _resample_latency;
+    }
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 

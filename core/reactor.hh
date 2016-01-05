@@ -61,6 +61,7 @@
 #include "circular_buffer.hh"
 #include "file.hh"
 #include "semaphore.hh"
+#include "fair_queue.hh"
 #include "core/scattered_message.hh"
 #include "core/enum.hh"
 #include <boost/range/irange.hpp>
@@ -522,21 +523,40 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
+public:
+    using io_priority_class_handle = unsigned;
+    static io_priority_class_handle default_priority_class;
+private:
+    static std::atomic<io_priority_class_handle> all_priority_classes;
+    static std::array<std::atomic<uint32_t>, 32> all_classes_shares;
+
     shard_id _coordinator;
     size_t _capacity;
     size_t _pending_io = 0;
     std::vector<shard_id> _io_topology;
-    semaphore _has_room;
+    using priority_class_shard_map = std::unordered_map<shard_id, priority_class*>;
+    std::unordered_map<io_priority_class_handle, priority_class_shard_map> _priority_classes;
+    lw_shared_ptr<fair_queue> _fq;
 
+    void register_one_priority_class(io_priority_class_handle h, uint32_t shares) {
+        // We will register one queue for each shard that is served by this IO queue
+        _priority_classes.emplace(h, priority_class_shard_map());
+        for (shard_id c = 0; c < shard_id(_io_topology.size()); ++c) {
+            if (_io_topology[c] == _coordinator) {
+                auto& pc = _fq->register_priority_class(1);
+                _priority_classes[h].emplace(c, &pc);
+            }
+        }
+    }
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 
     template <typename Func>
     static future<io_event>
-    queue_request(shard_id coordinator, size_t len, Func do_io);
+    queue_request(shard_id coordinator, priority_class& pc, size_t len, Func do_io);
 
     size_t queued_requests() const {
-        return _has_room.waiters();
+        return _fq->waiters();
     }
 
     size_t pending_io() const {
@@ -549,6 +569,18 @@ public:
     shard_id coordinator_of_shard(shard_id shard) const {
         return _io_topology[shard];
     }
+
+    priority_class& priority_class_of_shard(io_priority_class_handle h, shard_id shard) {
+        // We will use .at() here instead of the [] operator to guarantee that we
+        // always throw in case somebody asks for a non-existent class.
+        return *_priority_classes.at(h).at(shard);
+    }
+
+    unsigned capacity(priority_class& pc) const {
+        return _fq->capacity(pc);
+    }
+
+    static const io_priority_class_handle register_io_priority_class(uint32_t shares);
     friend class reactor;
 };
 
@@ -729,6 +761,10 @@ public:
 
     const io_queue& get_io_queue() const {
         return *_io_queue;
+    }
+
+    ::priority_class& priority_class(const io_queue::io_priority_class_handle& h) {
+        return _io_queue->priority_class_of_shard(h, cpu_id());
     }
 
     void configure(boost::program_options::variables_map config);

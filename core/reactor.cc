@@ -606,7 +606,8 @@ io_queue::queue_request(shard_id coordinator, size_t len, Func prepare_io) {
 }
 
 posix_file_impl::posix_file_impl(int fd, file_open_options options)
-        : _fd(fd) {
+        : _fd(fd)
+        , _io_priority_class(options.io_priority_class) {
     query_dma_alignment();
 }
 

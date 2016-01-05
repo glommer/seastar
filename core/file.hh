@@ -27,6 +27,7 @@
 #include "core/shared_ptr.hh"
 #include "core/align.hh"
 #include "core/future-util.hh"
+#include "core/fair_queue.hh"
 #include <experimental/optional>
 #include <system_error>
 #include <sys/stat.h>
@@ -78,6 +79,8 @@ struct directory_entry {
 /// \ref file
 struct file_open_options {
     uint64_t extent_allocation_size_hint = 1 << 20; ///< Allocate this much disk space when extending the file
+    priority_class* io_priority_class;
+    file_open_options(priority_class* pclass): io_priority_class(pclass) {}
 };
 
 /// \cond internal
@@ -108,6 +111,7 @@ public:
 class posix_file_impl : public file_impl {
 public:
     int _fd;
+    priority_class *_io_priority_class;
     posix_file_impl(int fd, file_open_options options);
     virtual ~posix_file_impl() override;
     future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len);

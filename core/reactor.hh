@@ -61,6 +61,7 @@
 #include "circular_buffer.hh"
 #include "file.hh"
 #include "semaphore.hh"
+#include "fair_queue.hh"
 #include "core/scattered_message.hh"
 #include "core/enum.hh"
 #include <boost/range/irange.hpp>
@@ -522,21 +523,29 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
+private:
     shard_id _coordinator;
     size_t _capacity;
     size_t _pending_io = 0;
     std::vector<shard_id> _io_topology;
-    semaphore _has_room;
 
+    std::unordered_map<unsigned, priority_class_ptr> _priority_classes;
+    lw_shared_ptr<fair_queue> _fq;
+
+    static constexpr int max_classes = 1024;
+    static std::atomic<int> registered_class;
+    static std::array<std::atomic<int>, max_classes> registered_shares;
+
+    static unsigned register_one_priority_class(uint32_t shares);
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 
     template <typename Func>
     static future<io_event>
-    queue_request(shard_id coordinator, size_t len, Func do_io);
+    queue_request(shard_id coordinator, unsigned pc, size_t len, Func do_io);
 
     size_t queued_requests() const {
-        return _has_room.waiters();
+        return _fq->waiters();
     }
 
     size_t pending_io() const {
@@ -730,6 +739,10 @@ public:
 
     const io_queue& get_io_queue() const {
         return *_io_queue;
+    }
+
+    unsigned register_one_priority_class(uint32_t shares) {
+        return io_queue::register_one_priority_class(shares);
     }
 
     void configure(boost::program_options::variables_map config);

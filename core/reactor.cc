@@ -553,12 +553,19 @@ reactor::flush_pending_aio() {
     return did_work;
 }
 
+unsigned default_priority_class() {
+    static thread_local auto shard_default_class = [] {
+        return engine().register_one_priority_class(1);
+    }();
+    return shard_default_class;
+}
+
 template <typename Func>
 future<io_event>
 reactor::submit_io_read(size_t len, Func prepare_io) {
     ++_aio_reads;
     _aio_read_bytes += len;
-    return io_queue::queue_request(_io_coordinator, len, std::move(prepare_io));
+    return io_queue::queue_request(_io_coordinator, default_priority_class(), len, std::move(prepare_io));
 }
 
 template <typename Func>
@@ -566,7 +573,7 @@ future<io_event>
 reactor::submit_io_write(size_t len, Func prepare_io) {
     ++_aio_writes;
     _aio_write_bytes += len;
-    return io_queue::queue_request(_io_coordinator, len, std::move(prepare_io));
+    return io_queue::queue_request(_io_coordinator, default_priority_class(), len, std::move(prepare_io));
 }
 
 bool reactor::process_io()
@@ -588,20 +595,37 @@ io_queue::io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> 
         : _coordinator(coordinator)
         , _capacity(capacity)
         , _io_topology(std::move(topology))
-        , _has_room(capacity)
-{}
+        , _priority_classes()
+        , _fq(make_lw_shared<fair_queue>(capacity)) {
+}
+
+std::atomic<int> io_queue::registered_class = {0};
+std::array<std::atomic<int>, io_queue::max_classes> io_queue::registered_shares;
+
+unsigned io_queue::register_one_priority_class(uint32_t shares) {
+    auto ret = registered_class.fetch_add(1, std::memory_order_relaxed);
+    registered_shares.at(ret).store(shares, std::memory_order_relaxed);
+    return ret;
+}
 
 template <typename Func>
 future<io_event>
-io_queue::queue_request(shard_id coordinator, size_t len, Func prepare_io) {
-    return smp::submit_to(coordinator, [len, prepare_io = std::move(prepare_io)] {
+io_queue::queue_request(shard_id coordinator, unsigned pc, size_t len, Func prepare_io) {
+    return smp::submit_to(coordinator, [pc, len, prepare_io = std::move(prepare_io)] {
         auto& queue = *(engine()._io_queue);
         queue._pending_io += len;
-        return queue._has_room.wait(1).then([prepare_io = std::move(prepare_io)] {
+        unsigned weight = 1 + len/(16 << 10);
+        // First time will hit here, and then we create the class. It is important
+        // that we create the shared pointer in the same shard it will be used at later.
+        if (queue._priority_classes.count(pc)) {
+            auto shares = registered_shares.at(pc).load(std::memory_order_relaxed);
+            queue._priority_classes.emplace(pc, queue._fq->register_priority_class(shares));
+        }
+        auto priority_class = queue._priority_classes.at(pc);
+        return queue._fq->queue(priority_class, weight, [prepare_io = std::move(prepare_io)] {
             return engine().submit_io(std::move(prepare_io));
         }).finally([&queue, len] {
             queue._pending_io -= len;
-            queue._has_room.signal(1);
         });
     });
 }

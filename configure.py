@@ -262,6 +262,7 @@ core = [
     'core/app-template.cc',
     'core/thread.cc',
     'core/dpdk_rte.cc',
+    'core/fair_queue.cc',
     'util/conversions.cc',
     'net/packet.cc',
     'net/posix-stack.cc',

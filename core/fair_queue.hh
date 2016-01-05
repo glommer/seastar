@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <experimental/optional>
 
-/// \addtogroup fiber-module
+/// \addtogroup io-module
 /// @{
 class priority_class;
 using priority_class_ptr = lw_shared_ptr<priority_class>;
@@ -28,15 +28,15 @@ public:
 /// \brief Fair queuing class
 ///
 /// This is a fair queue, allowing multiple consumers to queue requests
-/// that will then be served proportionally to their \ref power.
+/// that will then be served proportionally to their \ref shares.
 ///
 /// The user of this interface is expected to register multiple \ref priority_class
-/// objects, which will each have a \ref power attribute. The queue will then
-/// serve requests proportionally to \ref power divided by the sum of all powers for
+/// objects, which will each have a \ref shares attribute. The queue will then
+/// serve requests proportionally to \ref shares divided by the sum of all shares for
 /// all classes registered against this queue.
 ///
 /// Each priority class keeps a separate queue of requests. Requests pertaining to
-/// a class can go through even if they are over its \ref power limit, provided that
+/// a class can go through even if they are over its \ref shares limit, provided that
 /// the other classes have empty queues.
 ///
 /// When the queues that lag behind start seeing requests, the fair queue will serve
@@ -48,44 +48,35 @@ public:
 struct fair_queue : public enable_lw_shared_from_this<fair_queue> {
     friend priority_class;
 private:
-    struct qh_compare {
+    struct class_compare {
         bool operator() (const lw_shared_ptr<priority_class>& lhs, const lw_shared_ptr<priority_class>&rhs) const;
     };
 
     semaphore _sem;
-    uint64_t _total_ops = 0;
-    uint64_t _total_power = 0;
+    uint64_t _total_shares = 0;
     timer<> _bandwidth_timer;
-    using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, qh_compare>;
+    using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
 
 private:
     void refill_heap(prioq::container_type scanned);
 
     // Those operations only happen through the priority_class
-    void execute_one();
+    void execute_one(unsigned weight);
     void finish_one() {
         _sem.signal();
     }
 
     void reset_stats();
 public:
-    /// Constructs a fair queue with a given \c capacity, that balances requests over
-    /// \c period milliseconds (the queue resolution).
-    ///
-    /// \param capacity how many concurrent requests are allowed in this queue.
-    /// \param period over how much time (in milliseconds) the queue is expected to balance.
-    fair_queue(int capacity, std::experimental::optional<std::chrono::milliseconds> period) : _sem(capacity)
-                             , _bandwidth_timer([this] { reset_stats(); }) {
-        if (period) {
-            _bandwidth_timer.arm_periodic(*period);
-        }
-    }
     /// Constructs a fair queue with a given \c capacity, with a resolution
-    /// of 100 miliseconds
+    /// of 20 miliseconds
     ///
     /// \param capacity how many concurrent requests are allowed in this queue.
-    fair_queue(int capacity) : fair_queue(capacity, std::chrono::milliseconds(100)) {}
+    explicit fair_queue(int capacity) : _sem(capacity)
+                                      , _bandwidth_timer([this] { reset_stats(); }) {
+        _bandwidth_timer.arm_periodic(std::chrono::milliseconds(20));
+    }
 
     /// Registers a priority class against this queue.
     ///
@@ -106,8 +97,9 @@ public:
 ///
 /// \related fair_queue
 class priority_class {
-    uint32_t _power = 0;
-    uint32_t _ops = 0;
+    uint32_t _shares = 0;
+    float _ops = 0;
+    float _weight = 0;
     lw_shared_ptr<fair_queue> _fq;
     friend fair_queue;
     std::queue<promise<>> _queue;
@@ -118,23 +110,23 @@ public:
     ///
     /// Calling this method for a queue that is already configured will throw \ref
     /// misconfigured_queue exception.
-    void associate_queue(lw_shared_ptr<fair_queue> qh) {
+    void associate_queue(lw_shared_ptr<fair_queue> fq) {
         if (_fq) {
             throw misconfigured_queue("fair queue already bound.");
         }
-        _fq = qh;
+        _fq = fq;
     }
 
-    /// Constructs a priority class with a given \c power
-    priority_class(uint32_t power) : _power(power), _fq(nullptr) {}
+    /// Constructs a priority class with a given \c shares
+    explicit priority_class(uint32_t shares) : _shares(shares), _fq(nullptr) {}
 
-    /// Executes the function \c func through this class' \ref fair_queue.
+    /// Executes the function \c func through this class' \ref fair_queue, consuming \c weight
     ///
     /// \throw misconfigured_queue exception if called for an unbound queue
     ///
     /// \return whatever \c func returns
     template <typename Func>
-    std::result_of_t<Func()> queue(Func func) {
+    std::result_of_t<Func()> queue(unsigned weight, Func func) {
         if (!_fq) {
             throw misconfigured_queue("Not bound to any fair queue.");
         }
@@ -142,7 +134,7 @@ public:
         promise<> pr;
         auto fut = pr.get_future();
         _queue.push(std::move(pr));
-        _fq->execute_one();
+        _fq->execute_one(weight);
         return fut.then([func = std::move(func)] {
             return func();
         }).finally([this] {

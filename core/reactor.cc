@@ -587,20 +587,27 @@ io_queue::io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> 
         : _coordinator(coordinator)
         , _capacity(capacity)
         , _io_topology(std::move(topology))
-        , _has_room(capacity)
-{}
+        , _idle_classes()
+        , _fq(make_lw_shared<fair_queue>(capacity)) {
+    for (shard_id c = 0; c < shard_id(_io_topology.size()); ++c) {
+        if (_io_topology[c] == coordinator) {
+            auto pc = make_lw_shared<priority_class>(1);
+            _idle_classes.emplace(c, pc);
+            _fq->register_priority_class(pc);
+        }
+    }
+}
 
 template <typename Func>
 future<io_event>
-io_queue::queue_request(shard_id coordinator, size_t len, Func prepare_io) {
-    return smp::submit_to(coordinator, [len, prepare_io = std::move(prepare_io)] {
+io_queue::queue_request(shard_id coordinator, priority_class *pc, size_t len, Func prepare_io) {
+    return smp::submit_to(coordinator, [pc, len, prepare_io = std::move(prepare_io)] {
         auto& queue = *(engine()._io_queue);
         queue._pending_io += len;
-        return queue._has_room.wait(1).then([prepare_io = std::move(prepare_io)] {
+        return pc->queue([prepare_io = std::move(prepare_io)] {
             return engine().submit_io(std::move(prepare_io));
         }).finally([&queue, len] {
             queue._pending_io -= len;
-            queue._has_room.signal(1);
         });
     });
 }
@@ -677,6 +684,11 @@ posix_file_impl::read_dma(uint64_t pos, std::vector<iovec> iov) {
         throw_kernel_error(long(ev.res));
         return make_ready_future<size_t>(size_t(ev.res));
     });
+}
+
+priority_class_ptr default_priority() {
+    static thread_local dp = make_lw_shared<queue_handle>(1);
+    return dp;
 }
 
 inline
@@ -843,7 +855,7 @@ reactor::open_directory(sstring name) {
         return wrap_syscall<int>(::open(name.c_str(), O_DIRECTORY | O_CLOEXEC | O_RDONLY));
     }).then([] (syscall_result<int> sr) {
         sr.throw_if_error();
-        return make_ready_future<file>(file(sr.result, file_open_options()));
+        return make_ready_future<file>(file(sr.result, file_open_options(nullptr)));
     });
 }
 
@@ -2359,6 +2371,7 @@ void smp::configure(boost::program_options::variables_map configuration)
             engine().my_io_queue.reset(all_io_queues[queue_idx]);
         }
         engine()._io_queue = all_io_queues[queue_idx];
+        engine()._io_queue->register_priority_class(default_priority_class());
         engine()._io_coordinator = all_io_queues[queue_idx]->coordinator();
     };
 
@@ -2381,6 +2394,8 @@ void smp::configure(boost::program_options::variables_map configuration)
             start_all_queues();
             assign_io_queue(i, queue_idx);
             inited.wait();
+            engine()._io_queue = reactor::all_io_queues[queue_idx].get();
+            engine()._io_coordinator = reactor::all_io_queues[queue_idx]->coordinator();
             engine().configure(configuration);
             engine().run();
         });
@@ -2648,7 +2663,7 @@ future<> check_direct_io_support(sstring path) {
 }
 
 future<file> open_file_dma(sstring name, open_flags flags) {
-    return engine().open_file_dma(std::move(name), flags, file_open_options());
+    return engine().open_file_dma(std::move(name), flags, file_open_options(default_priority_class()));
 }
 
 future<file> open_file_dma(sstring name, open_flags flags, file_open_options options) {

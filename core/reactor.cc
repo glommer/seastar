@@ -554,18 +554,18 @@ reactor::flush_pending_aio() {
 
 template <typename Func>
 future<io_event>
-reactor::submit_io_read(size_t len, Func prepare_io) {
+reactor::submit_io_read(priority_class* pc, size_t len, Func prepare_io) {
     ++_aio_reads;
     _aio_read_bytes += len;
-    return io_queue::queue_request(_io_coordinator, len, std::move(prepare_io));
+    return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));
 }
 
 template <typename Func>
 future<io_event>
-reactor::submit_io_write(size_t len, Func prepare_io) {
+reactor::submit_io_write(priority_class* pc, size_t len, Func prepare_io) {
     ++_aio_writes;
     _aio_write_bytes += len;
-    return io_queue::queue_request(_io_coordinator, len, std::move(prepare_io));
+    return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));
 }
 
 bool reactor::process_io()
@@ -640,7 +640,7 @@ posix_file_impl::query_dma_alignment() {
 
 future<size_t>
 posix_file_impl::write_dma(uint64_t pos, const void* buffer, size_t len) {
-    return engine().submit_io_write(len, [fd = _fd, pos, buffer, len] (iocb& io) {
+    return engine().submit_io_write(_io_priority_class, len, [fd = _fd, pos, buffer, len] (iocb& io) {
         io_prep_pwrite(&io, fd, const_cast<void*>(buffer), len, pos);
     }).then([] (io_event ev) {
         throw_kernel_error(long(ev.res));
@@ -654,7 +654,7 @@ posix_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov) {
     auto iov_ptr = std::make_unique<std::vector<iovec>>(std::move(iov));
     auto size = iov_ptr->size();
     auto data = iov_ptr->data();
-    return engine().submit_io_write(len, [fd = _fd, pos, data, size] (iocb& io) {
+    return engine().submit_io_write(_io_priority_class, len, [fd = _fd, pos, data, size] (iocb& io) {
         io_prep_pwritev(&io, fd, data, size, pos);
     }).then([iov_ptr = std::move(iov_ptr)] (io_event ev) {
         throw_kernel_error(long(ev.res));
@@ -664,7 +664,7 @@ posix_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov) {
 
 future<size_t>
 posix_file_impl::read_dma(uint64_t pos, void* buffer, size_t len) {
-    return engine().submit_io_read(len, [fd = _fd, pos, buffer, len] (iocb& io) {
+    return engine().submit_io_read(_io_priority_class, len, [fd = _fd, pos, buffer, len] (iocb& io) {
         io_prep_pread(&io, fd, buffer, len, pos);
     }).then([] (io_event ev) {
         throw_kernel_error(long(ev.res));
@@ -678,17 +678,12 @@ posix_file_impl::read_dma(uint64_t pos, std::vector<iovec> iov) {
     auto iov_ptr = std::make_unique<std::vector<iovec>>(std::move(iov));
     auto size = iov_ptr->size();
     auto data = iov_ptr->data();
-    return engine().submit_io_read(len, [fd = _fd, pos, data, size] (iocb& io) {
+    return engine().submit_io_read(_io_priority_class, len, [fd = _fd, pos, data, size] (iocb& io) {
         io_prep_preadv(&io, fd, data, size, pos);
     }).then([iov_ptr = std::move(iov_ptr)] (io_event ev) {
         throw_kernel_error(long(ev.res));
         return make_ready_future<size_t>(size_t(ev.res));
     });
-}
-
-priority_class_ptr default_priority() {
-    static thread_local dp = make_lw_shared<queue_handle>(1);
-    return dp;
 }
 
 inline
@@ -2663,7 +2658,7 @@ future<> check_direct_io_support(sstring path) {
 }
 
 future<file> open_file_dma(sstring name, open_flags flags) {
-    return engine().open_file_dma(std::move(name), flags, file_open_options(default_priority_class()));
+    return engine().open_file_dma(std::move(name), flags, file_open_options(engine().default_priority_class()));
 }
 
 future<file> open_file_dma(sstring name, open_flags flags, file_open_options options) {

@@ -61,6 +61,7 @@
 #include "circular_buffer.hh"
 #include "file.hh"
 #include "semaphore.hh"
+#include "fair_queue.hh"
 #include "core/scattered_message.hh"
 #include "core/enum.hh"
 #include <boost/range/irange.hpp>
@@ -526,17 +527,17 @@ class io_queue {
     size_t _capacity;
     size_t _pending_io = 0;
     std::vector<shard_id> _io_topology;
-    semaphore _has_room;
-
+    std::unordered_map<shard_id, lw_shared_ptr<priority_class>> _idle_classes;
+    lw_shared_ptr<fair_queue> _fq;
 public:
     io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
 
     template <typename Func>
     static future<io_event>
-    queue_request(shard_id coordinator, size_t len, Func do_io);
+    queue_request(shard_id coordinator, priority_class *pc, size_t len, Func do_io);
 
     size_t queued_requests() const {
-        return _has_room.waiters();
+        return _fq->waiters();
     }
 
     size_t pending_io() const {
@@ -548,6 +549,12 @@ public:
     }
     shard_id coordinator_of_shard(shard_id shard) const {
         return _io_topology[shard];
+    }
+    void register_priority_class(priority_class_ptr pclass) {
+        _fq->register_priority_class(pclass);
+    }
+    priority_class* priority_class_of_shard(shard_id shard) {
+        return &*_idle_classes[shard];
     }
     friend class reactor;
 };
@@ -730,6 +737,9 @@ public:
     const io_queue& get_io_queue() const {
         return *_io_queue;
     }
+    priority_class* default_priority_class() {
+        return _io_queue->priority_class_of_shard(cpu_id());
+    }
 
     void configure(boost::program_options::variables_map config);
 
@@ -771,9 +781,9 @@ public:
     template <typename Func>
     future<io_event> submit_io(Func prepare_io);
     template <typename Func>
-    future<io_event> submit_io_read(size_t len, Func prepare_io);
+    future<io_event> submit_io_read(priority_class* pc, size_t len, Func prepare_io);
     template <typename Func>
-    future<io_event> submit_io_write(size_t len, Func prepare_io);
+    future<io_event> submit_io_write(priority_class* pc, size_t len, Func prepare_io);
 
     int run();
     void exit(int ret);

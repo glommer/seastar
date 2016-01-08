@@ -583,28 +583,48 @@ bool reactor::process_io()
     return n;
 }
 
+std::atomic<io_queue::io_priority_class_handle> io_queue::all_priority_classes = { 0 };
+std::array<std::atomic<uint32_t>, 32> io_queue::all_classes_shares;
+
+io_queue::io_priority_class_handle io_queue::default_priority_class = io_queue::register_io_priority_class(1);
+
 io_queue::io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology)
         : _coordinator(coordinator)
         , _capacity(capacity)
         , _io_topology(std::move(topology))
-        , _idle_classes()
+        , _priority_classes()
         , _fq(make_lw_shared<fair_queue>(capacity)) {
-    for (shard_id c = 0; c < shard_id(_io_topology.size()); ++c) {
-        if (_io_topology[c] == coordinator) {
-            auto pc = make_lw_shared<priority_class>(1);
-            _idle_classes.emplace(c, pc);
-            _fq->register_priority_class(pc);
-        }
+
+    auto max_class = io_queue::all_priority_classes.load(std::memory_order_relaxed);
+    for (auto i = 0u; i < max_class; ++i) {
+        auto shares = io_queue::all_classes_shares[i].load(std::memory_order_acquire);
+        register_one_priority_class(i, shares);
     }
+}
+
+const io_queue::io_priority_class_handle io_queue::register_io_priority_class(uint32_t shares) {
+    // This is not supposed to be called after initialization. It would not be impossible to
+    // do so: we would have to collect the maximum registered class in all shards and then
+    // proceed to a separate initialization stage of late registeres. However, at the moment
+    // there is no reason to support the complexity, nor do I see any in the foreseeable
+    // future.
+    assert(local_engine == nullptr);
+    auto handle = all_priority_classes.fetch_add(1, std::memory_order_relaxed);
+    if (handle >= io_queue::all_classes_shares.size()) {
+        throw std::runtime_error("maximum number of priority classes achieved");
+    }
+    io_queue::all_classes_shares[handle].store(shares, std::memory_order_release);
+    return handle;
 }
 
 template <typename Func>
 future<io_event>
-io_queue::queue_request(shard_id coordinator, priority_class *pc, size_t len, Func prepare_io) {
-    return smp::submit_to(coordinator, [pc, len, prepare_io = std::move(prepare_io)] {
+io_queue::queue_request(shard_id coordinator, priority_class& pc, size_t len, Func prepare_io) {
+    return smp::submit_to(coordinator, [&pc, len, prepare_io = std::move(prepare_io)] {
         auto& queue = *(engine()._io_queue);
         queue._pending_io += len;
-        return pc->queue([prepare_io = std::move(prepare_io)] {
+        unsigned weight = 1 + len/(16 << 10);
+        return queue._fq->queue(pc, weight, [prepare_io = std::move(prepare_io)] {
             return engine().submit_io(std::move(prepare_io));
         }).finally([&queue, len] {
             queue._pending_io -= len;
@@ -612,9 +632,12 @@ io_queue::queue_request(shard_id coordinator, priority_class *pc, size_t len, Fu
     });
 }
 
+priority_class& default_priority_class() {
+    return engine().priority_class(io_queue::default_priority_class);
+}
+
 posix_file_impl::posix_file_impl(int fd, file_open_options options)
-        : _fd(fd)
-        , _io_priority_class(options.io_priority_class) {
+        : _fd(fd) {
     query_dma_alignment();
 }
 
@@ -850,7 +873,7 @@ reactor::open_directory(sstring name) {
         return wrap_syscall<int>(::open(name.c_str(), O_DIRECTORY | O_CLOEXEC | O_RDONLY));
     }).then([] (syscall_result<int> sr) {
         sr.throw_if_error();
-        return make_ready_future<file>(file(sr.result, file_open_options(nullptr)));
+        return make_ready_future<file>(file(sr.result, file_open_options()));
     });
 }
 
@@ -2261,8 +2284,7 @@ void smp::cleanup() {
     smp::_threads = std::vector<thread_adaptor>();
 }
 
-void smp::configure(boost::program_options::variables_map configuration)
-{
+void smp::configure(boost::program_options::variables_map configuration) {
     smp::count = 1;
     smp::_tmain = std::this_thread::get_id();
     auto nr_cpus = resource::nr_processing_units();
@@ -2366,7 +2388,6 @@ void smp::configure(boost::program_options::variables_map configuration)
             engine().my_io_queue.reset(all_io_queues[queue_idx]);
         }
         engine()._io_queue = all_io_queues[queue_idx];
-        engine()._io_queue->register_priority_class(default_priority_class());
         engine()._io_coordinator = all_io_queues[queue_idx]->coordinator();
     };
 
@@ -2389,8 +2410,6 @@ void smp::configure(boost::program_options::variables_map configuration)
             start_all_queues();
             assign_io_queue(i, queue_idx);
             inited.wait();
-            engine()._io_queue = reactor::all_io_queues[queue_idx].get();
-            engine()._io_coordinator = reactor::all_io_queues[queue_idx]->coordinator();
             engine().configure(configuration);
             engine().run();
         });
@@ -2426,7 +2445,7 @@ void smp::configure(boost::program_options::variables_map configuration)
 
 __thread size_t future_avail_count = 0;
 
-__thread reactor* local_engine;
+__thread reactor* local_engine = nullptr;
 
 class reactor_notifier_epoll : public reactor_notifier {
     writeable_eventfd _write;
@@ -2658,7 +2677,7 @@ future<> check_direct_io_support(sstring path) {
 }
 
 future<file> open_file_dma(sstring name, open_flags flags) {
-    return engine().open_file_dma(std::move(name), flags, file_open_options(engine().default_priority_class()));
+    return engine().open_file_dma(std::move(name), flags, file_open_options());
 }
 
 future<file> open_file_dma(sstring name, open_flags flags, file_open_options options) {

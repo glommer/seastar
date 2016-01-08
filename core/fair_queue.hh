@@ -63,6 +63,7 @@ class fair_queue {
     };
 
     semaphore _sem;
+    unsigned _capacity;
     uint64_t _total_shares = 0;
     timer<> _bandwidth_timer;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
@@ -114,8 +115,9 @@ public:
     /// Constructs a fair queue with a given \c capacity.
     ///
     /// \param capacity how many concurrent requests are allowed in this queue.
-    explicit fair_queue(int capacity) : _sem(capacity)
-                                      , _bandwidth_timer([this] { reset_stats(); }) {
+    explicit fair_queue(unsigned capacity) : _sem(capacity)
+                                           , _capacity(capacity)
+                                           , _bandwidth_timer([this] { reset_stats(); }) {
         _bandwidth_timer.arm_periodic(std::chrono::milliseconds(20));
     }
 
@@ -161,8 +163,16 @@ public:
         reset_stats();
     }
 
-    float weight_of_class(priority_class &pc) {
+    float weight(priority_class &pc) {
         return float(pc._shares) / _total_shares;
+    }
+
+    unsigned capacity() {
+        return _capacity;
+    }
+
+    unsigned capacity(priority_class &pc) {
+        return weight(pc) * capacity();
     }
 };
 

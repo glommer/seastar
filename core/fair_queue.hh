@@ -11,19 +11,27 @@
 
 /// \addtogroup io-module
 /// @{
-class priority_class;
-using priority_class_ptr = lw_shared_ptr<priority_class>;
 
-/// Exception thrown when a fair queue is not properly set up
-class misconfigured_queue : public std::exception {
-    sstring _msg;
-public:
-    misconfigured_queue(sstring msg) : std::exception(), _msg("misconfigured queue: " + msg) {}
-    /// Reports the exception reason.
-    const char *what() const noexcept {
-        return _msg.c_str();
-    }
+/// \cond internal
+/// \brief Priority class, to be used with a given \ref fair_queue
+///
+/// Before this class is used, it has to be associated with a \ref fair_queue instance
+/// through the \ref associate_queue method. Using a priority_class without proper
+/// initialization will throw a \ref unconfigured_queue exception.
+///
+/// \related fair_queue
+class priority_class {
+    friend class fair_queue;
+    uint32_t _shares = 0;
+    float _ops = 0;
+    float _weight = 0;
+    std::queue<promise<>> _queue;
+
+    friend struct shared_ptr_no_esft<priority_class>;
+    /// Constructs a priority class with a given \c shares
+    explicit priority_class(uint32_t shares) : _shares(shares) {}
 };
+/// \endcond
 
 /// \brief Fair queuing class
 ///
@@ -41,15 +49,17 @@ public:
 ///
 /// When the queues that lag behind start seeing requests, the fair queue will serve
 /// them first, until balance is restored. This balancing is expected to happen within
-/// a certain period of time, the resolution of the queue. Queues with smaller resolution
-/// numbers adapt faster to changes in workload.
+/// a certain period of time.
 ///
 /// Once the classes are registered, work is submitted through the class itself.
-struct fair_queue : public enable_lw_shared_from_this<fair_queue> {
+class fair_queue {
     friend priority_class;
-private:
+    using priority_class_ptr = lw_shared_ptr<priority_class>;
+
     struct class_compare {
-        bool operator() (const lw_shared_ptr<priority_class>& lhs, const lw_shared_ptr<priority_class>&rhs) const;
+        bool operator() (const priority_class_ptr& lhs, const priority_class_ptr &rhs) const {
+            return lhs->_ops < rhs->_ops;
+        }
     };
 
     semaphore _sem;
@@ -58,19 +68,50 @@ private:
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
 
-private:
-    void refill_heap(prioq::container_type scanned);
+    void execute_one(unsigned weight) {
+        _sem.wait().then([this, weight] {
+            prioq::container_type scanned;
+            while (!_handles.empty()) {
+                auto h = _handles.top();
+                scanned.push_back(h);
+                _handles.pop();
 
-    // Those operations only happen through the priority_class
-    void execute_one(unsigned weight);
-    void finish_one() {
-        _sem.signal();
+                if (!h->_queue.empty()) {
+                    auto& pr = h->_queue.front();
+                    pr.set_value();
+                    h->_queue.pop();
+                    h->_ops += weight;
+                    refill_heap(std::move(scanned));
+                    return make_ready_future<>();;
+                }
+            }
+            throw std::runtime_error("Trying to execute command in empty queue!");
+        });
     }
 
-    void reset_stats();
+    void refill_heap(prioq::container_type scanned) {
+        for (auto& s: scanned) {
+            _handles.push(s);
+        }
+    }
+
+    void reset_stats() {
+        prioq::container_type scanned;
+        while (!_handles.empty()) {
+            auto h = _handles.top();
+            scanned.push_back(h);
+            _handles.pop();
+            h->_ops = 0;
+            if (_total_shares) {
+                h->_weight = h->_shares / _total_shares;
+            } else {
+                h->_weight = 0; // Can happen if the timer triggers before any class is registered.
+            }
+        }
+        refill_heap(std::move(scanned));
+    }
 public:
-    /// Constructs a fair queue with a given \c capacity, with a resolution
-    /// of 20 miliseconds
+    /// Constructs a fair queue with a given \c capacity.
     ///
     /// \param capacity how many concurrent requests are allowed in this queue.
     explicit fair_queue(int capacity) : _sem(capacity)
@@ -78,47 +119,20 @@ public:
         _bandwidth_timer.arm_periodic(std::chrono::milliseconds(20));
     }
 
-    /// Registers a priority class against this queue.
+    /// Registers a priority class against this fair queue.
     ///
-    /// \param class, a priority pclass, which is an object of the class \c priority_class
-    void register_priority_class(priority_class_ptr pclass);
-
+    /// \param shares, how many shares to create this class with
+    priority_class& register_priority_class(uint32_t shares) {
+        _total_shares += shares;
+        priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
+        _handles.push(pclass);
+        reset_stats();
+        return *pclass;
+    }
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const {
         return _sem.waiters();
     }
-};
-
-/// \brief Priority class, to be used with a given \ref fair_queue
-///
-/// Before this class is used, it has to be associated with a \ref fair_queue instance
-/// through the \ref associate_queue method. Using a priority_class without proper
-/// initialization will throw a \ref unconfigured_queue exception.
-///
-/// \related fair_queue
-class priority_class {
-    uint32_t _shares = 0;
-    float _ops = 0;
-    float _weight = 0;
-    lw_shared_ptr<fair_queue> _fq;
-    friend fair_queue;
-    std::queue<promise<>> _queue;
-
-public:
-    /// Associates this priority class to a \ref fair_queue. Each priority class can
-    /// only be associated with a single priority queue.
-    ///
-    /// Calling this method for a queue that is already configured will throw \ref
-    /// misconfigured_queue exception.
-    void associate_queue(lw_shared_ptr<fair_queue> fq) {
-        if (_fq) {
-            throw misconfigured_queue("fair queue already bound.");
-        }
-        _fq = fq;
-    }
-
-    /// Constructs a priority class with a given \c shares
-    explicit priority_class(uint32_t shares) : _shares(shares), _fq(nullptr) {}
 
     /// Executes the function \c func through this class' \ref fair_queue, consuming \c weight
     ///
@@ -126,20 +140,30 @@ public:
     ///
     /// \return whatever \c func returns
     template <typename Func>
-    std::result_of_t<Func()> queue(unsigned weight, Func func) {
-        if (!_fq) {
-            throw misconfigured_queue("Not bound to any fair queue.");
-        }
-
+    std::result_of_t<Func()> queue(priority_class& pc, unsigned weight, Func func) {
         promise<> pr;
         auto fut = pr.get_future();
-        _queue.push(std::move(pr));
-        _fq->execute_one(weight);
+        pc._queue.push(std::move(pr));
+        execute_one(weight);
         return fut.then([func = std::move(func)] {
             return func();
         }).finally([this] {
-            _fq->finish_one();
+            _sem.signal();
         });
     }
+
+    /// Updates the current shares of this priority class
+    ///
+    /// \param new_shares the new number of shares for this priority class
+    void update_shares(priority_class& pc, uint32_t new_shares) {
+        _total_shares -= pc._shares;
+        pc._shares = new_shares;
+        reset_stats();
+    }
+
+    float weight_of_class(priority_class &pc) {
+        return float(pc._shares) / _total_shares;
+    }
 };
+
 /// @}

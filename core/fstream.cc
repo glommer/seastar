@@ -93,10 +93,12 @@ input_stream<char> make_file_input_stream(
 }
 
 input_stream<char> make_file_input_stream(
+        priority_class &pc,
         file f, uint64_t offset, size_t buffer_size) {
     file_input_stream_options options;
     options.offset = offset;
     options.buffer_size = buffer_size;
+    options.io_priority_class = &pc;
     return make_file_input_stream(std::move(f), options);
 }
 
@@ -174,7 +176,7 @@ private:
             truncate = true;
         }
 
-        return _file.dma_write(pos, p, buf_size).then(
+        return _file.dma_write(pos, p, buf_size, *_options.io_priority_class).then(
                 [this, buf = std::move(buf), truncate] (size_t size) {
             if (truncate) {
                 return _file.truncate(_pos);
@@ -212,9 +214,10 @@ public:
                 std::move(f), options)) {}
 };
 
-output_stream<char> make_file_output_stream(file f, size_t buffer_size) {
+output_stream<char> make_file_output_stream(priority_class& pc, file f, size_t buffer_size) {
     file_output_stream_options options;
     options.buffer_size = buffer_size;
+    options.io_priority_class = &pc;
     return make_file_output_stream(std::move(f), options);
 }
 

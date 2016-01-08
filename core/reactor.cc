@@ -554,7 +554,7 @@ reactor::flush_pending_aio() {
 
 template <typename Func>
 future<io_event>
-reactor::submit_io_read(priority_class* pc, size_t len, Func prepare_io) {
+reactor::submit_io_read(::priority_class& pc, size_t len, Func prepare_io) {
     ++_aio_reads;
     _aio_read_bytes += len;
     return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));
@@ -562,7 +562,7 @@ reactor::submit_io_read(priority_class* pc, size_t len, Func prepare_io) {
 
 template <typename Func>
 future<io_event>
-reactor::submit_io_write(priority_class* pc, size_t len, Func prepare_io) {
+reactor::submit_io_write(::priority_class& pc, size_t len, Func prepare_io) {
     ++_aio_writes;
     _aio_write_bytes += len;
     return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));

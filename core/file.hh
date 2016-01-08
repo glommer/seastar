@@ -27,7 +27,6 @@
 #include "core/shared_ptr.hh"
 #include "core/align.hh"
 #include "core/future-util.hh"
-#include "core/fair_queue.hh"
 #include <experimental/optional>
 #include <system_error>
 #include <sys/stat.h>

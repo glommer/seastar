@@ -639,8 +639,7 @@ posix_file_impl::query_dma_alignment() {
 }
 
 future<size_t>
-posix_file_impl::write_dma(uint64_t pos, const void* buffer, size_t len, priority_class* io_priority_class) {
-    io_priority_class = io_priority_class ? io_priority_class : engine().default_priority_class();
+posix_file_impl::write_dma(uint64_t pos, const void* buffer, size_t len, priority_class& io_priority_class) {
     return engine().submit_io_write(io_priority_class, len, [fd = _fd, pos, buffer, len] (iocb& io) {
         io_prep_pwrite(&io, fd, const_cast<void*>(buffer), len, pos);
     }).then([] (io_event ev) {
@@ -650,8 +649,7 @@ posix_file_impl::write_dma(uint64_t pos, const void* buffer, size_t len, priorit
 }
 
 future<size_t>
-posix_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov, priority_class* io_priority_class) {
-    io_priority_class = io_priority_class ? io_priority_class : engine().default_priority_class();
+posix_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov, priority_class& io_priority_class) {
     auto len = boost::accumulate(iov | boost::adaptors::transformed(std::mem_fn(&iovec::iov_len)), size_t(0));
     auto iov_ptr = std::make_unique<std::vector<iovec>>(std::move(iov));
     auto size = iov_ptr->size();
@@ -665,8 +663,7 @@ posix_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov, priority_class*
 }
 
 future<size_t>
-posix_file_impl::read_dma(uint64_t pos, void* buffer, size_t len, priority_class* io_priority_class) {
-    io_priority_class = io_priority_class ? io_priority_class : engine().default_priority_class();
+posix_file_impl::read_dma(uint64_t pos, void* buffer, size_t len, priority_class& io_priority_class) {
     return engine().submit_io_read(io_priority_class, len, [fd = _fd, pos, buffer, len] (iocb& io) {
         io_prep_pread(&io, fd, buffer, len, pos);
     }).then([] (io_event ev) {
@@ -676,8 +673,7 @@ posix_file_impl::read_dma(uint64_t pos, void* buffer, size_t len, priority_class
 }
 
 future<size_t>
-posix_file_impl::read_dma(uint64_t pos, std::vector<iovec> iov, priority_class* io_priority_class) {
-    io_priority_class = io_priority_class ? io_priority_class : engine().default_priority_class();
+posix_file_impl::read_dma(uint64_t pos, std::vector<iovec> iov, priority_class& io_priority_class) {
     auto len = boost::accumulate(iov | boost::adaptors::transformed(std::mem_fn(&iovec::iov_len)), size_t(0));
     auto iov_ptr = std::make_unique<std::vector<iovec>>(std::move(iov));
     auto size = iov_ptr->size();

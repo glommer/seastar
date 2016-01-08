@@ -79,11 +79,13 @@ struct directory_entry {
 /// \ref file
 struct file_open_options {
     uint64_t extent_allocation_size_hint = 1 << 20; ///< Allocate this much disk space when extending the file
-    priority_class* io_priority_class;
-    file_open_options(priority_class* pclass): io_priority_class(pclass) {}
 };
 
 /// \cond internal
+
+class priority_class;
+priority_class& default_priority_class();
+
 class file_impl {
 public:
     unsigned _memory_dma_alignment = 4096;
@@ -92,10 +94,10 @@ public:
 public:
     virtual ~file_impl() {}
 
-    virtual future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, priority_class *pc) = 0;
-    virtual future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, priority_class *pc) = 0;
-    virtual future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, priority_class *pc) = 0;
-    virtual future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, priority_class *pc) = 0;
+    virtual future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, priority_class& pc) = 0;
+    virtual future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, priority_class& pc) = 0;
+    virtual future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, priority_class& pc) = 0;
+    virtual future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, priority_class& pc) = 0;
     virtual future<> flush(void) = 0;
     virtual future<struct stat> stat(void) = 0;
     virtual future<> truncate(uint64_t length) = 0;
@@ -113,10 +115,10 @@ public:
     int _fd;
     posix_file_impl(int fd, file_open_options options);
     virtual ~posix_file_impl() override;
-    future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, priority_class* pc);
-    future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, priority_class* pc);
-    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, priority_class* pc);
-    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, priority_class* pc);
+    future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, priority_class& pc);
+    future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, priority_class& pc);
+    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, priority_class& pc);
+    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, priority_class& pc);
     future<> flush(void);
     future<struct stat> stat(void);
     future<> truncate(uint64_t length);
@@ -217,6 +219,7 @@ public:
      * @param aligned_pos offset to begin reading at (should be aligned)
      * @param aligned_buffer output buffer (should be aligned)
      * @param aligned_len number of bytes to read (should be aligned)
+     * @param pc the IO priority class under which to queue this operation
      *
      * Alignment is HW dependent but use 4KB alignment to be on the safe side as
      * explained above.
@@ -226,7 +229,7 @@ public:
      */
     template <typename CharType>
     future<size_t>
-    dma_read(uint64_t aligned_pos, CharType* aligned_buffer, size_t aligned_len, priority_class *pc = nullptr) {
+    dma_read(uint64_t aligned_pos, CharType* aligned_buffer, size_t aligned_len, priority_class& pc = default_priority_class()) {
         return _file_impl->read_dma(aligned_pos, aligned_buffer, aligned_len, pc);
     }
 
@@ -235,6 +238,7 @@ public:
      *
      * @param pos offset to begin reading from
      * @param len number of bytes to read
+     * @param pc the IO priority class under which to queue this operation
      *
      * @return temporary buffer containing the requested data.
      * @throw exception in case of I/O error
@@ -245,7 +249,7 @@ public:
      *       reached of in case of I/O error.
      */
     template <typename CharType>
-    future<temporary_buffer<CharType>> dma_read(uint64_t pos, size_t len, priority_class *pc = nullptr) {
+    future<temporary_buffer<CharType>> dma_read(uint64_t pos, size_t len, priority_class& pc = default_priority_class()) {
         return dma_read_bulk<CharType>(pos, len, pc).then(
                 [len] (temporary_buffer<CharType> buf) {
             if (len < buf.size()) {
@@ -265,6 +269,7 @@ public:
      *
      * @param pos offset in a file to begin reading from
      * @param len number of bytes to read
+     * @param pc the IO priority class under which to queue this operation
      *
      * @return temporary buffer containing the read data
      * @throw end_of_file_error if EOF is reached, file_io_error or
@@ -272,7 +277,7 @@ public:
      */
     template <typename CharType>
     future<temporary_buffer<CharType>>
-    dma_read_exactly(uint64_t pos, size_t len, priority_class *pc) {
+    dma_read_exactly(uint64_t pos, size_t len, priority_class& pc = default_priority_class()) {
         return dma_read<CharType>(pos, len, pc).then(
                 [pos, len] (auto buf) {
             if (buf.size() < len) {
@@ -288,9 +293,11 @@ public:
     /// \param pos offset to read from.  Must be aligned to \ref dma_alignment.
     /// \param iov vector of address/size pairs to read into.  Addresses must be
     ///            aligned.
+    /// \param pc the IO priority class under which to queue this operation
+    ///
     /// \return a future representing the number of bytes actually read.  A short
     ///         read may happen due to end-of-file or an I/O error.
-    future<size_t> dma_read(uint64_t pos, std::vector<iovec> iov, priority_class* pc) {
+    future<size_t> dma_read(uint64_t pos, std::vector<iovec> iov, priority_class& pc = default_priority_class()) {
         return _file_impl->read_dma(pos, std::move(iov), pc);
     }
 
@@ -300,10 +307,12 @@ public:
     /// \param buffer aligned address of buffer to read from.  Buffer must exists
     ///               until the future is made ready.
     /// \param len number of bytes to write.  Must be aligned.
+    /// \param pc the IO priority class under which to queue this operation
+    ///
     /// \return a future representing the number of bytes actually written.  A short
     ///         write may happen due to an I/O error.
     template <typename CharType>
-    future<size_t> dma_write(uint64_t pos, const CharType* buffer, size_t len, priority_class *pc = nullptr) {
+    future<size_t> dma_write(uint64_t pos, const CharType* buffer, size_t len, priority_class& pc = default_priority_class()) {
         return _file_impl->write_dma(pos, buffer, len, pc);
     }
 
@@ -312,9 +321,11 @@ public:
     /// \param pos offset to write into.  Must be aligned to \ref dma_alignment.
     /// \param iov vector of address/size pairs to write from.  Addresses must be
     ///            aligned.
+    /// \param pc the IO priority class under which to queue this operation
+    ///
     /// \return a future representing the number of bytes actually written.  A short
     ///         write may happen due to an I/O error.
-    future<size_t> dma_write(uint64_t pos, std::vector<iovec> iov, priority_class *pc = nullptr) {
+    future<size_t> dma_write(uint64_t pos, std::vector<iovec> iov, priority_class& pc = default_priority_class()) {
         return _file_impl->write_dma(pos, std::move(iov), pc);
     }
 
@@ -389,6 +400,7 @@ public:
      *
      * @param offset starting address of the range the read bulk should contain
      * @param range_size size of the addresses range
+     * @param pc the IO priority class under which to queue this operation
      *
      * @return temporary buffer containing the read data bulk.
      * @throw system_error exception in case of I/O error or eof_error when
@@ -396,7 +408,7 @@ public:
      */
     template <typename CharType>
     future<temporary_buffer<CharType>>
-    dma_read_bulk(uint64_t offset, size_t range_size, priority_class *pc = nullptr);
+    dma_read_bulk(uint64_t offset, size_t range_size, priority_class& pc = default_priority_class());
 
 private:
     template <typename CharType>
@@ -416,6 +428,7 @@ private:
      *
      * @param pos offset to read from
      * @param len number of bytes to read
+     * @param pc the IO priority class under which to queue this operation
      *
      * @return temporary buffer with read data or zero-sized temporary buffer if
      *         pos is at or beyond EOF.
@@ -423,7 +436,7 @@ private:
      */
     template <typename CharType>
     future<temporary_buffer<CharType>>
-    read_maybe_eof(uint64_t pos, size_t len, priority_class *pc = nullptr);
+    read_maybe_eof(uint64_t pos, size_t len, priority_class& pc = default_priority_class());
 
     friend class reactor;
 };
@@ -498,7 +511,7 @@ private:
 
 template <typename CharType>
 future<temporary_buffer<CharType>>
-file::dma_read_bulk(uint64_t offset, size_t range_size, priority_class *pc) {
+file::dma_read_bulk(uint64_t offset, size_t range_size, priority_class& pc) {
     using tmp_buf_type = typename read_state<CharType>::tmp_buf_type;
 
     auto front = offset & (disk_read_dma_alignment() - 1);
@@ -517,7 +530,7 @@ file::dma_read_bulk(uint64_t offset, size_t range_size, priority_class *pc) {
     auto read = dma_read(offset, rstate->buf.get_write(),
                          rstate->buf.size(), pc);
 
-    return read.then([rstate, this, pc] (size_t size) mutable {
+    return read.then([rstate, this, &pc] (size_t size) mutable {
         rstate->pos = size;
 
         //
@@ -533,7 +546,7 @@ file::dma_read_bulk(uint64_t offset, size_t range_size, priority_class *pc) {
         //
         return do_until(
             [rstate] { return rstate->done(); },
-            [rstate, this, pc] () mutable {
+            [rstate, this, &pc] () mutable {
             return read_maybe_eof<CharType>(
                 rstate->cur_offset(), rstate->left_to_read(), pc).then(
                     [rstate] (auto buf1) mutable {
@@ -558,7 +571,7 @@ file::dma_read_bulk(uint64_t offset, size_t range_size, priority_class *pc) {
 
 template <typename CharType>
 future<temporary_buffer<CharType>>
-file::read_maybe_eof(uint64_t pos, size_t len, priority_class *pc) {
+file::read_maybe_eof(uint64_t pos, size_t len, priority_class& pc) {
     //
     // We have to allocate a new aligned buffer to make sure we don't get
     // an EINVAL error due to unaligned destination buffer.

@@ -36,7 +36,7 @@ class file_data_source_impl : public data_source_impl {
     std::experimental::optional<promise<>> _done;
 public:
     file_data_source_impl(file f, file_input_stream_options options)
-            : _file(std::move(f)), _options(options), _pos(_options.offset) {}
+            : _file(std::move(f)), _options(options), _pos(_options.offset) { assert(_options.io_priority_class); }
     virtual future<temporary_buffer<char>> get() override {
         if (_read_buffers.empty()) {
             issue_read_aheads(1);
@@ -66,7 +66,7 @@ private:
             ++_reads_in_progress;
             // if _pos is not dma-aligned, we'll get a short read.  Account for that.
             auto now = _options.buffer_size - _pos % _file.disk_read_dma_alignment();
-            _read_buffers.push_back(_file.dma_read_bulk<char>(_pos, now).then_wrapped(
+            _read_buffers.push_back(_file.dma_read_bulk<char>(_pos, now, *_options.io_priority_class).then_wrapped(
                     [this] (future<temporary_buffer<char>> ret) {
                 issue_read_aheads();
                 --_reads_in_progress;

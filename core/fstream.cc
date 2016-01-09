@@ -36,7 +36,7 @@ class file_data_source_impl : public data_source_impl {
     std::experimental::optional<promise<>> _done;
 public:
     file_data_source_impl(file f, file_input_stream_options options)
-            : _file(std::move(f)), _options(options), _pos(_options.offset) {}
+            : _file(std::move(f)), _options(options), _pos(_options.offset) { assert(_options.io_priority_class); }
     virtual future<temporary_buffer<char>> get() override {
         if (_read_buffers.empty()) {
             issue_read_aheads(1);
@@ -66,7 +66,7 @@ private:
             ++_reads_in_progress;
             // if _pos is not dma-aligned, we'll get a short read.  Account for that.
             auto now = _options.buffer_size - _pos % _file.disk_read_dma_alignment();
-            _read_buffers.push_back(_file.dma_read_bulk<char>(_pos, now).then_wrapped(
+            _read_buffers.push_back(_file.dma_read_bulk<char>(_pos, now, *_options.io_priority_class).then_wrapped(
                     [this] (future<temporary_buffer<char>> ret) {
                 issue_read_aheads();
                 --_reads_in_progress;
@@ -93,10 +93,12 @@ input_stream<char> make_file_input_stream(
 }
 
 input_stream<char> make_file_input_stream(
+        priority_class &pc,
         file f, uint64_t offset, size_t buffer_size) {
     file_input_stream_options options;
     options.offset = offset;
     options.buffer_size = buffer_size;
+    options.io_priority_class = &pc;
     return make_file_input_stream(std::move(f), options);
 }
 
@@ -174,7 +176,7 @@ private:
             truncate = true;
         }
 
-        return _file.dma_write(pos, p, buf_size).then(
+        return _file.dma_write(pos, p, buf_size, *_options.io_priority_class).then(
                 [this, buf = std::move(buf), truncate] (size_t size) {
             if (truncate) {
                 return _file.truncate(_pos);
@@ -212,9 +214,10 @@ public:
                 std::move(f), options)) {}
 };
 
-output_stream<char> make_file_output_stream(file f, size_t buffer_size) {
+output_stream<char> make_file_output_stream(priority_class& pc, file f, size_t buffer_size) {
     file_output_stream_options options;
     options.buffer_size = buffer_size;
+    options.io_priority_class = &pc;
     return make_file_output_stream(std::move(f), options);
 }
 

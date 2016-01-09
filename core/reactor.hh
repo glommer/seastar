@@ -807,9 +807,9 @@ public:
     template <typename Func>
     future<io_event> submit_io(Func prepare_io);
     template <typename Func>
-    future<io_event> submit_io_read(size_t len, Func prepare_io);
+    future<io_event> submit_io_read(::priority_class& pc, size_t len, Func prepare_io);
     template <typename Func>
-    future<io_event> submit_io_write(size_t len, Func prepare_io);
+    future<io_event> submit_io_write(::priority_class& pc, size_t len, Func prepare_io);
 
     int run();
     void exit(int ret);

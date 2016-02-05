@@ -255,6 +255,7 @@ libnet = [
 
 core = [
     'core/reactor.cc',
+    'core/ioqueue_setup.cc',
     'core/systemwide_memory_barrier.cc',
     'core/fstream.cc',
     'core/posix.cc',

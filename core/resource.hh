@@ -28,6 +28,7 @@
 #include <vector>
 #include <set>
 #include <sched.h>
+#include "sstring.hh"
 
 cpu_set_t cpuid_to_cpuset(unsigned cpuid);
 
@@ -44,6 +45,7 @@ struct configuration {
     optional<cpuset> cpu_set;
     optional<unsigned> max_io_requests;
     optional<unsigned> io_queues;
+    optional<sstring> io_queue_autotune_directory;
 };
 
 struct memory {

@@ -2286,6 +2286,7 @@ smp::get_options_description()
 #else
         ("max-io-requests", bpo::value<unsigned>(), "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of processors")
 #endif
+        ("io-queue-directory", bpo::value<sstring>(), "Directory used to estimate I/O queue capacity")
         ;
     return opts;
 }
@@ -2430,6 +2431,14 @@ void smp::configure(boost::program_options::variables_map configuration)
 
     if (configuration.count("num-io-queues")) {
         rc.io_queues = configuration["num-io-queues"].as<unsigned>();
+    }
+
+    sstring io_queue_directory;
+    if (configuration.count("io-queue-directory")) {
+        if (rc.io_queues || rc.max_io_requests) {
+           throw std::runtime_error("Specified both static and dynamic configuration for I/O queues");
+        }
+        rc.io_queue_autotune_directory = configuration["io-queue-directory"].as<sstring>();
     }
 
     auto resources = resource::allocate(rc);

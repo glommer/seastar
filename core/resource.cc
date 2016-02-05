@@ -22,6 +22,8 @@
 #include "resource.hh"
 #include "core/align.hh"
 
+extern uint32_t io_queue_discovery(sstring dir, std::vector<unsigned> cpus);
+
 namespace resource {
 
 size_t calculate_memory(configuration c, size_t available_memory, float panic_factor = 1) {
@@ -110,8 +112,23 @@ struct distribute_objects {
 
 static io_queue_topology
 allocate_io_queues(hwloc_topology_t& topology, configuration c, std::vector<cpu> cpus) {
-    unsigned num_io_queues = c.io_queues.value_or(cpus.size());
-    unsigned max_io_requests = c.max_io_requests.value_or(128 * num_io_queues);
+
+    unsigned num_io_queues;
+    unsigned max_io_requests;
+    if (c.io_queue_autotune_directory) {
+        std::vector<unsigned> cpuvec;
+        for (auto& c: cpus) {
+            cpuvec.push_back(c.cpu_id);
+        }
+        printf("I/O queue directory %s\n", c.io_queue_autotune_directory->c_str());
+        auto magic_number = io_queue_discovery(*c.io_queue_autotune_directory, cpuvec);
+        printf("Configured to %d\n", magic_number);
+        num_io_queues = c.io_queues.value_or(cpus.size());
+        max_io_requests = c.max_io_requests.value_or(128 * num_io_queues);
+    } else {
+        num_io_queues = c.io_queues.value_or(cpus.size());
+        max_io_requests = c.max_io_requests.value_or(128 * num_io_queues);
+    }
 
     unsigned depth = find_memory_depth(topology);
     auto node_of_shard = [&topology, &cpus, &depth] (unsigned shard) {

@@ -49,13 +49,7 @@ SEASTAR_TEST_CASE(reproducer) {
             auto oflags = open_flags::wo | open_flags::create | open_flags::exclusive;
             auto name = sprint("%s/test-file-%ld",tmp->path, idx);
             return open_file_dma(name, oflags).then([] (auto f) {
-                return f.truncate(4096).then([f] () mutable {
-                    auto bufptr = allocate_aligned_buffer<char>(4096, 4096);
-                    auto buf = bufptr.get();
-                    return f.dma_write(0, buf, 4096).then([bufptr = std::move(bufptr)] (auto s) {});
-                }).then([f] () mutable {
-                    return f.flush();
-                }).then([f] {});
+                return f.flush().then([f] {});
             });
         }).then([count] {
              printf("Shard %d finished %ld flushes\n", engine().cpu_id(), count);

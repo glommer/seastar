@@ -200,6 +200,7 @@ tests = [
     'tests/tls_test',
     'tests/fair_queue_test',
     'tests/rpc_test',
+    'tests/reproducer',
     ]
 
 apps = [
@@ -377,6 +378,7 @@ deps = {
     'tests/rpc': ['tests/rpc.cc'] + core + libnet,
     'tests/rpc_test': ['tests/rpc_test.cc'] + core + libnet + boost_test_lib,
     'tests/packet_test': ['tests/packet_test.cc'] + core + libnet,
+    'tests/reproducer': ['tests/reproducer.cc'] + core + boost_test_lib,
 }
 
 warnings = [

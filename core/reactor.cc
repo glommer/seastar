@@ -1949,7 +1949,7 @@ syscall_work_queue::syscall_work_queue()
 
 void syscall_work_queue::submit_item(syscall_work_queue::work_item* item) {
     _queue_has_room.wait().then([this, item] {
-        _pending.push(item);
+        assert(_pending.push(item));
         _start_eventfd.signal(1);
     });
 }
@@ -2141,7 +2141,7 @@ void thread_pool::work() {
         }
         inter_thread_wq._pending.consume_all([this] (syscall_work_queue::work_item* wi) {
             wi->process();
-            inter_thread_wq._completed.push(wi);
+            assert(inter_thread_wq._completed.push(wi));
         });
         pthread_kill(_notify, SIGUSR1);
     }

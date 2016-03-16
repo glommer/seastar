@@ -78,7 +78,7 @@ class iotune_manager {
 public:
     enum class test_done { no, yes };
     using clock = std::chrono::steady_clock;
-    static constexpr uint64_t file_size = 10ull << 30;
+    static uint64_t file_size;
     static constexpr uint64_t wbuffer_size = 128ul << 10;
     static constexpr uint64_t rbuffer_size = 4ul << 10;
 private:
@@ -335,7 +335,7 @@ public:
     }
 };
 
-constexpr uint64_t iotune_manager::file_size;
+uint64_t iotune_manager::file_size = 10ull << 30;
 constexpr uint64_t iotune_manager::wbuffer_size;
 constexpr uint64_t iotune_manager::rbuffer_size;
 
@@ -351,7 +351,12 @@ test_file::test_file(const directory& dir)
     ::unlink(name.c_str());
 
     if (si.available < iotune_manager::file_size) {
-        throw std::runtime_error(sprint("iotune requires at least %.2f GB available. Filesystem contains only %.2f GB available\n", gb(iotune_manager::file_size), gb(si.available)));
+        std::cerr << "iotune requires at least " << gb(iotune_manager::file_size)
+                  << "GB available. Filesystem contains only" << gb(si.available)
+                  << "GB available. Trying to continue with a ";
+
+        iotune_manager::file_size = align_down((2 * si.available) / 3, iotune_manager::wbuffer_size);
+        std::cerr << gb(iotune_manager::file_size) << "GB file" << std::endl;
     }
 }
 
@@ -484,6 +489,7 @@ void test_file::generate() {
     iocb_vecptr.resize(max_aio);
     std::iota(iocb_vecptr.begin(), iocb_vecptr.end(), iocbs.data());
     uint64_t pos = 0;
+    uint64_t bytes_written = 0;
     unsigned aio_outstanding = 0;
 
     while (pos < iotune_manager::file_size || aio_outstanding) {
@@ -508,9 +514,11 @@ void test_file::generate() {
                 sanity_check_ev(ev[i], iotune_manager::wbuffer_size);
             }
             aio_outstanding -= n;
+            bytes_written += n * iotune_manager::wbuffer_size;
         }
     }
-    std::cout << " done." << std::endl;
+    iotune_manager::file_size = bytes_written;
+    std::cout << " done, " << iotune_manager::file_size << " bytes written" << std::endl;
 }
 
 uint32_t io_queue_discovery(sstring dir, std::vector<unsigned> cpus) {

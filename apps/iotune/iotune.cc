@@ -59,6 +59,10 @@ struct test_file {
 
     test_file(const directory& dir);
     void generate();
+
+    static float to_gb(unsigned long b) {
+        return float(b) / (1ull << 30);
+    };
 };
 
 struct run_stats {
@@ -343,20 +347,16 @@ test_file::test_file(const directory& dir)
     : name(dir.name + "/ioqueue-discovery")
     , file(file_desc::open(name.c_str(),  O_DIRECT | O_CLOEXEC | O_RDWR | O_CREAT, S_IRWXU)) {
 
-    auto gb = [] (auto b) {
-        return float(b) / (1ull << 30);
-    };
-
     auto si = boost::filesystem::space(boost::filesystem::path(dir.name));
     ::unlink(name.c_str());
 
     if (si.available < iotune_manager::file_size) {
-        std::cerr << "iotune requires at least " << gb(iotune_manager::file_size)
-                  << "GB available. Filesystem contains only" << gb(si.available)
+        std::cerr << "iotune requires at least " << to_gb(iotune_manager::file_size)
+                  << "GB available. Filesystem contains only" << to_gb(si.available)
                   << "GB available. Trying to continue with a ";
 
         iotune_manager::file_size = align_down((2 * si.available) / 3, iotune_manager::wbuffer_size);
-        std::cerr << gb(iotune_manager::file_size) << "GB file" << std::endl;
+        std::cerr << to_gb(iotune_manager::file_size) << "GB file" << std::endl;
     }
 }
 

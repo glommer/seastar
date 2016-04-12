@@ -218,6 +218,12 @@ public:
     /// \param period a duration representing the period
     /// \param usage which percentage of the time to assign for the thread's \c quota
     thread_scheduling_group(std::chrono::nanoseconds period, float usage);
+    /// \brief changes the current maximum usage per period
+    ///
+    /// \param new_usage The new percentage of the period during which to run
+    void update_usage(float new_usage) {
+        _quota = std::chrono::duration_cast<std::chrono::nanoseconds>(new_usage * _period);
+    }
 private:
     void account_start();
     void account_stop();

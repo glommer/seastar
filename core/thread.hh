@@ -79,13 +79,15 @@ class thread_scheduling_group;
 /// Clock used for scheduling threads
 using thread_clock = steady_clock_type;
 
-/// \cond internal
-class thread_context;
-
+/// Class that holds attributes controling the behavior of a thread.
 class thread_attributes {
 public:
     thread_scheduling_group* scheduling_group = nullptr;
 };
+
+
+/// \cond internal
+class thread_context;
 
 namespace thread_impl {
 
@@ -196,6 +198,14 @@ public:
     }
 };
 
+/// An instance of this class can be used to assign a thread to a particular scheduling group.
+/// Threads can share the same scheduling group if they hold a pointer to the same instance
+/// of this class.
+///
+/// A thread that belongs to a scheduling group will run for a specified \c quota at every \c period.
+/// yielding does not happen automatically, so if the thread never yields, this is not enforced.
+/// When a thread does yield, if it already ran for more than it's \c quota, then it will be scheduled
+/// to run again only at the beginning of a new \c period
 class thread_scheduling_group {
     std::chrono::nanoseconds _period;
     std::chrono::nanoseconds _quota;
@@ -203,6 +213,10 @@ class thread_scheduling_group {
     std::chrono::time_point<thread_clock> _this_run_start = {};
     std::chrono::nanoseconds _this_period_remain = {};
 public:
+    /// \brief Constructs a \c thread_scheduling_group object
+    ///
+    /// \param period a duration representing the period
+    /// \param usage which percentage of the time to assign for the thread's \c quota
     thread_scheduling_group(std::chrono::nanoseconds period, float usage);
 private:
     void account_start();

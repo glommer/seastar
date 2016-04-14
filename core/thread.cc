@@ -120,6 +120,13 @@ thread_context::yield() {
     if (!_attr.scheduling_group) {
         later().get();
     } else {
+        if (engine()._pending_tasks.size() == 0) {
+            later().get(); // let pollers run.
+            // Still idle: don't yield.
+            if (engine()._pending_tasks.size() == 0) {
+                return;
+            }
+        }
         auto when = _attr.scheduling_group->next_scheduling_point();
         if (when) {
             _sched_promise.emplace();

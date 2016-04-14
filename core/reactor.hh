@@ -692,6 +692,7 @@ private:
     uint64_t _fsyncs = 0;
     circular_buffer<std::unique_ptr<task>> _pending_tasks;
     circular_buffer<std::unique_ptr<task>> _at_destroy_tasks;
+    friend seastar::thread_context;
     std::chrono::duration<double> _task_quota;
     sig_atomic_t _task_quota_finished;
     std::unique_ptr<network_stack> _network_stack;

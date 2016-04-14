@@ -1729,6 +1729,20 @@ public:
     }
 };
 
+class thread_idle_pollfn final : public reactor::idle_pollfn {
+    reactor& _r;
+public:
+    thread_idle_pollfn(reactor& r) : _r(r) {}
+    virtual bool idle_poll() final override {
+        return seastar::thread::try_run_one_idle_thread();
+    }
+    virtual bool try_enter_interrupt_mode() override {
+        return true;
+    }
+    virtual void exit_interrupt_mode() override final {
+    }
+};
+
 void
 reactor::wakeup() {
     pthread_kill(_thread_id, alarm_signal());
@@ -1822,6 +1836,10 @@ int reactor::run() {
     assert(r == 0);
 
     bool idle = false;
+
+    // Comes after all pollers. This will give yielded threads an opportunity to run, and
+    // an earlier poller could have put a task into the task list.
+    poller thread_idle_poll(std::make_unique<thread_idle_pollfn>(*this));
 
     while (true) {
         run_tasks(_pending_tasks);

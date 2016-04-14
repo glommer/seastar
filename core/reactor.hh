@@ -635,6 +635,7 @@ private:
     friend smp_pollfn;
     friend drain_cross_cpu_freelist_pollfn;
     friend lowres_timer_pollfn;
+    friend thread_idle_pollfn;
     friend class epoll_pollfn;
     friend sort_pollers;
 public:

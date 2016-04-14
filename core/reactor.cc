@@ -1834,7 +1834,7 @@ int reactor::run() {
             break;
         }
 
-        if (!poll_once() && _pending_tasks.empty()) {
+        if (!poll_once() && _pending_tasks.empty() && !seastar::thread::run_yielded_work()) {
             idle_end = steady_clock_type::now();
             if (!idle) {
                 idle_start = idle_end;

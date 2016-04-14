@@ -115,6 +115,12 @@ thread_context::should_yield() const {
     return bool(_attr.scheduling_group->next_scheduling_point());
 }
 
+thread_local
+bi::list<thread_context,
+         bi::member_hook<thread_context, bi::list_member_hook<>,
+         &thread_context::_link>,
+         bi::constant_time_size<false>> thread_context::_waiting_timers;
+
 void
 thread_context::yield() {
     if (!_attr.scheduling_group) {
@@ -122,6 +128,7 @@ thread_context::yield() {
     } else {
         auto when = _attr.scheduling_group->next_scheduling_point();
         if (when) {
+            _waiting_timers.push_back(*this);
             _sched_promise.emplace();
             auto fut = _sched_promise->get_future();
             _sched_timer.arm(*when);
@@ -133,7 +140,22 @@ thread_context::yield() {
 
 void
 thread_context::reschedule() {
+    _waiting_timers.erase(_waiting_timers.iterator_to(*this));
     _sched_promise->set_value();
+}
+
+bool
+thread::run_yielded_work() {
+    if (thread_context::_waiting_timers.empty()) {
+        return false;
+    }
+
+    auto&& t = thread_context::_waiting_timers.front();
+    t._sched_timer.cancel();
+    t._sched_promise->set_value();
+    thread_context::_waiting_timers.pop_front();
+
+    return true;
 }
 
 void

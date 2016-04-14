@@ -33,6 +33,7 @@
 #include <chrono>
 #include <experimental/optional>
 #include <ucontext.h>
+#include <boost/intrusive/list.hpp>
 
 /// \defgroup thread-module Seastar threads
 ///
@@ -68,6 +69,7 @@
 namespace seastar {
 
 namespace stdx = std::experimental;
+namespace bi = boost::intrusive;
 
 /// \addtogroup thread-module
 /// @{
@@ -123,6 +125,13 @@ class thread_context {
     bool _joined = false;
     timer<> _sched_timer{[this] { reschedule(); }};
     stdx::optional<promise<>> _sched_promise;
+
+    bi::list_member_hook<> _link;
+    static thread_local
+    bi::list<thread_context,
+             bi::member_hook<thread_context, bi::list_member_hook<>,
+             &thread_context::_link>,
+             bi::constant_time_size<false>> _waiting_timers;
 private:
     static void s_main(unsigned int lo, unsigned int hi);
     void setup();
@@ -193,6 +202,8 @@ public:
     /// Need to take some cleanup action first.
     static bool should_yield();
 
+    static bool run_yielded_work();
+
     static bool running_in_thread() {
         return seastar::thread_impl::get() != nullptr;
     }
@@ -218,7 +229,8 @@ public:
 /// should yield often.
 ///
 /// After those events, if the thread has already run for more than its fraction, it will be scheduled to
-/// run again only after \c period completes.
+/// run again only after \c period completes, unless there are no other tasks to run (the system is
+/// idle)
 class thread_scheduling_group {
     std::chrono::nanoseconds _period;
     std::chrono::nanoseconds _quota;

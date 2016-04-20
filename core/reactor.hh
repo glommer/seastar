@@ -690,8 +690,15 @@ private:
     uint64_t _aio_writes = 0;
     uint64_t _aio_write_bytes = 0;
     uint64_t _fsyncs = 0;
-    circular_buffer<std::unique_ptr<task>> _pending_tasks;
+    circular_buffer<std::unique_ptr<task>> _pending_foreground_tasks;
+    circular_buffer<std::unique_ptr<task>> _pending_background_tasks;;
     circular_buffer<std::unique_ptr<task>> _at_destroy_tasks;
+    circular_buffer<std::unique_ptr<task>>* _current_pending = &_pending_foreground_tasks;
+
+    void set_background_context() { _current_pending = &_pending_background_tasks; }
+    void set_foreground_context() { _current_pending = &_pending_foreground_tasks; }
+    friend seastar::thread_context;
+
     std::chrono::duration<double> _task_quota;
     sig_atomic_t _task_quota_finished;
     std::unique_ptr<network_stack> _network_stack;
@@ -752,6 +759,7 @@ private:
     friend class thread_pool;
 
     void run_tasks(circular_buffer<std::unique_ptr<task>>& tasks);
+    void run_one_task(circular_buffer<std::unique_ptr<task>>& tasks);
     bool posix_reuseport_detect();
 public:
     static boost::program_options::options_description get_options_description();
@@ -823,7 +831,7 @@ public:
         _at_destroy_tasks.push_back(make_task(std::forward<Func>(func)));
     }
 
-    void add_task(std::unique_ptr<task>&& t) { _pending_tasks.push_back(std::move(t)); }
+    void add_task(std::unique_ptr<task>&& t) { _current_pending->push_back(std::move(t)); }
     void force_poll();
 
     void add_high_priority_task(std::unique_ptr<task>&&);

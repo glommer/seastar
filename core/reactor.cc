@@ -317,7 +317,7 @@ void reactor::timer_thread_func() {
                 if (tmr.expired()) {
                     _timer_due = 0;
                     _engine_thread->unsafe_stop();
-                    _pending_tasks.push_front(make_task([this] {
+                    _pending_foreground_tasks.push_front(make_task([this] {
                         complete_timers(_timers, _expired_timers, [this] {
                             if (!_timers.empty()) {
                                 enable_timer(_timers.get_next_timeout());
@@ -1358,7 +1358,7 @@ reactor::register_collectd_metrics() {
                     , scollectd::per_cpu_plugin_instance
                     , "queue_length", "tasks-pending")
                     , scollectd::make_typed(scollectd::data_type::GAUGE
-                            , std::bind(&decltype(_pending_tasks)::size, &_pending_tasks))
+                    , [this] { return _pending_foreground_tasks.size() + _pending_background_tasks.size(); })
             ),
             // total_operations value:DERIVE:0:U
             scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
@@ -1499,6 +1499,17 @@ void reactor::run_tasks(circular_buffer<std::unique_ptr<task>>& tasks) {
         std::atomic_signal_fence(std::memory_order_relaxed); // for _task_quota_finished flag
     }
 }
+
+void reactor::run_one_task(circular_buffer<std::unique_ptr<task>>& tasks) {
+    if (!tasks.empty()) {
+        auto tsk = std::move(tasks.front());
+        tasks.pop_front();
+        tsk->run();
+        tsk.reset();
+        ++_tasks_processed;
+    }
+}
+
 
 void reactor::force_poll() {
     _task_quota_finished = true;
@@ -1798,12 +1809,16 @@ int reactor::run() {
     bool idle = false;
 
     while (true) {
-        run_tasks(_pending_tasks);
+        run_tasks(_pending_foreground_tasks);
+        run_one_task(_pending_background_tasks);
         if (_stopped) {
             load_timer.cancel();
             // Final tasks may include sending the last response to cpu 0, so run them
-            while (!_pending_tasks.empty()) {
-                run_tasks(_pending_tasks);
+            while (!_pending_foreground_tasks.empty()) {
+                run_tasks(_pending_foreground_tasks);
+            }
+            while (!_pending_background_tasks.empty()) {
+                run_tasks(_pending_background_tasks);
             }
             while (!_at_destroy_tasks.empty()) {
                 run_tasks(_at_destroy_tasks);
@@ -1815,7 +1830,7 @@ int reactor::run() {
             break;
         }
 
-        if (!poll_once() && _pending_tasks.empty()) {
+        if (!poll_once() && _pending_foreground_tasks.empty() && _pending_background_tasks.empty()) {
             idle_end = steady_clock_type::now();
             if (!idle) {
                 idle_start = idle_end;
@@ -2943,7 +2958,7 @@ future<connected_socket> connect(socket_address sa, socket_address local) {
 }
 
 void reactor::add_high_priority_task(std::unique_ptr<task>&& t) {
-    _pending_tasks.push_front(std::move(t));
+    _pending_foreground_tasks.push_front(std::move(t));
     // break .then() chains
     future_avail_count = max_inlined_continuations - 1;
 }

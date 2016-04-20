@@ -80,6 +80,7 @@ thread_context::switch_in() {
     auto prev = g_current_context;
     g_current_context = &_context;
     _context.link = prev;
+    engine().set_background_context();
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_start();
     }
@@ -97,6 +98,7 @@ thread_context::switch_out() {
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_stop();
     }
+    engine().set_foreground_context();
     g_current_context = _context.link;
 #ifdef ASAN_ENABLED
     swapcontext(&_context.context, &g_current_context->context);
@@ -144,6 +146,7 @@ thread_context::s_main(unsigned int lo, unsigned int hi) {
 
 void
 thread_context::main() {
+    engine().set_background_context();
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_start();
     }
@@ -156,6 +159,7 @@ thread_context::main() {
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_stop();
     }
+    engine().set_foreground_context();
     g_current_context = _context.link;
 #ifdef ASAN_ENABLED
     setcontext(&g_current_context->context);

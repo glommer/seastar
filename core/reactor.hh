@@ -583,12 +583,19 @@ public:
     friend class reactor;
 };
 
+class thread_idle_pollfn;
+
 class reactor {
 private:
+    enum class poller_priority { normal, idle };
     struct pollfn {
         virtual ~pollfn() {}
         // Returns true if work was done (false = idle)
         virtual bool poll() = 0;
+
+        // Returns the priority at which to run these pollers. Idle pollers are only run when there
+        // are no other tasks in the system.
+        virtual poller_priority priority() { return poller_priority::normal; }
         // Tries to enter interrupt mode.
         //
         // If it returns true, then events from this poller will wake
@@ -599,6 +606,19 @@ private:
         virtual bool try_enter_interrupt_mode() { return false; }
         virtual void exit_interrupt_mode() {}
     };
+
+    struct idle_pollfn : public pollfn {
+        virtual ~idle_pollfn() {}
+        // Returns true if work was done (false = idle). Will only run if nothing else wants to
+        virtual bool poll() override;
+
+        virtual bool idle_poll() = 0;
+        // Returns the priority at which to run these pollers. Idle pollers are only run when there
+        // are no other tasks in the system.
+        virtual poller_priority priority() override { return poller_priority::idle; }
+    };
+
+    struct sort_pollers;
 
     class io_pollfn;
     class signal_pollfn;
@@ -616,6 +636,7 @@ private:
     friend drain_cross_cpu_freelist_pollfn;
     friend lowres_timer_pollfn;
     friend class epoll_pollfn;
+    friend sort_pollers;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;
@@ -726,7 +747,7 @@ private:
      */
     bool poll_once();
     template <typename Func> // signature: bool ()
-    static std::unique_ptr<pollfn> make_pollfn(Func&& func);
+    static std::unique_ptr<pollfn> make_pollfn(Func&& func, poller_priority prio = poller_priority::normal);
 
     class signals {
     public:
@@ -920,15 +941,19 @@ public:
 template <typename Func> // signature: bool ()
 inline
 std::unique_ptr<reactor::pollfn>
-reactor::make_pollfn(Func&& func) {
+reactor::make_pollfn(Func&& func, reactor::poller_priority prio) {
     struct the_pollfn : pollfn {
-        the_pollfn(Func&& func) : func(std::forward<Func>(func)) {}
+        the_pollfn(Func&& func, reactor::poller_priority prio) : func(std::forward<Func>(func)), _prio(prio) {}
         Func func;
+        reactor::poller_priority _prio;
         virtual bool poll() override {
             return func();
         }
+        virtual reactor::poller_priority priority() override {
+            return _prio;
+        }
     };
-    return std::make_unique<the_pollfn>(std::forward<Func>(func));
+    return std::make_unique<the_pollfn>(std::forward<Func>(func), prio);
 }
 
 extern __thread reactor* local_engine;

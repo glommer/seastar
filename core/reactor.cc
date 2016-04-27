@@ -1534,6 +1534,13 @@ reactor::do_expire_lowres_timers() {
     return false;
 }
 
+bool reactor::idle_pollfn::poll() {
+    if (!engine()._pending_tasks.empty()) {
+        return false;
+    }
+    return idle_poll();
+};
+
 #ifndef HAVE_OSV
 
 class reactor::io_pollfn final : public reactor::pollfn {
@@ -1925,15 +1932,29 @@ public:
     }
 };
 
+// Best thing here would be to keep a sorted set, and add the pollers in place. However, we wouldn't
+// be able to easily do the atomic replace we need. Since there aren't many pollers and they are
+// only usually changed during initialization, we can just re-sort the vector every time we change
+// it. For replace_poller(), we'll just make sure that the element that we are inserting holds the
+// same priority as the one that is going away.
+struct reactor::sort_pollers {
+    bool operator()(auto& p1, auto& p2) {
+        return int(p1->priority()) < int(p2->priority());
+    };
+};
+
 void reactor::register_poller(pollfn* p) {
     _pollers.push_back(p);
+    std::sort(_pollers.begin(), _pollers.end(), sort_pollers());
 }
 
 void reactor::unregister_poller(pollfn* p) {
     _pollers.erase(std::find(_pollers.begin(), _pollers.end(), p));
+    std::sort(_pollers.begin(), _pollers.end(), sort_pollers());
 }
 
 void reactor::replace_poller(pollfn* old, pollfn* neww) {
+    assert(old->priority() == neww->priority());
     std::replace(_pollers.begin(), _pollers.end(), old, neww);
 }
 
@@ -1979,7 +2000,7 @@ reactor::poller::~poller() {
             // not added yet, so don't do it at all.
             _registration_task->cancel();
         } else {
-            auto dummy = make_pollfn([] { return false; });
+            auto dummy = make_pollfn([] { return false; }, _pollfn->priority());
             auto dummy_p = dummy.get();
             auto task = std::make_unique<deregistration_task>(std::move(dummy));
             engine().add_task(std::move(task));

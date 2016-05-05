@@ -300,7 +300,7 @@ public:
     }
 private:
     void work();
-    void complete();
+    unsigned complete();
     void submit_item(work_item* wi);
 
     friend class thread_pool;

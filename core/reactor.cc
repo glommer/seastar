@@ -2027,7 +2027,7 @@ void syscall_work_queue::submit_item(syscall_work_queue::work_item* item) {
     });
 }
 
-void syscall_work_queue::complete() {
+unsigned syscall_work_queue::complete() {
     std::array<work_item*, queue_length> tmp_buf;
     auto end = tmp_buf.data();
     auto nr = _completed.consume_all([&] (work_item* wi) {
@@ -2039,6 +2039,7 @@ void syscall_work_queue::complete() {
         delete wi;
     }
     _queue_has_room.signal(nr);
+    return nr;
 }
 
 smp_message_queue::smp_message_queue(reactor* from, reactor* to)

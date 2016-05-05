@@ -419,6 +419,7 @@ class thread_pool {
     syscall_work_queue inter_thread_wq;
     posix_thread _worker_thread;
     std::atomic<bool> _stopped = { false };
+    std::atomic<bool> _main_thread_idle = { false };
     pthread_t _notify;
 public:
     thread_pool();
@@ -429,6 +430,11 @@ public:
         return inter_thread_wq.submit<T>(std::move(func));
     }
     uint64_t operation_count() const { return _aio_threaded_fallbacks; }
+
+    unsigned complete() { return inter_thread_wq.complete(); }
+    void enter_idle() { _main_thread_idle.store(true, std::memory_order_relaxed); }
+    void exit_idle() { _main_thread_idle.store(false, std::memory_order_relaxed); }
+
 #else
 public:
     template <typename T, typename Func>
@@ -608,6 +614,7 @@ private:
     class drain_cross_cpu_freelist_pollfn;
     class lowres_timer_pollfn;
     class epoll_pollfn;
+    class syscall_pollfn;
     friend io_pollfn;
     friend signal_pollfn;
     friend aio_batch_submit_pollfn;
@@ -616,6 +623,7 @@ private:
     friend drain_cross_cpu_freelist_pollfn;
     friend lowres_timer_pollfn;
     friend class epoll_pollfn;
+    friend class syscall_pollfn;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;

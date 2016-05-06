@@ -428,7 +428,7 @@ class thread_pool {
     std::atomic<bool> _main_thread_idle = { false };
     pthread_t _notify;
 public:
-    thread_pool();
+    thread_pool(unsigned phys_id);
     ~thread_pool();
     template <typename T, typename Func>
     future<T> submit(Func func) {
@@ -453,7 +453,7 @@ public:
     future<T> submit(Func func) { std::cout << "thread_pool not yet implemented on osv\n"; abort(); }
 #endif
 private:
-    void work();
+    void work(unsigned phys_id);
 };
 
 // The "reactor_backend" interface provides a method of waiting for various
@@ -774,7 +774,7 @@ private:
     bool posix_reuseport_detect();
 public:
     static boost::program_options::options_description get_options_description();
-    reactor();
+    reactor(unsigned phys_id);
     reactor(const reactor&) = delete;
     ~reactor();
     void operator=(const reactor&) = delete;
@@ -1047,7 +1047,7 @@ public:
 private:
     static void start_all_queues();
     static void pin(unsigned cpu_id);
-    static void allocate_reactor();
+    static void allocate_reactor(unsigned phys_id);
 public:
     static unsigned count;
 };

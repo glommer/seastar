@@ -216,7 +216,7 @@ inline int task_quota_signal() {
     return SIGRTMIN + 1;
 }
 
-reactor::reactor()
+reactor::reactor(unsigned phys_id)
     : _backend()
 #ifdef HAVE_OSV
     , _timer_thread(
@@ -226,8 +226,10 @@ reactor::reactor()
     , _cpu_started(0)
     , _io_context(0)
     , _io_context_available(max_aio)
-    , _reuseport(posix_reuseport_detect()) {
+    , _reuseport(posix_reuseport_detect())
+    , _thread_pool(phys_id) {
 
+    pin_this_thread(phys_id);
     seastar::thread_impl::init();
     auto r = ::io_setup(max_aio, &_io_context);
     assert(r >= 0);
@@ -2234,16 +2236,17 @@ void smp_message_queue::start(unsigned cpuid) {
 
 /* not yet implemented for OSv. TODO: do the notification like we do class smp. */
 #ifndef HAVE_OSV
-thread_pool::thread_pool() : _worker_thread([this] { work(); }), _notify(pthread_self()) {
+thread_pool::thread_pool(unsigned phys_id) : _worker_thread([this, phys_id] { work(phys_id); }), _notify(pthread_self()) {
     engine()._signals.handle_signal(SIGUSR1, [this] { inter_thread_wq.complete(); });
 }
 
-void thread_pool::work() {
+void thread_pool::work(unsigned phys_id) {
     sigset_t mask;
     sigfillset(&mask);
     auto r = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
     throw_system_error_on(r == -1);
     std::array<syscall_work_queue::work_item*, syscall_work_queue::queue_length> tmp_buf;
+    pin_this_thread(phys_id);
     while (true) {
         uint64_t count;
         auto r = ::read(inter_thread_wq._start_eventfd.get_read_fd(), &count, sizeof(count));
@@ -2460,7 +2463,7 @@ void smp::arrive_at_event_loop_end() {
     }
 }
 
-void smp::allocate_reactor() {
+void smp::allocate_reactor(unsigned phys_id) {
     assert(!reactor_holder);
 
     // we cannot just write "local_engin = new reactor" since reactor's constructor
@@ -2469,7 +2472,7 @@ void smp::allocate_reactor() {
     int r = posix_memalign(&buf, 64, sizeof(reactor));
     assert(r == 0);
     local_engine = reinterpret_cast<reactor*>(buf);
-    new (buf) reactor;
+    new (buf) reactor(phys_id);
     reactor_holder.reset(local_engine);
 }
 
@@ -2552,7 +2555,6 @@ void smp::configure(boost::program_options::variables_map configuration)
 
     auto resources = resource::allocate(rc);
     std::vector<resource::cpu> allocations = std::move(resources.cpus);
-    smp::pin(allocations[0].cpu_id);
     memory::configure(allocations[0].mem, hugepages_path);
 
 #ifdef HAVE_DPDK
@@ -2605,13 +2607,12 @@ void smp::configure(boost::program_options::variables_map configuration)
     for (i = 1; i < smp::count; i++) {
         auto allocation = allocations[i];
         _threads.emplace_back([configuration, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue] {
-            smp::pin(allocation.cpu_id);
             memory::configure(allocation.mem, hugepages_path);
             sigset_t mask;
             sigfillset(&mask);
             auto r = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
             throw_system_error_on(r == -1);
-            allocate_reactor();
+            allocate_reactor(allocation.cpu_id);
             engine()._id = i;
             _reactors[i] = &engine();
             auto queue_idx = alloc_io_queue(i);
@@ -2625,7 +2626,7 @@ void smp::configure(boost::program_options::variables_map configuration)
         });
     }
 
-    allocate_reactor();
+    allocate_reactor(allocations[0].cpu_id);
     _reactors[0] = &engine();
     auto queue_idx = alloc_io_queue(0);
 

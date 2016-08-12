@@ -94,6 +94,8 @@ class thread_context;
 namespace thread_impl {
 
 thread_context* get();
+bool should_yield();
+void yield();
 void switch_in(thread_context* to);
 void switch_out(thread_context* from);
 void init();

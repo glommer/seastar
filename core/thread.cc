@@ -187,6 +187,14 @@ thread_context::main() {
 
 namespace thread_impl {
 
+bool should_yield() {
+    return g_current_context->thread->should_yield();
+}
+
+void yield() {
+    g_current_context->thread->yield();
+}
+
 thread_context* get() {
     return g_current_context->thread;
 }

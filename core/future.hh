@@ -69,6 +69,9 @@ class thread_context;
 namespace thread_impl {
 
 thread_context* get();
+bool should_yield();
+void yield();
+
 void switch_in(thread_context* to);
 void switch_out(thread_context* from);
 
@@ -785,6 +788,8 @@ public:
     std::tuple<T...> get() {
         if (!state()->available()) {
             wait();
+        } else if (seastar::thread_impl::get() && seastar::thread_impl::should_yield()) {
+            seastar::thread_impl::yield();
         }
         return get_available_state().get();
     }

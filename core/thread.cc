@@ -32,6 +32,16 @@ namespace seastar {
 thread_local jmp_buf_link g_unthreaded_context;
 thread_local jmp_buf_link* g_current_context;
 
+#include <sys/sdt.h>
+
+void thread_in(thread_context* tc) {
+    STAP_PROBE1(seastar, thread_run_start, tc);
+}
+
+void thread_out(thread_context* tc) {
+    STAP_PROBE1(seastar, thread_run_end, tc);
+}
+
 thread_context::thread_context(thread_attributes attr, std::function<void ()> func)
         : _attr(std::move(attr))
         , _func(std::move(func)) {
@@ -80,6 +90,7 @@ thread_context::switch_in() {
     auto prev = g_current_context;
     g_current_context = &_context;
     _context.link = prev;
+    thread_in(this);
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_start();
         _context.yield_at = thread_clock::now() + _attr.scheduling_group->_this_period_remain;
@@ -97,6 +108,7 @@ thread_context::switch_in() {
 
 void
 thread_context::switch_out() {
+    thread_out(this);
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_stop();
     }
@@ -162,6 +174,7 @@ thread_context::s_main(unsigned int lo, unsigned int hi) {
 
 void
 thread_context::main() {
+    thread_in(this);
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_start();
     }
@@ -171,6 +184,7 @@ thread_context::main() {
     } catch (...) {
         _done.set_exception(std::current_exception());
     }
+    thread_out(this);
     if (_attr.scheduling_group) {
         _attr.scheduling_group->account_stop();
     }

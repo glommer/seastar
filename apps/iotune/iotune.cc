@@ -639,16 +639,19 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
 uint32_t io_queue_discovery(sstring dir, std::vector<unsigned> cpus, std::chrono::seconds timeout) {
     iotune_manager iotune_manager(cpus.size(), dir, timeout);
 
-    for (auto i = 0ul; i < cpus.size(); ++i) {
-        iotune_manager.spawn_new([&cpus, &iotune_manager, id = i] {
-            pin_this_thread(cpus[id]);
-            do {
-                auto my_concurrency = iotune_manager.get_thread_concurrency(id);
-                iotune_manager.run_test(id, my_concurrency);
-            } while (iotune_manager.analyze_results(id) == iotune_manager::test_done::no);
-        });
+    auto run_thread_load = [&iotune_manager, &cpus] (auto id) {
+        pin_this_thread(cpus[id]);
+        do {
+            auto my_concurrency = iotune_manager.get_thread_concurrency(id);
+            iotune_manager.run_test(id, my_concurrency);
+        } while (iotune_manager.analyze_results(id) == iotune_manager::test_done::no);
+    };
+
+    for (auto i = 1ul; i < cpus.size(); ++i) {
+        iotune_manager.spawn_new([&cpus, &iotune_manager, id = i, &run_thread_load] { run_thread_load(id); });
     }
 
+    run_thread_load(0);
     return iotune_manager.finish_estimate();
 }
 

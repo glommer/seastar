@@ -260,6 +260,12 @@ private:
     void find_next_concurrency(const run_stats& result) {
         bool should_run_more = (clock::now() < _maximum_end_time);
         if (!should_run_more && _current_test_phase == test_phase::find_max_region) {
+            std::queue<unsigned> empty_queue;
+            _concurrency_queue.swap(empty_queue);
+            _test_done = test_done::yes;
+            _time_run_atomic.fetch_add(1, std::memory_order_release);
+            _results_barrier.wait();
+            wait_for_threads();
             throw iotune_timeout_exception("IOTune timed out before the end of first disk scan. Can't provide a meaningful result - Aborting");
         }
 
@@ -314,6 +320,12 @@ private:
             return true;
         } else {
             return false;
+        }
+    }
+
+    void wait_for_threads() {
+        for (auto&& t: _threads) {
+            t.join();
         }
     }
 public:
@@ -395,9 +407,7 @@ public:
     }
 
     uint32_t finish_estimate() {
-        for (auto&& t: _threads) {
-            t.join();
-        }
+        wait_for_threads();
 
         if (_best_critical_concurrency == 0) {
             std::cerr << "============= Cut here ===============" << std::endl;

@@ -114,6 +114,10 @@ public:
     using clock =  timer<>::clock;
     using time_point =  timer<>::time_point;
 
+    static constexpr size_t max_counter() {
+        return std::numeric_limits<ssize_t>::max();
+    }
+
     /// Constructs a semaphore object with a specific number of units
     /// in its internal counter. E.g., starting it at 1 is suitable for use as
     /// an unlocked mutex.

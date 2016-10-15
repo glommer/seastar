@@ -87,7 +87,7 @@ struct semaphore_default_exception_factory {
 template<typename ExceptionFactory>
 class basic_semaphore {
 private:
-    size_t _count;
+    ssize_t _count;
     std::exception_ptr _ex;
     struct entry {
         promise<> pr;
@@ -111,10 +111,21 @@ private:
     chunked_fifo<entry> _wait_list;
 
     bool has_available_units(size_t nr) const {
-        return _count >= nr;
+        return _count >= 0 && (static_cast<size_t>(_count) >= nr);
     }
     bool may_proceed(size_t nr) const {
         return has_available_units(nr) && _wait_list.empty();
+    }
+
+    // used by consume and signal_one
+    void maybe_release_one() {
+        if (!_wait_list.empty() && has_available_units(_wait_list.front().nr)) {
+            auto& x = _wait_list.front();
+            _count -= x.nr;
+            x.pr.set_value();
+            x.tr.cancel();
+            _wait_list.pop_front();
+        }
     }
 public:
     using duration =  timer<>::duration;
@@ -233,6 +244,39 @@ public:
             _wait_list.pop_front();
         }
     }
+
+    /// Deposits a specified number of units into the counter and wakes up at most one request
+    ///
+    /// The counter is incremented by the specified number of units.
+    /// If the new counter value is sufficient to satisfy the request
+    /// of one waiter, its future (in FIFO order) become
+    /// ready, and the value of the counter is reduced according to
+    /// the amount requested.
+    ///
+    /// \param nr Number of units to deposit (default 1).
+    void signal_one(size_t nr = 1) {
+        if (_ex) {
+            return;
+        }
+        _count += nr;
+        maybe_release_one();
+    }
+
+    /// Consume the specific number of units without blocking
+    //
+    /// Consume the specific number of units now, regardless of how many units are available
+    /// in the counter, and reduces the counter by that amount of units. This operation may
+    /// cause the counter to go negative.
+    ///
+    /// \param nr Amount of units to consume (default 1).
+    void consume(size_t nr = 1) {
+        if (_ex) {
+            return;
+        }
+        _count -= nr;
+        maybe_release_one();
+    }
+
     /// Attempts to reduce the counter value by a specified number of units.
     ///
     /// If sufficient units are available in the counter, and if no
@@ -254,7 +298,7 @@ public:
     /// Returns the number of units available in the counter.
     ///
     /// Does not take into account any waiters.
-    size_t current() const { return _count; }
+    size_t current() const { return _count >= 0 ? _count: 0; }
 
     /// Returns the current number of waiters
     size_t waiters() const { return _wait_list.size(); }

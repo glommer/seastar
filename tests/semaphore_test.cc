@@ -35,6 +35,15 @@
 using namespace seastar;
 using namespace std::chrono_literals;
 
+SEASTAR_TEST_CASE(test_semaphore_wait_0) {
+    // Make sure wait(0) works in a semaphore with an emptied count
+    semaphore zero(0);
+    BOOST_REQUIRE_EQUAL(zero.try_wait(0), true);
+    auto fut = zero.wait(0);
+    BOOST_REQUIRE_EQUAL(fut.available(), true);
+    return make_ready_future<>();
+}
+
 SEASTAR_TEST_CASE(test_semaphore_1) {
     return do_with(std::make_pair(semaphore(0), 0), [] (std::pair<semaphore, int>& x) {
         x.first.wait().then([&x] {

@@ -80,6 +80,14 @@ public:
 
     size_t max_size() const { return _max; }
 
+    // Clears the queue. Should only be called by the consumer.
+    void clear() {
+        _q = std::queue<T, circular_buffer<T>>();
+        if (!full()) {
+            notify_not_full();
+        }
+    }
+
     // Destroy any items in the queue, and pass the provided exception to any
     // waiting readers or writers.
     void abort(std::exception_ptr ex) {

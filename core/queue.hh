@@ -80,12 +80,18 @@ public:
 
     size_t max_size() const { return _max; }
 
+    // Clears the queue.
+    void clear() {
+        _q = std::queue<T, circular_buffer<T>>();
+        if (!full()) {
+            notify_not_full();
+        }
+    }
+
     // Destroy any items in the queue, and pass the provided exception to any
     // waiting readers or writers.
     void abort(std::exception_ptr ex) {
-        while (!_q.empty()) {
-            _q.pop();
-        }
+        _q = std::queue<T, circular_buffer<T>>();
         _ex = ex;
         if (_not_full) {
             _not_full->set_exception(ex);
@@ -152,6 +158,9 @@ future<T> queue<T>::pop_eventually() {
         return not_empty().then([this] {
             if (_ex) {
                 return make_exception_future<T>(_ex);
+            } else if (empty()) {
+                // Someone called clear after not_empty() resolved but before .then executed
+                return pop_eventually();
             } else {
                 return make_ready_future<T>(pop());
             }

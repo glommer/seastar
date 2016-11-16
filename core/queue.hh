@@ -80,6 +80,19 @@ public:
 
     size_t max_size() const { return _max; }
 
+    // Expand the size of the queue by the provided number of units
+    void expand(size_t units = 1) {
+        _max += units;
+        notify_not_full();
+    }
+
+    // Clears the queue
+    void clear() {
+        std::queue<T, circular_buffer<T>> nq;
+        _q.swap(nq);
+        notify_not_full();
+    }
+
     // Destroy any items in the queue, and pass the provided exception to any
     // waiting readers or writers.
     void abort(std::exception_ptr ex) {

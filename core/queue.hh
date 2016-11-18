@@ -80,6 +80,23 @@ public:
 
     size_t max_size() const { return _max; }
 
+    // Increases the maximum size of the queue by the specified number of units.
+    void expand(size_t units) {
+        _max += units;
+        if (!full()) {
+            notify_not_full();
+        }
+    }
+
+    // Decreases the maximum size of the queue by the specified number of units. If that's
+    // greater than the current queue maximum size, the maximum size is set to 0.
+    //
+    // Note that after a call to contract(), the queue effective size can be greater than the
+    // queue maximum size.
+    void contract(size_t units) {
+        _max -= std::min(units, _max);
+    }
+
     // Clears the queue. Should only be called by the consumer.
     void clear() {
         _q = std::queue<T, circular_buffer<T>>();
@@ -208,7 +225,7 @@ bool queue<T>::empty() const {
 template <typename T>
 inline
 bool queue<T>::full() const {
-    return _q.size() == _max;
+    return _q.size() >= _max;
 }
 
 template <typename T>

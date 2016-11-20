@@ -80,6 +80,14 @@ public:
 
     size_t max_size() const { return _max; }
 
+    // Set the maximum size to a new value
+    void set_max_size(size_t max) {
+        _max = max;
+        if (!full()) {
+            notify_not_full();
+        }
+    }
+
     // Clears the queue.
     void clear() {
         _q = std::queue<T, circular_buffer<T>>();
@@ -189,13 +197,13 @@ template <typename T>
 template <typename Func>
 inline
 bool queue<T>::consume(Func&& func) {
-    if (_q.size() == _max) {
-        notify_not_full();
-    }
     bool running = true;
     while (!_q.empty() && running) {
         running = func(std::move(_q.front()));
         _q.pop();
+    }
+    if (!full()) {
+        notify_not_full();
     }
     return running;
 }
@@ -209,7 +217,7 @@ bool queue<T>::empty() const {
 template <typename T>
 inline
 bool queue<T>::full() const {
-    return _q.size() == _max;
+    return _q.size() >= _max;
 }
 
 template <typename T>

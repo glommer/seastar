@@ -295,6 +295,10 @@ inline int alarm_signal() {
     return SIGRTMIN;
 }
 
+inline int block_notifier_signal() {
+    return SIGRTMIN + 1;
+}
+
 // Installs signal handler stack for current thread.
 // The stack remains installed as long as the returned object is kept alive.
 // When it goes out of scope the previous handler is restored.
@@ -351,6 +355,7 @@ reactor::reactor()
     r = timer_create(CLOCK_MONOTONIC, &sev, &_steady_clock_timer);
     assert(r >= 0);
     sigemptyset(&mask);
+    sigaddset(&mask, block_notifier_signal());
     r = ::pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
     assert(r == 0);
 #endif
@@ -362,6 +367,12 @@ reactor::reactor()
 }
 
 reactor::~reactor() {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, block_notifier_signal());
+    auto r = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    assert(r == 0);
+
     _dying.store(true, std::memory_order_relaxed);
     _task_quota_timer_thread.join();
     timer_delete(_steady_clock_timer);
@@ -378,14 +389,51 @@ reactor::~reactor() {
 
 void
 reactor::task_quota_timer_thread_fn() {
+    unsigned report_at = _tasks_processed_report_threshold;
+    unsigned tasks_processed_stalled = 0;
+    uint64_t last_tasks_processed_seen = 0;
+    uint64_t last_polls_seen = 0;
+
     while (!_dying.load(std::memory_order_relaxed)) {
         uint64_t events;
         _task_quota_timer.read(&events, 8);
         _local_need_preempt = true;
+
+        auto tp = _tasks_processed.load(std::memory_order_relaxed);
+        auto p = _polls.load(std::memory_order_relaxed);
+        if ((tp == last_tasks_processed_seen) && (p == last_polls_seen)) {
+            // Error is one quota. But by only taking a time measurement here, we
+            // avoid having to do it in run_tasks
+            if (tasks_processed_stalled++ == 0) {
+                _task_stalled_at.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+            }
+            if (tasks_processed_stalled == report_at) {
+                pthread_kill(_thread_id, block_notifier_signal());
+                report_at <<= 1;
+            }
+        } else {
+            _task_stalled_at.store({}, std::memory_order_relaxed);
+            last_tasks_processed_seen = tp;
+            last_polls_seen = p;
+            tasks_processed_stalled = 0;
+            report_at = _tasks_processed_report_threshold;
+        }
         // We're in a different thread, but guaranteed to be on the same core, so even
         // a signal fence is overdoing it
         std::atomic_signal_fence(std::memory_order_seq_cst);
     }
+}
+
+void
+reactor::block_notifier(int) {
+    auto start = engine()._task_stalled_at.load(std::memory_order_relaxed);
+    uint64_t delta = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock_type::now() - start).count();
+
+    backtrace_buffer buf;
+    buf.append("Reactor stalled for ");
+    buf.append(delta);
+    buf.append(" ms");
+    print_with_backtrace(buf);
 }
 
 template <typename T, typename E, typename EnableFunc>
@@ -487,6 +535,10 @@ void reactor::configure(boost::program_options::variables_map vm) {
 
     _handle_sigint = !vm.count("no-handle-interrupt");
     _task_quota = vm["task-quota-ms"].as<double>() * 1ms;
+
+    auto blocked_time = vm["blocked-reactor-notify-ms"].as<unsigned>() * 1ms;
+    _tasks_processed_report_threshold = unsigned(blocked_time / _task_quota);
+
     _max_task_backlog = vm["max-task-backlog"].as<unsigned>();
     _max_poll_time = vm["idle-poll-time-us"].as<unsigned>() * 1us;
     if (vm.count("poll-mode")) {
@@ -1997,8 +2049,8 @@ void reactor::register_metrics() {
     _metric_groups.add_group("reactor", {
             sm::make_gauge("tasks_pending", std::bind(&decltype(_pending_tasks)::size, &_pending_tasks), sm::description("Number of pending tasks in the queue")),
             // total_operations value:DERIVE:0:U
-            sm::make_derive("tasks_processed", _tasks_processed, sm::description("Total tasks processed")),
-            sm::make_derive("polls", _polls, sm::description("Number of times pollers were executed")),
+            sm::make_derive("tasks_processed", [this] { return _tasks_processed.load(std::memory_order_relaxed); }, sm::description("Total tasks processed")),
+            sm::make_derive("polls", [this] { return _polls.load(std::memory_order_relaxed); }, sm::description("Number of times pollers were executed")),
             sm::make_derive("timers_pending", std::bind(&decltype(_timers)::size, &_timers), sm::description("Number of tasks in the timer-pending queue")),
             sm::make_gauge("utilization", [this] { return _load * 100; }, sm::description("CPU utilization")),
             sm::make_derive("cpu_busy_ns", [this] () -> int64_t { return std::chrono::duration_cast<std::chrono::nanoseconds>(total_busy_time()).count(); },
@@ -2081,7 +2133,8 @@ void reactor::run_tasks(circular_buffer<std::unique_ptr<task>>& tasks) {
         tsk->run();
         tsk.reset();
         STAP_PROBE(seastar, reactor_run_tasks_single_end);
-        ++_tasks_processed;
+        auto tp = _tasks_processed.load(std::memory_order_relaxed);
+        _tasks_processed.store(tp + 1, std::memory_order_relaxed);
         // check at end of loop, to allow at least one task to run
         if (need_preempt() && tasks.size() <= _max_task_backlog) {
             break;
@@ -2501,6 +2554,12 @@ int reactor::run() {
     _task_quota_timer.timerfd_settime(0, its);
     auto& task_quote_itimerspec = its;
 
+    struct sigaction sa_block_notifier = {};
+    sa_block_notifier.sa_handler = &reactor::block_notifier;
+    sa_block_notifier.sa_flags = SA_RESTART;
+    auto r = sigaction(block_notifier_signal(), &sa_block_notifier, nullptr);
+    assert(r == 0);
+
     bool idle = false;
 
     std::function<bool()> check_for_work = [this] () {
@@ -2527,7 +2586,8 @@ int reactor::run() {
             break;
         }
 
-        ++_polls;
+        auto p =_polls.load(std::memory_order_relaxed);
+        _polls.fetch_add(p + 1, std::memory_order_relaxed);
 
         if (check_for_work()) {
             if (idle) {
@@ -3069,6 +3129,7 @@ reactor::get_options_description() {
                 "busy-poll for disk I/O (reduces latency and increases throughput)")
         ("task-quota-ms", bpo::value<double>()->default_value(2.0), "Max time (ms) between polls")
         ("max-task-backlog", bpo::value<unsigned>()->default_value(1000), "Maximum number of task backlog to allow; above this we ignore I/O")
+        ("blocked-reactor-notify-ms", bpo::value<unsigned>()->default_value(2000), "threshold in miliseconds over which the reactor is considered blocked if no progress is made")
         ("relaxed-dma", "allow using buffered I/O if DMA is not available (reduces performance)")
         ("overprovisioned", "run in an overprovisioned environment (such as docker or a laptop); equivalent to --idle-poll-time-us 0 --thread-affinity 0 --poll-aio 0")
         ("abort-on-seastar-bad-alloc", "abort when seastar allocator cannot allocate memory")

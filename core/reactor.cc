@@ -226,6 +226,66 @@ void reactor::signals::action(int signo, siginfo_t* siginfo, void* ignore) {
     engine()._signals._pending_signals.fetch_or(1ull << signo, std::memory_order_relaxed);
 }
 
+namespace {
+static constexpr unsigned backtrace_buf_size = 8 << 10;
+thread_local char backtrace_buf[backtrace_buf_size];
+thread_local unsigned backtrace_pos = 0;
+
+inline void print_backtrace_buffer() noexcept {
+    print_safe(backtrace_buf, backtrace_pos);
+    backtrace_pos = 0;
+}
+
+inline void fill_backtrace_buffer(const char* str, size_t len) noexcept {
+    if (backtrace_pos + len >= backtrace_buf_size) {
+        print_backtrace_buffer();
+    }
+    memcpy(backtrace_buf + backtrace_pos, str, len);
+    backtrace_pos += len;
+}
+
+inline void fill_backtrace_buffer(const char* str) noexcept {
+    fill_backtrace_buffer(str, strlen(str));
+}
+
+void fill_pointer_addr(uintptr_t addr) noexcept {
+    char buf[sizeof(addr) * 2];
+    convert_zero_padded_hex_safe(buf, sizeof(buf), addr);
+    fill_backtrace_buffer(buf, sizeof(buf));
+}
+
+template <typename Integral>
+void fill_decimal_safe(Integral n) noexcept {
+    char buf[sizeof(n) * 3];
+    auto len = convert_decimal_safe(buf, sizeof(buf), n);
+    fill_backtrace_buffer(buf, len);
+}
+}
+
+// Prints current backtrace to stderr.
+// Async-signal safe.
+static void print_backtrace_safe() noexcept {
+    backtrace([&] (uintptr_t addr) {
+        fill_backtrace_buffer("  0x");
+        fill_pointer_addr(addr - 1);
+        fill_backtrace_buffer("\n");
+    });
+}
+
+static void print_with_backtrace(const char* cause) noexcept {
+    fill_backtrace_buffer(cause);
+
+    if (local_engine) {
+        fill_backtrace_buffer(" on shard ");
+        fill_decimal_safe(local_engine->cpu_id());
+    }
+
+
+    fill_backtrace_buffer(".\nBacktrace:\n");
+    print_backtrace_safe();
+    print_backtrace_buffer();
+}
+
 inline int alarm_signal() {
     // We don't want to use SIGALRM, because the boost unit test library
     // also plays with it.
@@ -2357,16 +2417,6 @@ void reactor::stop_aio_eventfd_loop() {
     ::write(_aio_eventfd->get_fd(), &one, 8);
 }
 
-// Prints current backtrace to stderr.
-// Async-signal safe.
-static void print_backtrace_safe() noexcept {
-    backtrace([&] (uintptr_t addr) {
-        print_safe("  0x");
-        print_zero_padded_hex_safe(addr - 1);
-        print_safe("\n");
-    });
-}
-
 int reactor::run() {
     auto signal_stack = install_signal_handler_stack();
 
@@ -3179,16 +3229,6 @@ void install_oneshot_signal_handler() {
     }
     auto r = ::sigaction(Signal, &sa, nullptr);
     throw_system_error_on(r == -1);
-}
-
-static void print_with_backtrace(const char* cause) noexcept {
-    print_safe(cause);
-    if (local_engine) {
-        print_safe(" on shard ");
-        print_decimal_safe(local_engine->cpu_id());
-    }
-    print_safe(".\nBacktrace:\n");
-    print_backtrace_safe();
 }
 
 static void sigsegv_action() noexcept {

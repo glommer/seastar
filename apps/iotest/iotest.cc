@@ -82,6 +82,9 @@ protected:
         {}
 
     future<> start(sstring dir) {
+        if (_iodepth == 0) {
+            return make_ready_future<>();
+        }
         fill_buffer(_buf.get());
 
         auto name = sprint("%s/test-queue-%d", dir, engine().cpu_id());
@@ -92,6 +95,10 @@ protected:
     }
 public:
     future<> do_test(latency_clock::time_point test_start, std::chrono::seconds duration) {
+        if (_iodepth == 0) {
+            return make_ready_future<>();
+        }
+
         auto iodepth = boost::irange(0u, _iodepth);
         auto test_end = test_start + duration;
 
@@ -113,6 +120,9 @@ public:
     }
 
     void report_stats() {
+        if (_iodepth == 0) {
+            return;
+        }
         std::stringstream ss;
         ss << std::fixed << std::setprecision(2);
         auto bandwidth = (_bytes_transferred >> 10) / std::chrono::duration_cast<std::chrono::duration<double>>(_real_duration).count();
@@ -148,6 +158,9 @@ public:
     write_parms(size_t size, unsigned iodepth, std::chrono::microseconds delay) : io_parms(size, 4096, "write-priority", iodepth, delay) {}
 
     future<> start(sstring dir) {
+        if (_iodepth == 0) {
+            return make_ready_future<>();
+        }
         return io_parms::start(std::move(dir));
     }
 };
@@ -164,6 +177,9 @@ public:
     read_parms(size_t size, unsigned iodepth, std::chrono::microseconds delay) : io_parms(size, 512, "read-priority", iodepth, delay) {}
 
     future<> start(sstring dir) {
+        if (_iodepth == 0) {
+            return make_ready_future<>();
+        }
         return io_parms::start(std::move(dir)).then([this] {
             return do_with(size_t(0), [this] (auto& pos) {
                 auto bufsz = size_t(128) << 10;

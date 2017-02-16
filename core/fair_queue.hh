@@ -123,6 +123,9 @@ class fair_queue {
 
     void execute_one() {
         get_units(_sem, 1).then([this] (auto permit) {
+            if (_handles.empty()) {
+                return make_ready_future<>();
+            }
             priority_class_ptr h;
             do {
                 h = this->pop_priority_class();

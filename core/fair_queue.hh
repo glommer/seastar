@@ -36,10 +36,13 @@
 /// \addtogroup io-module
 /// @{
 
+/// \brief represents the right to submit one operation
+using fair_queue_permit = semaphore_units<>;
+
 /// \cond internal
 class priority_class {
     struct request {
-        promise<> pr;
+        promise<fair_queue_permit> pr;
         unsigned weight;
     };
     friend class fair_queue;
@@ -117,22 +120,22 @@ class fair_queue {
     }
 
     void execute_one() {
-        _sem.wait().then([this] {
+        get_units(_sem, 1).then([this] (auto permit) {
             priority_class_ptr h;
             do {
-                h = pop_priority_class();
+                h = this->pop_priority_class();
             } while (h->_queue.empty());
 
             auto req = std::move(h->_queue.front());
             h->_queue.pop_front();
 
-            req.pr.set_value();
+            req.pr.set_value(std::move(permit));
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
             auto req_cost  = float(req.weight) / h->_shares;
             auto cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
             float next_accumulated = h->_accumulated + cost;
             while (std::isinf(next_accumulated)) {
-                normalize_stats();
+                this->normalize_stats();
                 // If we have renormalized, our time base will have changed. This should happen very infrequently
                 delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
                 cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
@@ -141,7 +144,7 @@ class fair_queue {
             h->_accumulated = next_accumulated;
 
             if (!h->_queue.empty()) {
-                push_priority_class(h);
+                this->push_priority_class(h);
             }
             return make_ready_future<>();
         });
@@ -201,7 +204,7 @@ public:
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
-        promise<> pr;
+        promise<fair_queue_permit> pr;
         auto fut = pr.get_future();
 
         push_priority_class(pc);
@@ -212,10 +215,8 @@ public:
             pc->_queue.pop_back();
             throw;
         }
-        return fut.then([func = std::move(func)] {
-            return func();
-        }).finally([this] {
-            _sem.signal();
+        return fut.then([func = std::move(func)] (auto permit) {
+            return func().finally([permit = std::move(permit)] {});
         });
     }
 

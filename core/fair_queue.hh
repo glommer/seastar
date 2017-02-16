@@ -140,7 +140,9 @@ class fair_queue {
         auto req = std::move(h->_queue.front());
         h->_queue.pop_front();
 
-        req.pr.set_value(std::move(permit));
+        // trick to schedule this future urgently. We want to dispatch to request ASAP.
+        make_ready_future<fair_queue_permit>(std::move(permit)).forward_to(std::move(req.pr));
+
         auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
         auto req_cost  = float(req.weight) / h->_shares;
         auto cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
@@ -209,7 +211,7 @@ public:
     ///
     /// \return \c func's return value, if \c func returns a future, or future<T> if \c func returns a non-future of type T.
     template <typename Func>
-    futurize_t<std::result_of_t<Func()>> queue(priority_class_ptr pc, unsigned weight, Func func) {
+    futurize_t<std::result_of_t<Func(fair_queue_permit)>> queue(priority_class_ptr pc, unsigned weight, Func func) {
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
@@ -225,7 +227,7 @@ public:
             throw;
         }
         return fut.then([func = std::move(func)] (auto permit) {
-            return func().finally([permit = std::move(permit)] {});
+            return func(std::move(permit));
         });
     }
 

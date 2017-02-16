@@ -27,6 +27,7 @@
 #include "core/sleep.hh"
 #include "core/align.hh"
 #include "core/timer.hh"
+#include "unistd.h"
 #include <chrono>
 #include <boost/range/irange.hpp>
 #include <boost/algorithm/string.hpp>
@@ -49,7 +50,7 @@ using accumulator_type = accumulator_set<double, stats<tag::mean, tag::max, tag:
 using latency_clock = std::chrono::steady_clock;
 
 struct io_parms {
-    static constexpr size_t file_size = 1ull << 30;
+    static constexpr size_t file_size = 10ull << 30;
 
     size_t _bytes_transferred = 0;
     size_t _iop = 0;
@@ -103,7 +104,10 @@ public:
         auto test_end = test_start + duration;
 
         return parallel_for_each(iodepth.begin(), iodepth.end(), [this, test_end] (auto idx) {
-            return do_until([this, test_end] { return latency_clock::now() >= test_end; }, [this] () mutable {
+            auto sss = make_lw_shared<latency_clock::time_point>(latency_clock::now());
+            return do_until([this, test_end] { return latency_clock::now() >= test_end; }, [this, sss] () mutable {
+//                printf("Write request at %ld\n", std::chrono::duration_cast<std::chrono::microseconds>(latency_clock::now() - *sss).count());
+                *sss = latency_clock::now();
                 auto req_start = latency_clock::now();
                 auto pos = _pos_distribution(random_generator) * _size;
                 return this->iofunc(pos).then([req_start = std::move(req_start), this] (size_t size) {
@@ -128,7 +132,9 @@ public:
         auto bandwidth = (_bytes_transferred >> 10) / std::chrono::duration_cast<std::chrono::duration<double>>(_real_duration).count();
         auto iops = _iop / std::chrono::duration_cast<std::chrono::duration<double>>(_real_duration).count();
         ss << id() << ":" <<std::endl;
-        ss << "Bandwidth (KB/s): " << std::setw(16) << bandwidth << std::endl;
+        ss << "I/O depth       : " << std::setw(16) << _iodepth << std::endl;
+        ss << "I/O Size (bytes): " << std::setw(16) << _size << std::endl;
+        ss << "Bandwidth (kB/s): " << std::setw(16) << bandwidth << std::endl;
         ss << "IOPS            : " << std::setw(16) << iops << std::endl;
         ss << "latencies (us)  : " << std::endl;
         ss << "  50th          : " << std::setw(16) << quantile(_latencies, quantile_probability = 0.50) << std::endl;
@@ -206,15 +212,17 @@ class context {
     write_parms _writer;
 
     std::chrono::seconds _duration;
-    bool _use_cpu_hog = false;
+    unsigned _cpu_hog_fibers = 0;
+    bool _cpu_hog_batch = false;
 public:
     context(sstring dir, size_t read_size, size_t write_size, unsigned read_iodepth, unsigned write_iodepth,
-            std::chrono::microseconds read_delay, std::chrono::microseconds write_delay, std::chrono::seconds duration, bool use_cpu_hog)
+            std::chrono::microseconds read_delay, std::chrono::microseconds write_delay, std::chrono::seconds duration, unsigned cpu_hog_fibers, bool cpu_hog_batch)
             : _dir(dir)
             , _reader(read_size, read_iodepth, read_delay)
             , _writer(write_size, write_iodepth, write_delay)
             , _duration(duration)
-            , _use_cpu_hog(use_cpu_hog)
+            , _cpu_hog_fibers(cpu_hog_fibers)
+            , _cpu_hog_batch(cpu_hog_batch)
     {
     }
 
@@ -229,10 +237,25 @@ public:
         auto test_start = latency_clock::now();
 
         auto cpu_hog = make_ready_future<>();
-        if (_use_cpu_hog) {
-            cpu_hog = do_until([this, test_end = test_start + _duration] { return latency_clock::now() >= test_end; }, [this] {
-                return make_ready_future<>();
-            });
+        if (_cpu_hog_fibers > 0) {
+            if (_cpu_hog_batch) {
+                cpu_hog = do_until([this, test_end = test_start + _duration] { return latency_clock::now() >= test_end; }, [this] {
+                    auto fibers = boost::irange(0u, _cpu_hog_fibers);
+                    return parallel_for_each(fibers.begin(), fibers.end(), [] (auto idx) {
+                        usleep(10);
+                        return make_ready_future<>();
+                    });
+                });
+            } else {
+                auto fibers = boost::irange(0u, _cpu_hog_fibers);
+                cpu_hog = parallel_for_each(fibers.begin(), fibers.end(), [test_end = test_start + _duration] (auto idx) {
+                    return do_until([test_end] { return latency_clock::now() >= test_end; }, [] {
+                        usleep(10);
+                        return make_ready_future<>();
+                    });
+                });
+
+            }
         }
         auto reader = _reader.do_test(test_start, _duration);
         auto writer = _writer.do_test(test_start, _duration);
@@ -264,7 +287,8 @@ int main(int ac, char** av) {
         ("delay-between-reads", bpo::value<unsigned>()->default_value(0), "time in microseconds to wait between issuing a new read request")
         ("delay-between-writes", bpo::value<unsigned>()->default_value(0), "time in microseconds to wait between issuing a new write request")
         ("duration", bpo::value<unsigned>()->default_value(60), "duration of the test, in seconds")
-        ("cpu-hog", bpo::value<bool>()->default_value(false), "if set to true will add a CPU hog competing for resources in each shard")
+        ("cpu-hog-fibers", bpo::value<unsigned>()->default_value(0), "number of parallel fibers running in a CPU hog competing for resources in each shard. Each fiber sleeps for 10 usec")
+        ("cpu-hog-batch", bpo::value<bool>()->default_value(false), "If true, submit cpu hogs in batches. If false, each completing subtask submits another")
     ;
 
 
@@ -279,16 +303,18 @@ int main(int ac, char** av) {
         auto read_delay = opts["delay-between-reads"].as<unsigned>() * 1us;
         auto write_delay = opts["delay-between-writes"].as<unsigned>() * 1us;
         auto duration = opts["duration"].as<unsigned>() * 1s;
-        auto cpu_hog = opts["cpu-hog"].as<bool>();
+        auto cpu_hog_fibers = opts["cpu-hog-fibers"].as<unsigned>();
+        auto cpu_hog_batch = opts["cpu-hog-batch"].as<bool>();
 
         return ctx.start(directory, read_size, write_size, read_iodepth,
-                         write_iodepth, read_delay, write_delay, duration, cpu_hog).then([&ctx] {
+                         write_iodepth, read_delay, write_delay, duration, cpu_hog_fibers, cpu_hog_batch).then([&ctx] {
             engine().at_exit([&ctx] {
                 return ctx.stop();
             });
             return ctx.invoke_on_all([] (auto& c) {
                 return c.start();
             }).then([&ctx] {
+                std::cout << "Starting test" << std::endl;
                 return ctx.invoke_on_all([] (auto& c) {
                     return c.do_test();
                 });

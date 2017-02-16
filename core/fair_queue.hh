@@ -121,36 +121,40 @@ class fair_queue {
 
     void execute_one() {
         get_units(_sem, 1).then([this] (auto permit) {
-            if (_handles.empty()) {
-                return make_ready_future<>();
-            }
-            priority_class_ptr h;
-            do {
-                h = this->pop_priority_class();
-            } while (h->_queue.empty());
-
-            auto req = std::move(h->_queue.front());
-            h->_queue.pop_front();
-
-            req.pr.set_value(std::move(permit));
-            auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-            auto req_cost  = float(req.weight) / h->_shares;
-            auto cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
-            float next_accumulated = h->_accumulated + cost;
-            while (std::isinf(next_accumulated)) {
-                this->normalize_stats();
-                // If we have renormalized, our time base will have changed. This should happen very infrequently
-                delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-                cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
-                next_accumulated = h->_accumulated + cost;
-            }
-            h->_accumulated = next_accumulated;
-
-            if (!h->_queue.empty()) {
-                this->push_priority_class(h);
-            }
+            this->dispatch_one(std::move(permit));
             return make_ready_future<>();
         });
+    }
+
+    void dispatch_one(fair_queue_permit&& permit) {
+        if (_handles.empty()) {
+            return;
+        }
+        priority_class_ptr h;
+        do {
+            h = this->pop_priority_class();
+        } while (h->_queue.empty());
+
+        auto req = std::move(h->_queue.front());
+        h->_queue.pop_front();
+
+        req.pr.set_value(std::move(permit));
+        auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
+        auto req_cost  = float(req.weight) / h->_shares;
+        auto cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
+        float next_accumulated = h->_accumulated + cost;
+        while (std::isinf(next_accumulated)) {
+            this->normalize_stats();
+            // If we have renormalized, our time base will have changed. This should happen very infrequently
+            delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
+            cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
+            next_accumulated = h->_accumulated + cost;
+        }
+        h->_accumulated = next_accumulated;
+
+        if (!h->_queue.empty()) {
+            this->push_priority_class(h);
+        }
     }
 
     float normalize_factor() const {
@@ -221,6 +225,14 @@ public:
         return fut.then([func = std::move(func)] (auto permit) {
             return func().finally([permit = std::move(permit)] {});
         });
+    }
+
+    /// Notify that the operation has completed.
+    ///
+    /// May start a new one re-using the provided \c permit if that is possible.
+    /// \param permit: an existing permit for the ongoing operation.
+    void notify_completion(fair_queue_permit&& permit) {
+        dispatch_one(std::move(permit));
     }
 
     /// Updates the current shares of this priority class

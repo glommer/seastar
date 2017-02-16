@@ -207,7 +207,7 @@ public:
     ///
     /// \return \c func's return value, if \c func returns a future, or future<T> if \c func returns a non-future of type T.
     template <typename Func>
-    futurize_t<std::result_of_t<Func()>> queue(priority_class_ptr pc, unsigned weight, Func func) {
+    futurize_t<std::result_of_t<Func(fair_queue_permit)>> queue(priority_class_ptr pc, unsigned weight, Func func) {
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
@@ -223,7 +223,7 @@ public:
             throw;
         }
         return fut.then([func = std::move(func)] (auto permit) {
-            return func().finally([permit = std::move(permit)] {});
+            return func(std::move(permit));
         });
     }
 

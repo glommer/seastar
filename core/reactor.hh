@@ -562,6 +562,10 @@ public:
         return _fq.waiters();
     }
 
+    void notify_completion(fair_queue_permit&& p) {
+        _fq.notify_completion(std::move(p));
+    }
+
     shard_id coordinator() const {
         return _coordinator;
     }
@@ -692,6 +696,12 @@ private:
     seastar::timer_set<timer<lowres_clock>, &timer<lowres_clock>::_link>::timer_list_t _expired_lowres_timers;
     seastar::timer_set<timer<manual_clock>, &timer<manual_clock>::_link> _manual_timers;
     seastar::timer_set<timer<manual_clock>, &timer<manual_clock>::_link>::timer_list_t _expired_manual_timers;
+    struct io_token {
+        promise<io_event> pr;
+        fair_queue_permit permit;
+        io_token(fair_queue_permit&& permit) : permit(std::move(permit)) {}
+    };
+
     io_context_t _io_context;
     std::vector<struct ::iocb> _pending_aio;
     semaphore _io_context_available;
@@ -845,7 +855,7 @@ public:
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
     template <typename Func>
-    future<io_event> submit_io(Func prepare_io);
+    future<io_event> submit_io(fair_queue_permit&& permit, Func prepare_io);
     template <typename Func>
     future<io_event> submit_io_read(const io_priority_class& priority_class, size_t len, Func prepare_io);
     template <typename Func>

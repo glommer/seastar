@@ -755,18 +755,18 @@ void reactor_backend_epoll::complete_epoll_event(pollable_fd_state& pfd, promise
 
 template <typename Func>
 future<io_event>
-reactor::submit_io(Func prepare_io) {
-    return _io_context_available.wait(1).then([this, prepare_io = std::move(prepare_io)] () mutable {
-        auto pr = std::make_unique<promise<io_event>>();
+reactor::submit_io(fair_queue_permit&& permit, Func prepare_io) {
+    return _io_context_available.wait(1).then([this, prepare_io = std::move(prepare_io), permit = std::move(permit)] () mutable {
+        auto token = std::make_unique<io_token>(std::move(permit));
         iocb io;
         prepare_io(io);
         if (_aio_eventfd) {
             io_set_eventfd(&io, _aio_eventfd->get_fd());
         }
-        auto f = pr->get_future();
-        io.data = pr.get();
+        auto f = token->pr.get_future();
+        io.data = token.get();
         _pending_aio.push_back(io);
-        pr.release();
+        token.release();
         if ((_io_queue->queued_requests() > 0) ||
             (_pending_aio.size() >= std::min(max_aio / 4, _io_queue->_capacity / 2))) {
             flush_pending_aio();
@@ -853,9 +853,10 @@ bool reactor::process_io()
     auto n = ::io_getevents(_io_context, 1, max_aio, ev, &timeout);
     assert(n >= 0);
     for (size_t i = 0; i < size_t(n); ++i) {
-        auto pr = reinterpret_cast<promise<io_event>*>(ev[i].data);
-        pr->set_value(ev[i]);
-        delete pr;
+        auto token = reinterpret_cast<io_token*>(ev[i].data);
+        token->pr.set_value(ev[i]);
+        _io_queue->notify_completion(std::move(token->permit));
+        delete token;
     }
     _io_context_available.signal(n);
     return n;
@@ -976,10 +977,10 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
         pclass.bytes += len;
         pclass.ops++;
         pclass.nr_queued++;
-        return queue._fq.queue(pclass.ptr, weight, [&pclass, start, prepare_io = std::move(prepare_io)] {
+        return queue._fq.queue(pclass.ptr, weight, [&pclass, start, prepare_io = std::move(prepare_io)] (auto&& permit) {
             pclass.nr_queued--;
             pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-            return engine().submit_io(std::move(prepare_io));
+            return engine().submit_io(std::move(permit), std::move(prepare_io));
         });
     });
 }

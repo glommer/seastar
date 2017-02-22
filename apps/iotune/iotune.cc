@@ -96,10 +96,10 @@ public:
     enum class test_done { no, yes };
     using clock = std::chrono::steady_clock;
     static constexpr uint64_t wbuffer_size = 128ul << 10;
-    static constexpr uint64_t rbuffer_size = 4ul << 10;
     static constexpr uint64_t desired_file_size = 10ull << 30;
 private:
     size_t _num_threads;
+    uint64_t _rbuffer_size;
     // We need all threads to synchronize and start the various phases at the same time.
     // Each of them will serve a purpose:
     //
@@ -338,8 +338,9 @@ private:
         }
     }
 public:
-    iotune_manager(size_t n, test_file file, std::chrono::seconds timeout)
+    iotune_manager(size_t n, test_file file, uint64_t rbuffer_size, std::chrono::seconds timeout)
         : _num_threads(n)
+        , _rbuffer_size(rbuffer_size)
         , _start_run_barrier(n)
         , _finish_run_barrier(n)
         , _time_run_atomic(0)
@@ -444,7 +445,6 @@ public:
 };
 
 constexpr uint64_t iotune_manager::wbuffer_size;
-constexpr uint64_t iotune_manager::rbuffer_size;
 
 test_file::test_file(const directory& dir)
     : name(dir.name + "/ioqueue-discovery")
@@ -464,6 +464,7 @@ static thread_local std::default_random_engine random_generator(std::chrono::dur
 class reader {
     uint64_t _opcount = 0;
     file_desc _file;
+    uint64_t _buffer_size;
     std::uniform_int_distribution<uint32_t> _pos_distribution;
     struct iocb _iocb;
     iotune_manager::clock::time_point _start_time;
@@ -471,17 +472,18 @@ class reader {
     iotune_manager::clock::time_point _end_time;
     std::unique_ptr<char[], free_deleter> _buf;
 public:
-    reader(file_desc f, uint64_t file_size, iotune_manager::clock::time_point start_time, iotune_manager::clock::time_point end_time)
+    reader(file_desc f, uint64_t file_size, uint64_t buffer_size, iotune_manager::clock::time_point start_time, iotune_manager::clock::time_point end_time)
                 : _file(std::move(f))
-                , _pos_distribution(0, (file_size/ iotune_manager::rbuffer_size) - 1)
+                , _buffer_size(buffer_size)
+                , _pos_distribution(0, (file_size/ buffer_size) - 1)
                 , _start_time(start_time)
                 , _tstamp(iotune_manager::clock::now())
                 , _end_time(end_time)
-                , _buf(allocate_aligned_buffer<char>(iotune_manager::rbuffer_size, 4096))
+                , _buf(allocate_aligned_buffer<char>(buffer_size, 4096))
     {}
 
     iocb* issue() {
-        io_prep_pread(&_iocb, _file.get(), _buf.get(), iotune_manager::rbuffer_size, _pos_distribution(random_generator) * iotune_manager::rbuffer_size);
+        io_prep_pread(&_iocb, _file.get(), _buf.get(), _buffer_size, _pos_distribution(random_generator) * _buffer_size);
         _iocb.data = this;
         _tstamp = std::chrono::steady_clock::now();
         return &_iocb;
@@ -537,7 +539,7 @@ run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
 
     auto fds = std::vector<reader>();
     for (unsigned i = 0u; i < concurrency; ++i) {
-        fds.emplace_back(_test_file.file.dup(), _test_file.real_size, start_time, start_time + total_time);
+        fds.emplace_back(_test_file.file.dup(), _test_file.real_size, _rbuffer_size, start_time, start_time + total_time);
     }
 
     for (auto& r: fds) {
@@ -553,7 +555,7 @@ run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
         throw_kernel_error(n);
         unsigned new_req = 0;
         for (auto i = 0ul; i < size_t(n); ++i) {
-            sanity_check_ev(ev[i], iotune_manager::rbuffer_size);
+            sanity_check_ev(ev[i], _rbuffer_size);
             auto reader_ptr = reinterpret_cast<reader*>(ev[i].data);
             auto iocb_ptr = reader_ptr->req_finished();
             if (iocb_ptr == nullptr) {
@@ -665,7 +667,8 @@ uint32_t io_queue_discovery(sstring dir, std::vector<unsigned> cpus, std::chrono
     directory test_dir(dir);
     test_file tf(test_dir);
     tf.generate(iotune_manager::desired_file_size, (timeout * 4) / 10);
-    iotune_manager iotune_manager(cpus.size(), tf, (timeout * 6) / 10);
+    auto rbuffer_size = 4ul << 10;
+    iotune_manager iotune_manager(cpus.size(), tf, rbuffer_size, (timeout * 6) / 10);
 
     do {
         for (auto i = 0ul; i < cpus.size(); ++i) {

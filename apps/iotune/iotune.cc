@@ -252,20 +252,14 @@ private:
 
     auto iterator_of_percentile(float percentile) {
         auto desired = percentile * _result_percentiles.at(100).IOPS;
-//        printf("Desired for %f pct : %f\n", percentile, desired);
-
-        uint64_t best_delta = std::numeric_limits<uint64_t>::max();
-        auto best_fit = _all_results.begin();
-
+        printf("Desired for %f pct : %f\n", percentile, desired);
         for (auto it = _all_results.begin(); it != _all_results.end(); ++it) {
-            uint64_t d = std::abs(int64_t(desired - it->second));
-            if (d < best_delta) {
-                best_delta = d;
-                best_fit = it;
+            if (it->second > desired) {
+                printf("Found point: %ld -> %ld\n", it->first, it->second);
+                return it;
             }
         }
-//        printf("Found point: %ld -> %ld\n", best_fit->first, best_fit->second);
-        return best_fit;
+        return _all_results.end();
     }
 
     void find_max_point(const run_stats& result, float percentile) {

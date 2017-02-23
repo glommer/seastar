@@ -71,9 +71,11 @@ struct directory {
 struct test_file {
     sstring name;
     file_desc file;
+    size_t real_size;
 
     test_file(const directory& dir);
-    void generate(iotune_manager& iotune_manager, std::chrono::seconds timeout);
+    test_file(const test_file& t);
+    void generate(size_t size, std::chrono::seconds timeout);
 };
 
 struct run_stats {
@@ -93,9 +95,9 @@ class iotune_manager {
 public:
     enum class test_done { no, yes };
     using clock = std::chrono::steady_clock;
-    uint64_t file_size = 10ull << 30;
     static constexpr uint64_t wbuffer_size = 128ul << 10;
     static constexpr uint64_t rbuffer_size = 4ul << 10;
+    static constexpr uint64_t desired_file_size = 10ull << 30;
 private:
     size_t _num_threads;
     // We need all threads to synchronize and start the various phases at the same time.
@@ -336,17 +338,15 @@ private:
         }
     }
 public:
-    iotune_manager(size_t n, sstring dirname, std::chrono::seconds timeout)
+    iotune_manager(size_t n, test_file file, std::chrono::seconds timeout)
         : _num_threads(n)
         , _start_run_barrier(n)
         , _finish_run_barrier(n)
         , _time_run_atomic(0)
-        , _test_file(directory(dirname))
+        , _test_file(std::move(file))
         , _run_start_time(iotune_manager::clock::now())
         , _maximum_end_time(_run_start_time + timeout)
     {
-        _test_file.generate(*this, (timeout * 4) / 10);
-
         // Initial exploratory run
         for (auto initial: boost::irange<unsigned, unsigned>(4, 512, 4)) {
             _concurrency_queue.push(initial);
@@ -452,6 +452,13 @@ test_file::test_file(const directory& dir)
     unlink(name.c_str());
 }
 
+test_file::test_file(const test_file& base)
+    : name(base.name)
+    , file(base.file.dup())
+    , real_size(base.real_size) {
+}
+
+
 static thread_local std::default_random_engine random_generator(std::chrono::duration_cast<std::chrono::nanoseconds>(iotune_manager::clock::now().time_since_epoch()).count());
 
 class reader {
@@ -530,7 +537,7 @@ run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
 
     auto fds = std::vector<reader>();
     for (unsigned i = 0u; i < concurrency; ++i) {
-        fds.emplace_back(_test_file.file.dup(), file_size, start_time, start_time + total_time);
+        fds.emplace_back(_test_file.file.dup(), _test_file.real_size, start_time, start_time + total_time);
     }
 
     for (auto& r: fds) {
@@ -565,12 +572,12 @@ run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
     return result;
 }
 
-void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds timeout) {
+void test_file::generate(size_t desired_size, std::chrono::seconds timeout) {
     auto to_gb = [] (auto b) {
         return float(b) / (1ull << 30);
     };
 
-    std::cout << "Generating evaluation file sized " << to_gb(iotune_manager.file_size) << "GB..." << std::flush;
+    std::cout << "Generating evaluation file sized " << to_gb(desired_size) << "GB..." << std::flush;
 
     auto start_time = iotune_manager::clock::now();
     auto latest_tstamp = start_time;
@@ -583,7 +590,7 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
 
     auto buf = allocate_aligned_buffer<char>(iotune_manager::wbuffer_size, 4096);
     memset(buf.get(), 0, iotune_manager::wbuffer_size);
-    auto ft = ftruncate(file.get(), iotune_manager.file_size);
+    auto ft = ftruncate(file.get(), desired_size);
     throw_kernel_error(ft);
 
     std::vector<iocb*> iocb_vecptr;
@@ -599,10 +606,10 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
     unsigned aio_outstanding = 0;
     bool stopped_on_error = false;
 
-    while ((pos < iotune_manager.file_size && !stopped_on_error) || aio_outstanding) {
+    while ((pos < desired_size && !stopped_on_error) || aio_outstanding) {
         unsigned i = 0;
-        while (i < max_aio - aio_outstanding && pos < iotune_manager.file_size) {
-            auto now = std::min(iotune_manager.file_size - pos, iotune_manager::wbuffer_size);
+        while (i < max_aio - aio_outstanding && pos < desired_size) {
+            auto now = std::min(desired_size - pos, iotune_manager::wbuffer_size);
             auto& iocb = iocbs[i++];
             iocb.data = buf.get();
             io_prep_pwrite(&iocb, file.get(), buf.get(), now, pos);
@@ -627,7 +634,7 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
                     // FIXME: The buffer size can be cut short due to other conditions that are unrelated
                     // to ENOSPC. We should be testing it separately.
                     std::cout << " stopped early due to disk space issues. Will continue but accuracy may suffer." << std::endl;
-                    iotune_manager.file_size = bytes_written;
+                    real_size = bytes_written;
                     stopped_on_error = true;
                     break;
                 } else {
@@ -640,7 +647,7 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
         if ((latest_tstamp - start_time) > timeout) {
             std::cout << " timed out before we could write the entire file. Will continue but accuracy may suffer." << std::endl;
             aio_outstanding = 0;
-            iotune_manager.file_size = bytes_written;
+            real_size = bytes_written;
             if (bytes_written < (1ul << 30)) {
                 throw iotune_timeout_exception("timed out before we could write 1GB worth of data. Not enough to continue");
             }
@@ -648,14 +655,17 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
         }
 
     }
-    iotune_manager.file_size = bytes_written;
-    std::cout << to_gb(iotune_manager.file_size) << "GB written in "
+    real_size = bytes_written;
+    std::cout << to_gb(real_size) << "GB written in "
               << std::chrono::duration_cast<std::chrono::seconds>(latest_tstamp - start_time).count()
               << " seconds" << std::endl;
 }
 
 uint32_t io_queue_discovery(sstring dir, std::vector<unsigned> cpus, std::chrono::seconds timeout) {
-    iotune_manager iotune_manager(cpus.size(), dir, timeout);
+    directory test_dir(dir);
+    test_file tf(test_dir);
+    tf.generate(iotune_manager::desired_file_size, (timeout * 4) / 10);
+    iotune_manager iotune_manager(cpus.size(), tf, (timeout * 6) / 10);
 
     do {
         for (auto i = 0ul; i < cpus.size(); ++i) {

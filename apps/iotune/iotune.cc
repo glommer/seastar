@@ -167,7 +167,8 @@ private:
     //
     // We will keep track of the best result we have so far. This is used
     // to find the maximum seen throughput.
-    run_stats _best_result;
+    std::unordered_map<unsigned, run_stats> _result_percentiles = {{ 100, run_stats() }};
+
     // For how long to run the test for. As we progress with the estimation,
     // we will increase the time of each run.
     clock::duration _phase_timing = 250ms;
@@ -234,15 +235,15 @@ private:
     }
 
     void find_max_region(const run_stats& result) {
-        if (result.IOPS > _best_result.IOPS) {
-            _best_result = result;
+        if (result.IOPS > _result_percentiles.at(100).IOPS) {
+            _result_percentiles.at(100) = result;
         }
         // Now try to explore the region around the maximum to see
         // if we find anything higher than the current seen maximum
         if (_concurrency_queue.empty()) {
-            std::cout << "Refining search for maximum. So far, " << _best_result.IOPS <<  " IOPS" << std::endl;
+            std::cout << "Refining search for maximum. So far, " << _result_percentiles.at(100).IOPS <<  " IOPS" << std::endl;
             _phase_timing = 500ms;
-            auto it = _all_results.find(_best_result.concurrency);
+            auto it = _all_results.find(_result_percentiles.at(100).concurrency);
 
             refill_concurrency_queue(std::prev(it), std::next(it));
             _current_test_phase = test_phase::find_max_point;
@@ -250,25 +251,25 @@ private:
     }
 
     void find_max_point(const run_stats& result, float percentile) {
-        if (result.IOPS > _best_result.IOPS) {
-            _best_result = result;
+        if (result.IOPS > _result_percentiles.at(100).IOPS) {
+            _result_percentiles.at(100) = result;
         }
         if (_concurrency_queue.empty()) {
-            std::cout << "Maximum throughput: " << _best_result.IOPS <<  " IOPS" << std::endl;
+            std::cout << "Maximum throughput: " << _result_percentiles.at(100).IOPS <<  " IOPS" << std::endl;
             _phase_timing = 2000ms;
             _current_test_phase = test_phase::find_percentile;
 
             std::map<uint64_t, uint64_t>::iterator iterator_of_minimum = _all_results.begin();
             std::map<uint64_t, uint64_t>::iterator iterator_of_maximum = _all_results.end();
             for (auto it = _all_results.begin(); it != _all_results.end(); ++it) {
-                if (((*it).second > (percentile - 0.20) * _best_result.IOPS) && (iterator_of_minimum == _all_results.begin())) {
+                if (((*it).second > (percentile - 0.20) * _result_percentiles.at(100).IOPS) && (iterator_of_minimum == _all_results.begin())) {
                     iterator_of_minimum = it;
                     break;
                 }
             }
 
             for (auto it = std::next(iterator_of_minimum); it != _all_results.end(); ++it) {
-                if ((*it).second > ((percentile + 0.10) * _best_result.IOPS)) {
+                if ((*it).second > ((percentile + 0.10) * _result_percentiles.at(100).IOPS)) {
                     iterator_of_maximum = it;
                     break;
                 }
@@ -327,7 +328,7 @@ private:
     }
 
     bool update_current_best(const run_stats& result) {
-        uint64_t critical_IOPS = _desired_percentile * _best_result.IOPS;
+        uint64_t critical_IOPS = _desired_percentile * _result_percentiles.at(100).IOPS;
         uint64_t d = std::abs(int64_t(critical_IOPS - result.IOPS));
         if (d < _best_critical_delta) {
             _best_critical_delta = d;
@@ -425,7 +426,7 @@ public:
                 std::cerr << r.first << ", " << r.second << std::endl;
             }
 
-            std::cerr << "Target critical IOPS: " << _desired_percentile * _best_result.IOPS << std::endl;
+            std::cerr << "Target critical IOPS: " << _desired_percentile * _result_percentiles.at(100).IOPS << std::endl;
             std::cerr << "best concurrency: " << _best_critical_concurrency << std::endl;
             std::cerr << "best delta: " << _best_critical_delta << std::endl;
             auto msg = "iotune encountered an error and could not calculate proper I/O Scheduler configuration. Please report the status above";

@@ -250,6 +250,24 @@ private:
         }
     }
 
+    auto iterator_of_percentile(float percentile) {
+        auto desired = percentile * _result_percentiles.at(100).IOPS;
+//        printf("Desired for %f pct : %f\n", percentile, desired);
+
+        uint64_t best_delta = std::numeric_limits<uint64_t>::max();
+        auto best_fit = _all_results.begin();
+
+        for (auto it = _all_results.begin(); it != _all_results.end(); ++it) {
+            uint64_t d = std::abs(int64_t(desired - it->second));
+            if (d < best_delta) {
+                best_delta = d;
+                best_fit = it;
+            }
+        }
+//        printf("Found point: %ld -> %ld\n", best_fit->first, best_fit->second);
+        return best_fit;
+    }
+
     void find_max_point(const run_stats& result, float percentile) {
         if (result.IOPS > _result_percentiles.at(100).IOPS) {
             _result_percentiles.at(100) = result;
@@ -259,23 +277,8 @@ private:
             _phase_timing = 1000ms;
             _current_test_phase = test_phase::find_percentile;
 
-            std::map<uint64_t, uint64_t>::iterator iterator_of_minimum = _all_results.begin();
-            std::map<uint64_t, uint64_t>::iterator iterator_of_maximum = _all_results.end();
-            for (auto it = _all_results.begin(); it != _all_results.end(); ++it) {
-                if (((*it).second > (percentile - 0.20) * _result_percentiles.at(100).IOPS) && (iterator_of_minimum == _all_results.begin())) {
-                    iterator_of_minimum = it;
-                    break;
-                }
-            }
-
-            for (auto it = std::next(iterator_of_minimum); it != _all_results.end(); ++it) {
-                if ((*it).second > ((percentile + 0.10) * _result_percentiles.at(100).IOPS)) {
-                    iterator_of_maximum = it;
-                    break;
-                }
-            }
-
-            refill_concurrency_queue(iterator_of_minimum, iterator_of_maximum);
+            auto it = iterator_of_percentile(percentile);
+            refill_concurrency_queue(std::prev(it), std::next(it));
         }
     }
 

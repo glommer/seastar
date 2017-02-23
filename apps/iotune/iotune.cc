@@ -242,7 +242,7 @@ private:
         // if we find anything higher than the current seen maximum
         if (_concurrency_queue.empty()) {
             std::cout << "Refining search for maximum. So far, " << _result_percentiles.at(100).IOPS <<  " IOPS" << std::endl;
-            _phase_timing = 500ms;
+            _phase_timing = 1000ms;
             auto it = _all_results.find(_result_percentiles.at(100).concurrency);
 
             refill_concurrency_queue(std::prev(it), std::next(it));
@@ -256,7 +256,7 @@ private:
         }
         if (_concurrency_queue.empty()) {
             std::cout << "Maximum throughput: " << _result_percentiles.at(100).IOPS <<  " IOPS" << std::endl;
-            _phase_timing = 2000ms;
+            _phase_timing = 1000ms;
             _current_test_phase = test_phase::find_percentile;
 
             std::map<uint64_t, uint64_t>::iterator iterator_of_minimum = _all_results.begin();

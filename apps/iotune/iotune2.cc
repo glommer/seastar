@@ -221,9 +221,16 @@ class iotune_manager {
     sstring _dirname;
     seastar::sharded<iotune_shard_context> _iotune_shard_context;
 
-//    using run_results = std::map<uint64_t, uint64_t>;
     using run_results = std::set<run_stats, run_stats_ordering>;
-    std::map<uint64_t, run_results> _all_results;
+    std::map<uint64_t, run_results> _raw_results;
+    std::vector<float> _percentiles_of_interest = {0.5, 0.70, 0.80, 0.95};
+
+    struct eval_result {
+        float percentile;
+        unsigned concurrency;
+        uint64_t IOPS;
+    };
+    std::map<uint64_t, eval_result> _eval_results;
 
     struct run_params {
         std::chrono::milliseconds duration;
@@ -238,7 +245,7 @@ class iotune_manager {
             uint64_t buffer_size = params.buffer_size;
             return _iotune_shard_context.map_reduce(run_stats_aggregator(), &iotune_shard_context::issue_reads,
                     std::move(concurrency), std::move(buffer_size), std::move(start), std::move(end)).then([this, params] (auto r) {
-                _all_results.at(params.buffer_size).emplace(r.concurrency, r.IOPS);
+                _raw_results.at(params.buffer_size).emplace(run_stats{r.IOPS, r.concurrency});
                 logger.debug("buffer size {} concurrency: {}, IOPS {}", params.buffer_size, r.concurrency, r.IOPS);
                 return make_ready_future<>();
             });
@@ -249,7 +256,7 @@ class iotune_manager {
         auto best_delta = std::numeric_limits<uint64_t>::max();
         auto best_result = run_stats{0, 0};
 
-        for (auto& m : _all_results.at(buffer_size)) {
+        for (auto& m : _raw_results.at(buffer_size)) {
             uint64_t d = std::abs(int64_t(IOPS_goal - m.IOPS));
             if (d < best_delta) {
                 best_delta = d;
@@ -264,7 +271,7 @@ class iotune_manager {
     }
 
     run_stats find_first(uint64_t buffer_size, uint64_t IOPS_goal) const {
-        for (auto& m : _all_results.at(buffer_size)) {
+        for (auto& m : _raw_results.at(buffer_size)) {
             if (m.IOPS > IOPS_goal) {
                 return m;
             }
@@ -273,8 +280,8 @@ class iotune_manager {
     }
 
     auto range_around(unsigned point) const {
-        auto min = point > 8 ? point - 8 : 1;
-        auto max = point + 8;
+        auto min = point > 4 ? point - 4 : 1;
+        auto max = point + 4;
         return boost::irange<unsigned, unsigned>(min, max, 1);
     }
 
@@ -302,34 +309,42 @@ public:
 
     // This should take around a minute
     future<> measure_reads(uint64_t buffer_size) {
-        _all_results.emplace(buffer_size, run_results{{ 0ul, 0ul }});
+        _raw_results.emplace(buffer_size, run_results{{ 0ul, 0ul }});
         run_params params{500ms, buffer_size};
-        // Should take 512 / 8 * 500ms = ~ 32s
-        return explore_range(boost::irange<unsigned, unsigned>(1, 512, 8), std::move(params)).then([this, buffer_size] {
+        // Should take 512 / 4 * 250ms = ~ 32s
+        return explore_range(boost::irange<unsigned, unsigned>(1, 512, 4), std::move(params)).then([this, buffer_size] {
             run_params params{1000ms, buffer_size};
             auto best_result = find_max(buffer_size);
             return explore_range(range_around(best_result), std::move(params));
         }).then([this, buffer_size] {
             auto refined_best = find_max(buffer_size);
-            logger.info("{} buffers: Maximum READ IOPS {} at concurrency of {}", buffer_size, refined_best.IOPS, refined_best.concurrency);
+            logger.debug("{} buffers: Maximum READ IOPS {} at concurrency of {}", buffer_size, refined_best.IOPS, refined_best.concurrency);
 
-            std::vector<float> percentiles({0.5, 0.70, 0.80, 0.95});
             std::set<unsigned> explorer;
-            for (auto&& p : percentiles) {
+            for (auto&& p : _percentiles_of_interest) {
                 for (auto&& r: range_around(find_first(buffer_size, uint64_t(p * refined_best.IOPS)))) {
                     explorer.insert(r);
                 }
             }
 
-            // Should take 4 * 8 * 1s = 32s
+            // Should take 5 * 8 * 1s = 40s
             run_params params{1000ms, buffer_size};
-            return explore_range(explorer, params).then([this, percentiles, buffer_size, max = refined_best.IOPS] {
-                for (auto&&p : percentiles) {
-                    auto r = find_first(buffer_size, uint64_t(p * max));
-                    logger.info("{} buffers: {} percentile READ IOPS at concurrency of {}", buffer_size, p, r.concurrency);
-                }
-            });
+            return explore_range(explorer, params);
         });
+    }
+
+    // FIXME: Generate proper YAML
+    void show_config() {
+        std::cout << "reads:" << std::endl;
+        for (auto&& s: _raw_results) {
+            std::cout << "\t" << s.first << "kB:" << std::endl;    
+            auto max = find_max(s.first);
+            for (auto&& p: _percentiles_of_interest) {
+                auto r = find_first(s.first, uint64_t(p * max.IOPS));
+                std::cout << "\t\t" << "IOPS(" << r.concurrency << ")=" << r.IOPS << std::endl;    
+            }
+            std::cout << "\t\t" << "IOPS(" << max.concurrency << ")=" << max.IOPS << std::endl;    
+        }
     }
 
     future<> write_data() {
@@ -439,7 +454,11 @@ int main(int ac, char** av) {
                     sizes.push_back(next);
                 }
                 return do_for_each(sizes, [iotune_manager] (auto buf_size) {
+                    logger.info("Evaluating {} reads", buf_size);
                     return iotune_manager->measure_reads(buf_size);
+                }).then([iotune_manager] {
+                    iotune_manager->show_config();
+                    return make_ready_future<>();
                 });
             });
         }).then([] {

@@ -370,6 +370,27 @@ int do_fsqual(sstring directory) {
     return 0;
 }
 
+struct option_file_format_type {
+    sstring value;
+    explicit option_file_format_type(sstring f) : value(f) {}
+};
+
+std::ostream& operator<<(std::ostream& out, option_file_format_type offt) {
+    return out << offt.value;
+}
+
+void validate(boost::any& v, const std::vector<std::string>& values,
+              option_file_format_type* target_type, int) {
+    using namespace boost::program_options;
+
+    validators::check_first_occurrence(v);
+    auto&& format = validators::get_single_string(values);
+    if (format != "seastar" && format != "envfile") {
+        throw validation_error(validation_error::invalid_option_value);
+    }
+    v = option_file_format_type(format);
+}
+
 int main(int ac, char** av) {
     namespace bpo = boost::program_options;
     bool fs_check = false;
@@ -378,12 +399,16 @@ int main(int ac, char** av) {
     auto opt_add = app.add_options();
     opt_add
         ("evaluation-directory", bpo::value<sstring>()->required(), "directory where to execute the evaluation")
+        ("options-file", bpo::value<sstring>()->default_value("~/.config/seastar/io.conf"), "Output configuration file")
+        ("format", bpo::value<option_file_format_type>()->default_value(option_file_format_type("seastar")), "Configuration file format (seastar | envfile)")
         ("timeout", bpo::value<uint64_t>()->default_value(60 * 6), "Maximum time to wait for iotune to finish (seconds)")
         ("fs-check", bpo::bool_switch(&fs_check), "perform FS check only")
     ;
 
     return app.run(ac, av, [&] {
         auto& configuration = app.configuration();
+        auto format = configuration["format"].as<option_file_format_type>().value;
+        auto conf_file = configuration["options-file"].as<sstring>();
         auto directory = configuration["evaluation-directory"].as<sstring>();
         auto timeout = std::chrono::seconds(configuration["timeout"].as<uint64_t>());
 

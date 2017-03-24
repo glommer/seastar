@@ -51,6 +51,7 @@ using namespace std::chrono_literals;
 using iotune_clock = std::chrono::steady_clock;
 
 bool filesystem_has_good_aio_support(sstring directory, bool verbose);
+static thread_local std::default_random_engine random_generator(std::chrono::duration_cast<std::chrono::nanoseconds>(iotune_clock::now().time_since_epoch()).count());
 
 struct directory {
     sstring name;
@@ -64,9 +65,15 @@ class test_file {
     sstring _name;
     uint64_t _file_size;
     file _file;
+    std::uniform_int_distribution<uint64_t> _pos_distribution;
 
     float to_gb(auto b) {
         return float(b) / (1ull << 30);
+    }
+
+    uint64_t random_position(uint64_t buffer_size) {
+        auto max_pos = (_file_size / buffer_size) - 1;
+        return buffer_size * (_pos_distribution(random_generator) % max_pos);
     }
 public:
     test_file(const directory& dir, uint64_t desired_size);
@@ -75,6 +82,10 @@ public:
             _file = file;
             return remove_file(_name);
         });
+    }
+
+    future<size_t> one_read(char* buf, uint64_t buffer_size) {
+        return _file.dma_read(random_position(buffer_size), buf, buffer_size);
     }
 
     future<> generate(uint64_t buffer_size, std::chrono::seconds timeout) {
@@ -124,6 +135,39 @@ public:
     }
 };
 
+struct run_stats {
+    uint64_t IOPS;
+    uint64_t concurrency;
+    run_stats(uint64_t iops = 0, uint64_t conc = 0) : IOPS(iops), concurrency(conc) {}
+    run_stats& operator+=(const struct run_stats& stats) {
+        if (stats.concurrency != 0) {
+            IOPS += stats.IOPS;
+            concurrency += stats.concurrency;
+        }
+        return *this;
+    }
+};
+
+// Not using operator< inside run_stats, because saying that one run_stats is less than the
+// other implies it carries less IOPS.
+struct run_stats_ordering {
+    bool operator()(const run_stats& lhs, const run_stats& rhs) const {
+        return lhs.concurrency < rhs.concurrency;
+    }
+};
+
+class run_stats_aggregator {
+    run_stats aggregated_stats;
+public:
+    future<> operator()(const run_stats& value) {
+        aggregated_stats += value;
+        return make_ready_future<>();
+    }
+    run_stats get() && {
+        return std::move(aggregated_stats);
+    }
+};
+
 class iotune_shard_context {
     test_file _test_file;
     std::chrono::seconds _test_duration;
@@ -144,11 +188,99 @@ public:
             return _test_file.generate(128 << 10, (_test_duration * 4) / 10);
         });
     }
+
+    future<run_stats> issue_reads(unsigned concurrency, uint64_t buffer_size, iotune_clock::time_point start, iotune_clock::time_point end) {
+        auto my_concurrency = concurrency / smp::count;
+        if (engine().cpu_id() < (concurrency % smp::count)) {
+            my_concurrency++;
+        }
+
+        return do_with(unsigned(0), [this, conc = my_concurrency, buffer_size, start, end] (auto& opcount) {
+            auto local_concurrency = boost::irange<unsigned, unsigned>(0, conc, 1);
+            return parallel_for_each(local_concurrency.begin(), local_concurrency.end(), [this, buffer_size, start, end, &opcount] (auto idx) {
+                auto buf = allocate_aligned_buffer<char>(buffer_size, 4096);
+                while (iotune_clock::now() < start);
+                auto stop = [end] { return iotune_clock::now() >= end; };
+                return do_until(stop, [this, stop, buf = std::move(buf), &opcount, buffer_size] {
+                    return _test_file.one_read(buf.get(), buffer_size).then([this, stop, &opcount] (auto size) {
+                        if (!stop()) {
+                            opcount++;
+                        }
+                    });
+                });
+            }).then([conc, &opcount, start, end] {
+                double IOPS = opcount / std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+                return make_ready_future<run_stats>(run_stats{uint64_t(IOPS), conc});
+            });
+        });
+
+    }
 };
 
 class iotune_manager {
     sstring _dirname;
     seastar::sharded<iotune_shard_context> _iotune_shard_context;
+
+//    using run_results = std::map<uint64_t, uint64_t>;
+    using run_results = std::set<run_stats, run_stats_ordering>;
+    std::map<uint64_t, run_results> _all_results;
+
+    struct run_params {
+        std::chrono::milliseconds duration;
+        uint64_t buffer_size;
+    };
+
+    template <typename Range>
+    future<> explore_range(Range&& range, run_params params) {
+        return do_for_each(range.begin(), range.end(), [this, params = std::move(params)] (auto concurrency) {
+            auto start = iotune_clock::now() + 1ms;
+            auto end = start + params.duration;
+            uint64_t buffer_size = params.buffer_size;
+            return _iotune_shard_context.map_reduce(run_stats_aggregator(), &iotune_shard_context::issue_reads,
+                    std::move(concurrency), std::move(buffer_size), std::move(start), std::move(end)).then([this, params] (auto r) {
+                _all_results.at(params.buffer_size).emplace(r.concurrency, r.IOPS);
+                logger.debug("buffer size {} concurrency: {}, IOPS {}", params.buffer_size, r.concurrency, r.IOPS);
+                return make_ready_future<>();
+            });
+        });
+    }
+
+    run_stats find_closest(uint64_t buffer_size, uint64_t IOPS_goal) const {
+        auto best_delta = std::numeric_limits<uint64_t>::max();
+        auto best_result = run_stats{0, 0};
+
+        for (auto& m : _all_results.at(buffer_size)) {
+            uint64_t d = std::abs(int64_t(IOPS_goal - m.IOPS));
+            if (d < best_delta) {
+                best_delta = d;
+                best_result = m;
+            }
+        }
+        return best_result;
+    }
+
+    run_stats find_max(uint64_t buffer_size) const {
+        return find_closest(buffer_size, std::numeric_limits<int64_t>::max());
+    }
+
+    run_stats find_first(uint64_t buffer_size, uint64_t IOPS_goal) const {
+        for (auto& m : _all_results.at(buffer_size)) {
+            if (m.IOPS > IOPS_goal) {
+                return m;
+            }
+        }
+        return run_stats{0, 0};
+    }
+
+    auto range_around(unsigned point) const {
+        auto min = point > 8 ? point - 8 : 1;
+        auto max = point + 8;
+        return boost::irange<unsigned, unsigned>(min, max, 1);
+    }
+
+    auto range_around(const run_stats& rs) const {
+        return range_around(rs.concurrency);
+    }
 public:
     future<> stop() {
         return _iotune_shard_context.stop();
@@ -167,6 +299,39 @@ public:
         }
         return _iotune_shard_context.start(_dirname, desired_size / smp::count, std::forward<Args>(args)...);
     }
+
+    // This should take around a minute
+    future<> measure_reads(uint64_t buffer_size) {
+        _all_results.emplace(buffer_size, run_results{{ 0ul, 0ul }});
+        run_params params{500ms, buffer_size};
+        // Should take 512 / 8 * 500ms = ~ 32s
+        return explore_range(boost::irange<unsigned, unsigned>(1, 512, 8), std::move(params)).then([this, buffer_size] {
+            run_params params{1000ms, buffer_size};
+            auto best_result = find_max(buffer_size);
+            return explore_range(range_around(best_result), std::move(params));
+        }).then([this, buffer_size] {
+            auto refined_best = find_max(buffer_size);
+            logger.info("{} buffers: Maximum READ IOPS {} at concurrency of {}", buffer_size, refined_best.IOPS, refined_best.concurrency);
+
+            std::vector<float> percentiles({0.5, 0.70, 0.80, 0.95});
+            std::set<unsigned> explorer;
+            for (auto&& p : percentiles) {
+                for (auto&& r: range_around(find_first(buffer_size, uint64_t(p * refined_best.IOPS)))) {
+                    explorer.insert(r);
+                }
+            }
+
+            // Should take 4 * 8 * 1s = 32s
+            run_params params{1000ms, buffer_size};
+            return explore_range(explorer, params).then([this, percentiles, buffer_size, max = refined_best.IOPS] {
+                for (auto&&p : percentiles) {
+                    auto r = find_first(buffer_size, uint64_t(p * max));
+                    logger.info("{} buffers: {} percentile READ IOPS at concurrency of {}", buffer_size, p, r.concurrency);
+                }
+            });
+        });
+    }
+
     future<> write_data() {
         return _iotune_shard_context.invoke_on_all([] (auto& isc) {
             return isc.write_data();
@@ -178,7 +343,8 @@ public:
 
 test_file::test_file(const directory& dir, uint64_t desired_size)
     : _name(dir.name + "/ioqueue-discovery-" + to_sstring(engine().cpu_id()))
-    , _file_size(desired_size) {}
+    , _file_size(desired_size)
+    , _pos_distribution(0, std::numeric_limits<uint64_t>::max()) {}
 
 
 int do_fsqual(sstring directory) {
@@ -239,6 +405,18 @@ int main(int ac, char** av) {
         }).then([iotune_manager] {
             logger.info("Starting writes");
             return iotune_manager->write_data();
+        }).then([iotune_manager] {
+            logger.info("Starting reads");
+            return do_with(std::vector<uint64_t>(), [iotune_manager] (auto& sizes) {
+                sizes.push_back(1ull << 10);
+                while (sizes.back() <= (512ull << 10)) {
+                    auto next = sizes.back() << 2;
+                    sizes.push_back(next);
+                }
+                return do_for_each(sizes, [iotune_manager] (auto buf_size) {
+                    return iotune_manager->measure_reads(buf_size);
+                });
+            });
         }).then([] {
             return make_ready_future<int>(0);
         });

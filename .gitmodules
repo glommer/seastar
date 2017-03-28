@@ -7,3 +7,6 @@
 [submodule "c-ares"]
 	path = c-ares
 	url = ../c-ares
+[submodule "t-digest"]
+	path = t-digest
+	url = https://github.com/gpichot/cpp-tdigest.git

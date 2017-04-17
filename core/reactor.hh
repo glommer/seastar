@@ -654,6 +654,8 @@ public:
         uint64_t fstream_read_aheads_discarded = 0;
         uint64_t fstream_read_ahead_discarded_bytes = 0;
     };
+
+    static constexpr size_t max_aio = 128;
 private:
     // FIXME: make _backend a unique_ptr<reactor_backend>, not a compile-time #ifdef.
 #ifdef HAVE_OSV
@@ -669,7 +671,6 @@ private:
     sigset_t _active_sigmask; // holds sigmask while sleeping with sig disabled
     std::vector<pollfn*> _pollers;
 
-    static constexpr size_t max_aio = 128;
     // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
     // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
     // be stored here.

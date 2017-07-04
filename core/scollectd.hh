@@ -42,6 +42,7 @@
 #include "util/log.hh"
 
 #include "core/metrics_api.hh"
+#include "core/app-template.hh"
 
 namespace seastar {
 
@@ -359,7 +360,7 @@ private:
 extern const plugin_instance_id per_cpu_plugin_instance;
 
 void configure(const boost::program_options::variables_map&);
-boost::program_options::options_description get_options_description();
+boost::program_options::options_description get_options_description(app_template::config& cfg);
 void remove_polled_metric(const type_instance_id &);
 
 class plugin_instance_metrics;

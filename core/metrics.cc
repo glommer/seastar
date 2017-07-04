@@ -87,7 +87,7 @@ static std::string get_hostname() {
 }
 
 
-boost::program_options::options_description get_options_description() {
+boost::program_options::options_description get_options_description(app_template::config& cfg) {
     namespace bpo = boost::program_options;
     bpo::options_description opts("Metrics options");
     opts.add_options()(

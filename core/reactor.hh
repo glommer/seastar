@@ -74,6 +74,7 @@
 #include "lowres_clock.hh"
 #include "manual_clock.hh"
 #include "core/metrics_registration.hh"
+#include "core/app-template.hh"
 
 #ifdef HAVE_OSV
 #include <osv/sched.hh>
@@ -803,7 +804,7 @@ private:
     bool posix_reuseport_detect();
     void task_quota_timer_thread_fn();
 public:
-    static boost::program_options::options_description get_options_description();
+    static boost::program_options::options_description get_options_description(app_template::config& cfg);
     explicit reactor(unsigned id);
     reactor(const reactor&) = delete;
     ~reactor();
@@ -1037,7 +1038,7 @@ class smp {
     template <typename Func>
     using returns_void = std::is_same<std::result_of_t<Func()>, void>;
 public:
-    static boost::program_options::options_description get_options_description();
+    static boost::program_options::options_description get_options_description(app_template::config& cfg);
     static void configure(boost::program_options::variables_map vm);
     static void cleanup();
     static void cleanup_cpu();

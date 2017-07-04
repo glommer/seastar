@@ -3321,7 +3321,7 @@ network_stack_registrator::network_stack_registrator(sstring name,
 }
 
 boost::program_options::options_description
-reactor::get_options_description() {
+reactor::get_options_description(app_template::config& cfg) {
     namespace bpo = boost::program_options;
     bpo::options_description opts("Core options");
     auto net_stack_names = network_stack_registry::list();
@@ -3350,7 +3350,7 @@ reactor::get_options_description() {
 }
 
 boost::program_options::options_description
-smp::get_options_description()
+smp::get_options_description(app_template::config& cfg)
 {
     namespace bpo = boost::program_options;
     bpo::options_description opts("SMP options");

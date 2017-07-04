@@ -524,7 +524,7 @@ void configure(const boost::program_options::variables_map & opts) {
     }
 }
 
-boost::program_options::options_description get_options_description() {
+boost::program_options::options_description get_options_description(app_template::config& cfg) {
     namespace bpo = boost::program_options;
     bpo::options_description opts("COLLECTD options");
     opts.add_options()("collectd", bpo::value<bool>()->default_value(false),

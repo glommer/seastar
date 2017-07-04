@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include "sharded.hh"
 #include <boost/functional/hash.hpp>
+#include "core/app-template.hh"
+
 /*!
  * \file metrics_api.hh
  * \brief header file for metric API layer (like promehteus or collectd)
@@ -383,7 +385,7 @@ future<> configure(const boost::program_options::variables_map & opts);
  * \brief get the metrics configuration desciprtion
  */
 
-boost::program_options::options_description get_options_description();
+boost::program_options::options_description get_options_description(app_template::config& cfg);
 
 }
 }

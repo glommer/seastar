@@ -33,6 +33,7 @@ class app_template {
 public:
     struct config {
         sstring name;
+        std::unordered_map<const char *, boost::program_options::value_semantic*> app_defaults;
     };
 
     class options {
@@ -46,6 +47,10 @@ public:
             return *this;
         }
         options& operator()(const char *name, boost::program_options::value_semantic* val, const char *help) {
+            auto it = _cfg.app_defaults.find(name);
+            if (it != _cfg.app_defaults.end()) {
+                val = it->second;
+            }
             _opts_ei(name, val, help);
             return *this;
         }

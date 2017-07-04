@@ -89,12 +89,11 @@ static std::string get_hostname() {
 
 boost::program_options::options_description get_options_description(app_template::config& cfg) {
     namespace bpo = boost::program_options;
-    bpo::options_description opts("Metrics options");
-    opts.add_options()(
-            "metrics-hostname",
+    app_template::options opts("Metrics options", cfg);
+    opts("metrics-hostname",
             bpo::value<std::string>()->default_value(get_hostname()),
             "set the hostname used by the metrics, if not set, the local hostname will be used");
-    return opts;
+    return opts.done();
 }
 
 future<> configure(const boost::program_options::variables_map & opts) {

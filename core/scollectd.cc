@@ -526,8 +526,8 @@ void configure(const boost::program_options::variables_map & opts) {
 
 boost::program_options::options_description get_options_description(app_template::config& cfg) {
     namespace bpo = boost::program_options;
-    bpo::options_description opts("COLLECTD options");
-    opts.add_options()("collectd", bpo::value<bool>()->default_value(false),
+    app_template::options opts("COLLECTD options", cfg);
+    opts("collectd", bpo::value<bool>()->default_value(false),
             "enable collectd daemon")("collectd-address",
             bpo::value<std::string>()->default_value("239.192.74.66:25826"),
             "address to send/broadcast metrics to")("collectd-poll-period",
@@ -536,7 +536,7 @@ boost::program_options::options_description get_options_description(app_template
             "collectd-hostname",
             bpo::value<std::string>()->default_value(""),
             "Deprecated option, use metrics-hostname instead");
-    return opts;
+    return opts.done();
 }
 
 static seastar::metrics::impl::register_ref get_register(const scollectd::type_instance_id& i) {

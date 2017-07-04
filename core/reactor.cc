@@ -3323,9 +3323,9 @@ network_stack_registrator::network_stack_registrator(sstring name,
 boost::program_options::options_description
 reactor::get_options_description(app_template::config& cfg) {
     namespace bpo = boost::program_options;
-    bpo::options_description opts("Core options");
     auto net_stack_names = network_stack_registry::list();
-    opts.add_options()
+    app_template::options opts("Core options", cfg);
+    opts
         ("network-stack", bpo::value<std::string>(),
                 sprint("select network stack (valid values: %s)",
                         format_separated(net_stack_names.begin(), net_stack_names.end(), ", ")).c_str())
@@ -3346,15 +3346,15 @@ reactor::get_options_description(app_template::config& cfg) {
 #endif
         ;
     opts.add(network_stack_registry::options_description());
-    return opts;
+    return opts.done();
 }
 
 boost::program_options::options_description
 smp::get_options_description(app_template::config& cfg)
 {
     namespace bpo = boost::program_options;
-    bpo::options_description opts("SMP options");
-    opts.add_options()
+    app_template::options opts("SMP options", cfg);
+    opts
         ("smp,c", bpo::value<unsigned>(), "number of threads (default: one per CPU)")
         ("cpuset", bpo::value<cpuset_bpo_wrapper>(), "CPUs to use (in cpuset(7) format; default: all))")
         ("memory,m", bpo::value<std::string>(), "memory to use, in bytes (ex: 4G) (default: all)")
@@ -3370,7 +3370,7 @@ smp::get_options_description(app_template::config& cfg)
 #endif
         ("mbind", bpo::value<bool>()->default_value(true), "enable mbind")
         ;
-    return opts;
+    return opts.done();
 }
 
 thread_local scollectd::impl scollectd_impl;

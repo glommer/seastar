@@ -34,6 +34,28 @@ public:
     struct config {
         sstring name;
     };
+
+    class options {
+        boost::program_options::options_description _opts;
+        boost::program_options::options_description_easy_init _opts_ei;
+        app_template::config& _cfg;
+    public:
+        options(const char* name, app_template::config& cfg) : _opts(name), _opts_ei(_opts.add_options()), _cfg(cfg) {}
+        options& operator()(const char *name, const char *help) {
+            _opts_ei(name, help);
+            return *this;
+        }
+        options& operator()(const char *name, boost::program_options::value_semantic* val, const char *help) {
+            _opts_ei(name, val, help);
+            return *this;
+        }
+        boost::program_options::options_description& add(boost::program_options::options_description& opt) {
+            return _opts.add(opt);
+        }
+        boost::program_options::options_description&& done() {
+            return std::move(_opts);
+        }
+    };
 private:
     config _cfg;
     boost::program_options::options_description _opts;

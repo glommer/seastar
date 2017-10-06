@@ -32,6 +32,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
+#include "util/defer.hh"
 
 namespace seastar {
 
@@ -93,8 +94,9 @@ class fair_queue {
         }
     };
 
-    semaphore _sem;
+    unsigned _requests_in_flight = 0;
     unsigned _capacity;
+    uint64_t _queued = 0;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     std::chrono::microseconds _tau;
@@ -118,14 +120,39 @@ class fair_queue {
         return h;
     }
 
-    void execute_one() {
-        _sem.wait().then([this] {
+    float normalize_factor() const {
+        return std::numeric_limits<float>::min();
+    }
+
+    void normalize_stats() {
+        auto time_delta = std::log(normalize_factor()) * _tau;
+        // time_delta is negative; and this may advance _base into the future
+        _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
+        for (auto& pc: _all_classes) {
+            pc->_accumulated *= normalize_factor();
+        }
+    }
+public:
+    /// \brief Dispatch pending requests, if possible.
+    ///
+    /// Has to be called by the user of the fair_queue when there is a chance that new
+    /// requests could be dispatched. For example, when a previous request returned
+    void dispatch_requests() {
+        while (_queued && (_requests_in_flight < _capacity)) {
             priority_class_ptr h;
             do {
                 h = pop_priority_class();
             } while (h->_queue.empty());
 
+            auto push_back = defer([this, h] {
+                if (!h->_queue.empty()) {
+                    push_priority_class(h);
+                }
+            });
+
             auto req = std::move(h->_queue.front());
+            _requests_in_flight++;
+            _queued--;
             h->_queue.pop_front();
 
             req.pr.set_value();
@@ -141,36 +168,18 @@ class fair_queue {
                 next_accumulated = h->_accumulated + cost;
             }
             h->_accumulated = next_accumulated;
-
-            if (!h->_queue.empty()) {
-                push_priority_class(h);
-            }
-            return make_ready_future<>();
-        });
-    }
-
-    float normalize_factor() const {
-        return std::numeric_limits<float>::min();
-    }
-
-    void normalize_stats() {
-        auto time_delta = std::log(normalize_factor()) * _tau;
-        // time_delta is negative; and this may advance _base into the future
-        _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
-        for (auto& pc: _all_classes) {
-            pc->_accumulated *= normalize_factor();
         }
     }
-public:
+
     /// Constructs a fair queue with a given \c capacity.
     ///
     /// \param capacity how many concurrent requests are allowed in this queue.
     /// \param tau the queue exponential decay parameter, as in exp(-1/tau * t)
     explicit fair_queue(unsigned capacity, std::chrono::microseconds tau = std::chrono::milliseconds(100))
-                                           : _sem(capacity)
-                                           , _capacity(capacity)
-                                           , _base(std::chrono::steady_clock::now())
-                                           , _tau(tau) {
+        : _capacity(capacity)
+        , _base(std::chrono::steady_clock::now())
+        , _tau(tau)
+    {
     }
 
     /// Registers a priority class against this fair queue.
@@ -192,7 +201,7 @@ public:
 
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const {
-        return _sem.waiters();
+        return _queued;
     }
 
     /// Executes the function \c func through this class' \ref fair_queue, with weight \c weight
@@ -208,16 +217,14 @@ public:
 
         push_priority_class(pc);
         pc->_queue.push_back(priority_class::request{std::move(pr), weight});
-        try {
-            execute_one();
-        } catch (...) {
-            pc->_queue.pop_back();
-            throw;
-        }
+        _queued++;
+        dispatch_requests();
+
         return fut.then([func = std::move(func)] {
             return func();
         }).finally([this] {
-            _sem.signal();
+            _requests_in_flight--;
+            dispatch_requests();
         });
     }
 

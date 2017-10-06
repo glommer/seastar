@@ -571,6 +571,10 @@ public:
         return _fq.waiters();
     }
 
+    void poll_io_queue() {
+        _fq.dispatch_requests();
+    }
+
     shard_id coordinator() const {
         return _coordinator;
     }

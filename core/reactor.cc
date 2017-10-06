@@ -973,6 +973,9 @@ bool reactor::process_io()
         delete pr;
     }
     _io_context_available.signal(n);
+    if (my_io_queue) {
+        my_io_queue->poll_io_queue();
+    }
     return n;
 }
 

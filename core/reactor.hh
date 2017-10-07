@@ -557,6 +557,8 @@ private:
 public:
     struct config {
         unsigned capacity = std::numeric_limits<unsigned>::max();
+        uint64_t bytes_per_sec = std::numeric_limits<uint64_t>::max();
+        uint64_t req_per_sec = std::numeric_limits<uint64_t>::max();
     };
 
     io_queue(shard_id coordinator, config cfg, std::vector<shard_id> topology);

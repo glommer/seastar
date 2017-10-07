@@ -33,6 +33,7 @@
 #include <unordered_set>
 #include <cmath>
 #include "util/defer.hh"
+#include "util/token_bucket.hh"
 
 namespace seastar {
 
@@ -98,6 +99,8 @@ public:
         unsigned capacity = std::numeric_limits<unsigned>::max();
         std::chrono::microseconds tau = std::chrono::milliseconds(100);
         std::function<float(uint64_t)> weight = std::function<float(uint64_t)>([] (uint64_t dummy) { return 1.0f; });
+        uint64_t bytes_per_sec = std::numeric_limits<uint64_t>::max();
+        uint64_t req_per_sec = std::numeric_limits<uint64_t>::max();
     };
 private:
     friend priority_class;
@@ -111,8 +114,13 @@ private:
     config _config;
     unsigned _requests_in_flight = 0;
     uint64_t _queued = 0;
-    using clock_type = std::chrono::steady_clock::time_point;
+    using clock = std::chrono::steady_clock;
+    using clock_type = clock::time_point;
+
     clock_type _base;
+    token_bucket<clock> _req_per_sec;
+    token_bucket<clock> _bytes_per_sec;
+
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
     std::unordered_set<priority_class_ptr> _all_classes;
@@ -148,6 +156,8 @@ private:
 public:
     /// Dispatch pending requests, if possible.
     void dispatch_requests() {
+        _bytes_per_sec.refill_tokens();
+        _req_per_sec.refill_tokens();
         while (_queued && (_requests_in_flight < _config.capacity)) {
             priority_class_ptr h;
             do {
@@ -159,6 +169,13 @@ public:
                     push_priority_class(h);
                 }
             });
+
+            auto size = h->_queue.front().size;
+            if (!_bytes_per_sec.can_acquire(size) || !_req_per_sec.can_acquire(1)) {
+                return;
+            }
+            _req_per_sec.acquire_tokens(1);
+            _bytes_per_sec.acquire_tokens(size);
 
             auto req = std::move(h->_queue.front());
             _requests_in_flight++;
@@ -188,6 +205,8 @@ public:
     explicit fair_queue(config cfg)
         : _config(std::move(cfg))
         , _base(std::chrono::steady_clock::now())
+        , _req_per_sec(_config.req_per_sec)
+        , _bytes_per_sec(_config.bytes_per_sec)
     {
     }
 

@@ -33,6 +33,7 @@
 #include <unordered_set>
 #include <cmath>
 #include "util/defer.hh"
+#include "util/token_bucket.hh"
 
 namespace seastar {
 
@@ -98,6 +99,8 @@ public:
         unsigned capacity = std::numeric_limits<unsigned>::max();
         std::chrono::microseconds tau = std::chrono::milliseconds(100);
         std::function<float(uint64_t)> weight = std::function<float(uint64_t)>([] (uint64_t dummy) { return 1.0f; });
+        uint64_t bytes_per_sec = std::numeric_limits<uint64_t>::max();
+        uint64_t req_per_sec = std::numeric_limits<uint64_t>::max();
     };
 private:
     friend priority_class;
@@ -111,8 +114,13 @@ private:
     config _config;
     unsigned _requests_in_flight = 0;
     uint64_t _queued = 0;
-    using clock_type = std::chrono::steady_clock::time_point;
+    using clock = std::chrono::steady_clock;
+    using clock_type = clock::time_point;
+
     clock_type _base;
+    token_bucket<clock> _req_per_sec;
+    token_bucket<clock> _bytes_per_sec;
+
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
     std::unordered_set<priority_class_ptr> _all_classes;
@@ -151,6 +159,9 @@ public:
     /// Has to be called by the user of the fair_queue when there is a chance that new
     /// requests could be dispatched. For example, when a previous request returned
     void dispatch_requests() {
+        auto now = clock::now();
+        _bytes_per_sec.refill_tokens(now);
+        _req_per_sec.refill_tokens(now);
         while (_queued && (_requests_in_flight < _config.capacity)) {
             priority_class_ptr h;
             do {
@@ -162,6 +173,13 @@ public:
                     push_priority_class(h);
                 }
             });
+
+            auto size = h->_queue.front().size;
+            if (!_bytes_per_sec.can_acquire(size) || !_req_per_sec.can_acquire(1)) {
+                return;
+            }
+            _req_per_sec.acquire_tokens(1);
+            _bytes_per_sec.acquire_tokens(size);
 
             auto req = std::move(h->_queue.front());
             _requests_in_flight++;
@@ -191,6 +209,8 @@ public:
     explicit fair_queue(config cfg)
         : _config(std::move(cfg))
         , _base(std::chrono::steady_clock::now())
+        , _req_per_sec(_config.req_per_sec)
+        , _bytes_per_sec(_config.bytes_per_sec)
     {
     }
 
@@ -208,6 +228,16 @@ public:
         priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
         _all_classes.insert(pclass);
         return pclass;
+    }
+
+    /// \return a reference to the bytes_per_sec token bucket in this queue
+    token_bucket<clock>& bytes_per_sec_bucket() {
+        return _bytes_per_sec;
+    }
+
+    /// \return a reference to the req_per_sec token bucket in this queue
+    token_bucket<clock>& req_per_sec_bucket() {
+        return _req_per_sec;
     }
 
     /// Unregister a priority class.
@@ -237,6 +267,9 @@ public:
         push_priority_class(pc);
         pc->_queue.push_back(priority_class::request{std::move(pr), size});
         _queued++;
+        _bytes_per_sec.reserve_tokens(size);
+        _req_per_sec.reserve_tokens(1);
+
         dispatch_requests();
 
         return fut.then([func = std::move(func)] {

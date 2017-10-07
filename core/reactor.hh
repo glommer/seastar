@@ -557,6 +557,8 @@ private:
 public:
     struct config {
         unsigned capacity = std::numeric_limits<unsigned>::max();
+        uint64_t bytes_per_sec = std::numeric_limits<uint64_t>::max();
+        uint64_t req_per_sec = std::numeric_limits<uint64_t>::max();
     };
 
     io_queue(shard_id coordinator, config cfg, std::vector<shard_id> topology);
@@ -604,10 +606,11 @@ protected:
 class standard_io_queue_creator final : public io_queue_creator {
     std::vector<io_queue*> _all_io_queues;
     resource::io_queue_topology _io_info;
+    io_queue::config _default_cfg;
 public:
     int alloc_io_queue(unsigned shard) override;
     void assign_io_queue(shard_id id, int queue_idx);
-    standard_io_queue_creator(resource::io_queue_topology io_info);
+    standard_io_queue_creator(resource::io_queue_topology io_info, io_queue::config default_config);
 };
 
 class reactor {

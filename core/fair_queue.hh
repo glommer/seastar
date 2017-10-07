@@ -43,7 +43,7 @@ namespace seastar {
 class priority_class {
     struct request {
         promise<> pr;
-        unsigned weight;
+        uint64_t size;
     };
     friend class fair_queue;
     uint32_t _shares = 0;
@@ -71,9 +71,12 @@ using priority_class_ptr = lw_shared_ptr<priority_class>;
 /// This is a fair queue, allowing multiple request producers to queue requests
 /// that will then be served proportionally to their classes' shares.
 ///
-/// To each request, a weight can also be associated. A request of weight 1 will consume
-/// 1 share. Higher weights for a request will consume a proportionally higher amount of
-/// shares.
+/// To each request, a weight proportional to the request size can also be associated.
+/// The user of this interface can provide a function that translates sizes to weights
+/// as part of the fair_queue configuration, as defined in \ref config.
+//
+/// A request of weight 1 will consume / 1 share. Higher weights for a request
+/// will consume a proportionally higher amount of / shares.
 ///
 /// The user of this interface is expected to register multiple \ref priority_class
 /// objects, which will each have a shares attribute.
@@ -86,6 +89,17 @@ using priority_class_ptr = lw_shared_ptr<priority_class>;
 /// them first, until balance is restored. This balancing is expected to happen within
 /// a certain time window that obeys an exponential decay.
 class fair_queue {
+public:
+    /// \brief Fair Queue configuration structure.
+    ///
+    /// \sets the operation parameters of a \ref fair_queue
+    /// \related fair_queue
+    struct config {
+        unsigned capacity = std::numeric_limits<unsigned>::max();
+        std::chrono::microseconds tau = std::chrono::milliseconds(100);
+        std::function<float(uint64_t)> weight = std::function<float(uint64_t)>([] (uint64_t dummy) { return 1.0f; });
+    };
+private:
     friend priority_class;
 
     struct class_compare {
@@ -94,12 +108,11 @@ class fair_queue {
         }
     };
 
+    config _config;
     unsigned _requests_in_flight = 0;
-    unsigned _capacity;
     uint64_t _queued = 0;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
-    std::chrono::microseconds _tau;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
     std::unordered_set<priority_class_ptr> _all_classes;
@@ -125,7 +138,7 @@ class fair_queue {
     }
 
     void normalize_stats() {
-        auto time_delta = std::log(normalize_factor()) * _tau;
+        auto time_delta = std::log(normalize_factor()) * _config.tau;
         // time_delta is negative; and this may advance _base into the future
         _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
         for (auto& pc: _all_classes) {
@@ -138,7 +151,7 @@ public:
     /// Has to be called by the user of the fair_queue when there is a chance that new
     /// requests could be dispatched. For example, when a previous request returned
     void dispatch_requests() {
-        while (_queued && (_requests_in_flight < _capacity)) {
+        while (_queued && (_requests_in_flight < _config.capacity)) {
             priority_class_ptr h;
             do {
                 h = pop_priority_class();
@@ -154,21 +167,31 @@ public:
             _requests_in_flight++;
             _queued--;
             h->_queue.pop_front();
+            auto weight = _config.weight(req.size);
 
             req.pr.set_value();
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-            auto req_cost  = float(req.weight) / h->_shares;
-            auto cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
+            auto req_cost  = weight / h->_shares;
+            auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
             float next_accumulated = h->_accumulated + cost;
             while (std::isinf(next_accumulated)) {
                 normalize_stats();
                 // If we have renormalized, our time base will have changed. This should happen very infrequently
                 delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-                cost  = expf(1.0f/_tau.count() * delta.count()) * req_cost;
+                cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
                 next_accumulated = h->_accumulated + cost;
             }
             h->_accumulated = next_accumulated;
         }
+    }
+
+    /// Constructs a fair queue with configuration parameters \c cfg.
+    ///
+    /// \param cfg an instance of the class \ref config
+    explicit fair_queue(config cfg)
+        : _config(std::move(cfg))
+        , _base(std::chrono::steady_clock::now())
+    {
     }
 
     /// Constructs a fair queue with a given \c capacity.
@@ -176,11 +199,7 @@ public:
     /// \param capacity how many concurrent requests are allowed in this queue.
     /// \param tau the queue exponential decay parameter, as in exp(-1/tau * t)
     explicit fair_queue(unsigned capacity, std::chrono::microseconds tau = std::chrono::milliseconds(100))
-        : _capacity(capacity)
-        , _base(std::chrono::steady_clock::now())
-        , _tau(tau)
-    {
-    }
+        : fair_queue(config{capacity, tau}) {}
 
     /// Registers a priority class against this fair queue.
     ///
@@ -204,11 +223,11 @@ public:
         return _queued;
     }
 
-    /// Executes the function \c func through this class' \ref fair_queue, with weight \c weight
+    /// Executes the function \c func through this class' \ref fair_queue, with size \c size
     ///
     /// \return \c func's return value, if \c func returns a future, or future<T> if \c func returns a non-future of type T.
     template <typename Func>
-    futurize_t<std::result_of_t<Func()>> queue(priority_class_ptr pc, unsigned weight, Func func) {
+    futurize_t<std::result_of_t<Func()>> queue(priority_class_ptr pc, uint64_t size, Func func) {
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
@@ -216,7 +235,7 @@ public:
         auto fut = pr.get_future();
 
         push_priority_class(pc);
-        pc->_queue.push_back(priority_class::request{std::move(pr), weight});
+        pc->_queue.push_back(priority_class::request{std::move(pr), size});
         _queued++;
         dispatch_requests();
 

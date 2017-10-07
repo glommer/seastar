@@ -555,8 +555,11 @@ private:
     static void fill_shares_array();
     friend smp;
 public:
+    struct config {
+        unsigned capacity = std::numeric_limits<unsigned>::max();
+    };
 
-    io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology);
+    io_queue(shard_id coordinator, config cfg, std::vector<shard_id> topology);
     ~io_queue();
 
     template <typename Func>
@@ -582,6 +585,8 @@ public:
         return _io_topology[shard];
     }
     friend class reactor;
+private:
+    static fair_queue::config make_fair_queue_config(config cfg);
 };
 
 constexpr unsigned max_scheduling_groups() { return 16; }

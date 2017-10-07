@@ -982,6 +982,8 @@ bool reactor::process_io()
 fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
     fair_queue::config cfg;
     cfg.capacity = iocfg.capacity;
+    cfg.bytes_per_sec = iocfg.bytes_per_sec;
+    cfg.req_per_sec = iocfg.req_per_sec;
     cfg.weight = [] (uint64_t len) { return 1 + len/(16 << 10); };
     return cfg;
 }
@@ -3573,6 +3575,42 @@ reactor::get_options_description(std::chrono::duration<double> default_task_quot
     return opts;
 }
 
+struct device_attribute {
+    uint64_t device_id;
+    uint64_t attribute;
+};
+
+void validate(boost::any& v,
+              const std::vector<std::string>& values,
+              device_attribute* target_type, int) {
+    using namespace boost::program_options;
+    validators::check_first_occurrence(v);
+
+    auto& value = values[0];
+    auto sep = value.rfind(":");
+    sstring device("");
+    uint64_t device_id = 0;
+
+    if (sep != std::string::npos) {
+        device = value.substr(0, sep);
+        sep++;
+        if (device != "") {
+            std::cerr << "Found Device " << device << ". Multi-device queues not supported yet" << std::endl;
+            throw validation_error(validation_error::invalid_option_value);
+        }
+    } else {
+        sep = 0;
+    }
+
+    uint64_t attr = 0;
+    try {
+        attr = boost::lexical_cast<uint64_t>(value.data() + sep, value.size() - sep);
+    } catch (...) {
+        throw validation_error(validation_error::invalid_option_value);
+    }
+    v = device_attribute{device_id, attr};
+}
+
 boost::program_options::options_description
 smp::get_options_description()
 {
@@ -3586,6 +3624,8 @@ smp::get_options_description()
         ("hugepages", bpo::value<std::string>(), "path to accessible hugetlbfs mount (typically /dev/hugepages/something)")
         ("lock-memory", bpo::value<bool>(), "lock all memory (prevents swapping)")
         ("thread-affinity", bpo::value<bool>()->default_value(true), "pin threads to their cpus (disable for overprovisioning)")
+        ("max-disk-megabytes-per-sec", bpo::value<device_attribute>(), "Maximum disk throughput in MB/s. Format is [device:]MB_per_sec")
+        ("max-disk-req-per-sec", bpo::value<device_attribute>(), "Maximum disk throughput in IOPS. Format is [device:]req_per_sec")
 #ifdef HAVE_HWLOC
         ("num-io-queues", bpo::value<unsigned>(), "Number of IO queues. Each IO unit will be responsible for a fraction of the IO requests. Defaults to the number of threads")
         ("max-io-requests", bpo::value<unsigned>(), "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of IO queues")
@@ -3760,7 +3800,7 @@ int io_queue_creator::do_if_coordinator(resource::io_queue_topology& io_info, un
 
 int standard_io_queue_creator::alloc_io_queue(unsigned shard) {
     return do_if_coordinator(_io_info, shard, [this, shard] (resource::io_queue& coordinator, unsigned vec_idx) {
-        struct io_queue::config cfg;
+        struct io_queue::config cfg = _default_cfg;
         cfg.capacity = coordinator.capacity;
         engine().my_io_queue = std::make_unique<io_queue>(coordinator.id, std::move(cfg), _io_info.shard_to_coordinator);
         _all_io_queues[vec_idx] = engine().my_io_queue.get();
@@ -3772,9 +3812,10 @@ void standard_io_queue_creator::assign_io_queue(shard_id id, int queue_idx) {
     engine()._io_coordinator = _all_io_queues[queue_idx]->coordinator();
 }
 
-standard_io_queue_creator::standard_io_queue_creator(resource::io_queue_topology io_info)
+standard_io_queue_creator::standard_io_queue_creator(resource::io_queue_topology io_info, io_queue::config default_config)
     : _all_io_queues(io_info.coordinators.size(), nullptr)
     , _io_info(std::move(io_info))
+    , _default_cfg(std::move(default_config))
 {}
 
 void smp::configure(boost::program_options::variables_map configuration)
@@ -3893,6 +3934,17 @@ void smp::configure(boost::program_options::variables_map configuration)
     }
     memory::configure(allocations[0].mem, mbind, hugepages_path);
 
+    struct io_queue::config iocfg;
+    if (configuration.count("max-disk-megabytes-per-sec")) {
+        auto bytes_per_sec = configuration["max-disk-megabytes-per-sec"].as<device_attribute>();
+        iocfg.bytes_per_sec = (bytes_per_sec.attribute << 20) / resources.io_queues.coordinators.size();
+    }
+
+    if (configuration.count("max-disk-req-per-sec")) {
+        auto io_per_sec = configuration["max-disk-req-per-sec"].as<device_attribute>();
+        iocfg.req_per_sec = (io_per_sec.attribute) / resources.io_queues.coordinators.size();
+    }
+
     if (configuration.count("abort-on-seastar-bad-alloc")) {
         memory::enable_abort_on_allocation_failure();
     }
@@ -3916,7 +3968,7 @@ void smp::configure(boost::program_options::variables_map configuration)
     static boost::barrier smp_queues_constructed(smp::count);
     static boost::barrier inited(smp::count);
 
-    seastar::shared_ptr<io_queue_creator> io_queue_creator = seastar::make_shared<standard_io_queue_creator>(std::move(resources.io_queues));
+    seastar::shared_ptr<io_queue_creator> io_queue_creator = seastar::make_shared<standard_io_queue_creator>(std::move(resources.io_queues), iocfg);
     io_queue::fill_shares_array();
 
     _all_event_loops_done.emplace(smp::count);

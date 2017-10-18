@@ -474,6 +474,10 @@ reactor::task_queue::task_queue(unsigned id, sstring name, float shares)
         sm::make_gauge("shares", [this] { return _shares; },
                 sm::description("Shares allocated to this queue"),
                 {group_label}),
+        sm::make_derive("time_spent_on_task_quota_violations_ns", [this] {
+                return std::chrono::duration_cast<std::chrono::nanoseconds>(_time_spent_on_task_quota_violations).count();
+        }, sm::description("Total amount in nanoseconds we were in violation of the task quota"),
+           {group_label}),
     });
 }
 
@@ -494,6 +498,9 @@ reactor::task_queue::set_shares(float shares) {
 
 void
 reactor::account_runtime(task_queue& tq, sched_clock::duration runtime) {
+    if (runtime > _task_quota) {
+        tq._time_spent_on_task_quota_violations += runtime - _task_quota;
+    }
     tq._vruntime += tq.to_vruntime(runtime);
     tq._runtime += runtime;
 }

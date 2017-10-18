@@ -831,7 +831,6 @@ private:
     thread_pool _thread_pool;
     friend class thread_pool;
 
-    uint64_t pending_task_count() const;
     void run_tasks(task_queue& tq);
     bool have_more_tasks() const;
     bool posix_reuseport_detect();
@@ -843,7 +842,6 @@ private:
     void account_runtime(task_queue& tq, sched_clock::duration runtime);
     void account_idle(sched_clock::duration idletime);
     void init_scheduling_group(scheduling_group sg, sstring name, float shares);
-    uint64_t tasks_processed() const;
     uint64_t min_vruntime() const;
 public:
     static boost::program_options::options_description get_options_description(std::chrono::duration<double> default_task_quota);
@@ -964,6 +962,10 @@ public:
 
     steady_clock_type::duration total_idle_time();
     steady_clock_type::duration total_busy_time();
+
+    uint64_t pending_task_count() const;
+
+    uint64_t tasks_processed() const;
 
     uint64_t task_quota_violations() const {
         return _task_quota_violations.load(std::memory_order_relaxed);

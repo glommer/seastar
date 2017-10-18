@@ -710,6 +710,7 @@ private:
     semaphore _cpu_started;
     std::atomic<uint64_t> _tasks_processed = { 0 };
     std::atomic<uint64_t> _polls = { 0 };
+    std::atomic<uint64_t> _task_quota_violations = { 0 };
     std::atomic<unsigned> _tasks_processed_stalled = { 0 };
     unsigned _tasks_processed_report_threshold;
     unsigned _stall_detector_reports_per_minute;
@@ -963,6 +964,10 @@ public:
 
     steady_clock_type::duration total_idle_time();
     steady_clock_type::duration total_busy_time();
+
+    uint64_t task_quota_violations() const {
+        return _task_quota_violations.load(std::memory_order_relaxed);
+    }
 
     const io_stats& get_io_stats() const { return _io_stats; }
 #ifdef HAVE_OSV

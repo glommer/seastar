@@ -575,7 +575,11 @@ reactor::task_quota_timer_thread_fn() {
         auto tp = _tasks_processed.load(std::memory_order_relaxed);
         auto p = _polls.load(std::memory_order_relaxed);
         if ((tp == last_tasks_processed_seen) && (p == last_polls_seen)) {
-            if ((increment_nonatomically(_tasks_processed_stalled) == report_at)) {
+            auto stalled = increment_nonatomically(_tasks_processed_stalled);
+            if (stalled > 0) {
+                increment_nonatomically(_task_quota_violations);
+            }
+            if (stalled == report_at) {
                 rate_limit.maybe_report(_thread_id, block_notifier_signal());
                 report_at <<= 1;
             }
@@ -2347,6 +2351,7 @@ void reactor::register_metrics() {
             sm::make_gauge("tasks_pending", std::bind(&reactor::pending_task_count, this), sm::description("Number of pending tasks in the queue")),
             // total_operations value:DERIVE:0:U
             sm::make_derive("tasks_processed", std::bind(&reactor::tasks_processed, this), sm::description("Total tasks processed")),
+            sm::make_derive("task_quota_violations", std::bind(&reactor::task_quota_violations, this), sm::description("Total times the task quota was violated")),
             sm::make_derive("polls", [this] { return _polls.load(std::memory_order_relaxed); }, sm::description("Number of times pollers were executed")),
             sm::make_derive("timers_pending", std::bind(&decltype(_timers)::size, &_timers), sm::description("Number of tasks in the timer-pending queue")),
             sm::make_gauge("utilization", [this] { return (1-_load)  * 100; }, sm::description("CPU utilization")),

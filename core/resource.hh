@@ -40,13 +40,17 @@ using std::experimental::optional;
 
 using cpuset = std::set<unsigned>;
 
+struct io_queue_config {
+    optional<unsigned> max_io_requests;
+    optional<unsigned> io_queues;
+};
+
 struct configuration {
     optional<size_t> total_memory;
     optional<size_t> reserve_memory;  // if total_memory not specified
     optional<size_t> cpus;
     optional<cpuset> cpu_set;
-    optional<unsigned> max_io_requests;
-    optional<unsigned> io_queues;
+    io_queue_config  io_queue_params;
 };
 
 struct memory {

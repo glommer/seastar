@@ -3920,11 +3920,11 @@ void smp::configure(boost::program_options::variables_map configuration)
     rc.cpus = smp::count;
     rc.cpu_set = std::move(cpu_set);
     if (configuration.count("max-io-requests")) {
-        rc.max_io_requests = configuration["max-io-requests"].as<unsigned>();
+        rc.io_queue_params.max_io_requests = configuration["max-io-requests"].as<unsigned>();
     }
 
     if (configuration.count("num-io-queues")) {
-        rc.io_queues = configuration["num-io-queues"].as<unsigned>();
+        rc.io_queue_params.io_queues = configuration["num-io-queues"].as<unsigned>();
     }
 
     auto resources = resource::allocate(rc);

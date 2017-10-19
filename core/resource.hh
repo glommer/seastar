@@ -64,12 +64,22 @@ struct io_queue {
     unsigned capacity;
 };
 
+static constexpr unsigned max_shards_per_io_queue_group = 8;
+
 // Since this is static information, we will keep a copy at each CPU.
 // This will allow us to easily find who is the IO coordinator for a given
 // node without a trip to a remote CPU.
 struct io_queue_topology {
     std::vector<unsigned> shard_to_coordinator;
     std::vector<io_queue> coordinators;
+    unsigned num_io_queues;
+    // We can have a restricted number of I/O Queues - one per coordinator - in which case the size of
+    // the coordinator vector is the same as shards_with_io_queues. Coordinators are then responsible for
+    // dispatching I/O.
+    //
+    // Alternatively we can have a loaning scheme in which case we will have I/O Queues in all shards and
+    // the coordinators are only used as a reference for placement.
+    bool io_from_all_shards = true;
 };
 
 struct cpu {

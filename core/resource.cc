@@ -84,6 +84,19 @@ size_t calculate_memory(configuration c, size_t available_memory, float panic_fa
     return mem;
 }
 
+inline
+unsigned group_io_queues(size_t nr_cpus) {
+    unsigned ret;
+    // Try our best to have all I/O Queue groups in the system with the same number of shards.
+    // So we'll attempt to find a number that divides the number of CPU if possible
+    for (unsigned grp_size = 4; grp_size < max_shards_per_io_queue_group; ++grp_size) {
+        ret = nr_cpus / grp_size;
+        if ((nr_cpus % grp_size) == 0) {
+            break;
+        }
+    }
+    return std::max(ret, 1u);
+}
 }
 
 }
@@ -157,8 +170,31 @@ struct distribute_objects {
 
 static io_queue_topology
 allocate_io_queues(hwloc_topology_t& topology, io_queue_config& c, std::vector<cpu> cpus) {
-    unsigned num_io_queues = c.io_queues.value_or(cpus.size());
-    unsigned max_io_requests = c.max_io_requests.value_or(128 * num_io_queues);
+    io_queue_topology ret;
+    // If those parameters are set, use legacy I/O Queue mode: only coordinators issue requests
+    // and I/O limits are divided equally among coordinators. If they are not set, place an I/O
+    // queue in all shards and employ borrowing to distribute load.
+    ret.io_from_all_shards = !((bool(c.io_queues) || bool(c.max_io_requests)));
+
+    unsigned max_io_requests;
+    unsigned num_io_groups;
+    // Try our best to have all I/O Queue groups in the system with the same number of shards.
+    // So we'll attempt to find a number that divides the number of CPU if possible
+    if (ret.io_from_all_shards) {
+        ret.num_io_queues = cpus.size();
+        num_io_groups = group_io_queues(cpus.size());
+        max_io_requests = 128 * cpus.size();
+    } else {
+        ret.num_io_queues = c.io_queues.value_or(cpus.size());
+        max_io_requests = c.max_io_requests.value_or(128 * ret.num_io_queues);
+        num_io_groups = ret.num_io_queues;
+        // User may be playing with --smp option, but num_io_queues was independently
+        // determined by iotune, so adjust for any conflicts.
+        if (ret.num_io_queues > cpus.size()) {
+            print("Warning: number of IO queues (%d) greater than logical cores (%d). Adjusting downwards.\n", ret.num_io_queues, cpus.size());
+            ret.num_io_queues = cpus.size();
+        }
+    }
 
     unsigned depth = find_memory_depth(topology);
     auto node_of_shard = [&topology, &cpus, &depth] (unsigned shard) {
@@ -187,15 +223,7 @@ allocate_io_queues(hwloc_topology_t& topology, io_queue_config& c, std::vector<c
         numa_nodes.at(node_id).insert(shard);
     }
 
-    io_queue_topology ret;
     ret.shard_to_coordinator.resize(cpus.size());
-
-    // User may be playing with --smp option, but num_io_queues was independently
-    // determined by iotune, so adjust for any conflicts.
-    if (num_io_queues > cpus.size()) {
-        print("Warning: number of IO queues (%d) greater than logical cores (%d). Adjusting downwards.\n", num_io_queues, cpus.size());
-        num_io_queues = cpus.size();
-    }
 
     auto find_shard = [&cpus] (unsigned cpu_id) {
         auto idx = 0u;
@@ -208,14 +236,13 @@ allocate_io_queues(hwloc_topology_t& topology, io_queue_config& c, std::vector<c
         assert(0);
     };
 
-    auto cpu_sets = distribute_objects(topology, num_io_queues);
+    auto cpu_sets = distribute_objects(topology, num_io_groups);
     // First step: distribute the IO queues given the information returned in cpu_sets.
     // If there is one IO queue per processor, only this loop will be executed.
     std::unordered_map<unsigned, std::vector<unsigned>> node_coordinators;
     for (auto&& cs : cpu_sets()) {
         auto io_coordinator = find_shard(hwloc_bitmap_first(cs));
-
-        ret.coordinators.emplace_back(io_queue{io_coordinator, std::max(max_io_requests / num_io_queues , 1u)});
+        ret.coordinators.emplace_back(io_queue{io_coordinator, std::max(max_io_requests / ret.num_io_queues , 1u)});
         // If a processor is a coordinator, it is also obviously a coordinator of itself
         ret.shard_to_coordinator[io_coordinator] = io_coordinator;
 
@@ -350,17 +377,29 @@ namespace resource {
 static io_queue_topology
 allocate_io_queues(io_queue_config& c, std::vector<cpu> cpus) {
     io_queue_topology ret;
+    ret.io_from_all_shards = true;
+    bool legacy = bool(c.max_io_requests);
 
     unsigned nr_cpus = unsigned(cpus.size());
     unsigned max_io_requests = c.max_io_requests.value_or(128 * nr_cpus);
 
-    ret.shard_to_coordinator.resize(nr_cpus);
-    ret.coordinators.resize(nr_cpus);
+    unsigned num_io_groups = nr_cpus;
+    if (!legacy) {
+        num_io_grous = group_io_queues(nr_cpus);
+    }
 
+    ret.num_io_queues = nr_cpus;
+    ret.shard_to_coordinator.resize(nr_cpus);
+    ret.coordinators.resize(ret.num_io_queues);
+
+    auto shards_per_group = nr_cpus / num_io_groups;
     for (unsigned shard = 0; shard < nr_cpus; ++shard) {
-        ret.shard_to_coordinator[shard] = shard;
-        ret.coordinators[shard].capacity =  std::max(max_io_requests / nr_cpus, 1u);
-        ret.coordinators[shard].id = shard;
+        auto group = shard / shards_per_group;
+        ret.shard_to_coordinator[shard] = group;
+        if (group == shard) {
+            ret.coordinators[group].capacity =  std::max(max_io_requests / nr_cpus, 1u);
+            ret.coordinators[group].id = shard;
+        }
     }
     return ret;
 }

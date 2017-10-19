@@ -591,6 +591,20 @@ private:
 
 constexpr unsigned max_scheduling_groups() { return 16; }
 
+struct io_queue_creator {
+    virtual int alloc_io_queue(unsigned shard) = 0;
+    virtual void assign_io_queue(shard_id id, int queue_idx) = 0;
+};
+
+class standard_io_queue_creator final : public io_queue_creator {
+    std::vector<io_queue*> _all_io_queues;
+    resource::io_queue_topology _io_info;
+public:
+    int alloc_io_queue(unsigned shard) override;
+    void assign_io_queue(shard_id id, int queue_idx);
+    standard_io_queue_creator(resource::io_queue_topology io_info);
+};
+
 class reactor {
     using sched_clock = std::chrono::steady_clock;
 private:
@@ -704,6 +718,7 @@ private:
     shard_id _io_coordinator;
     io_queue* _io_queue;
     friend io_queue;
+    friend class standard_io_queue_creator;
 
     std::vector<std::function<future<> ()>> _exit_funcs;
     unsigned _id = 0;

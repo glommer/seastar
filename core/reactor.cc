@@ -3752,7 +3752,8 @@ int standard_io_queue_creator::alloc_io_queue(unsigned shard) {
         if (shard == cid) {
             struct io_queue::config cfg;
             cfg.capacity = coordinator.capacity;
-            _all_io_queues[vec_idx] = new io_queue(coordinator.id, std::move(cfg), _io_info.shard_to_coordinator);
+            engine().my_io_queue = std::make_unique<io_queue>(coordinator.id, std::move(cfg), _io_info.shard_to_coordinator);
+            _all_io_queues[vec_idx] = engine().my_io_queue.get();
         }
         return vec_idx;
     }
@@ -3760,9 +3761,6 @@ int standard_io_queue_creator::alloc_io_queue(unsigned shard) {
 };
 
 void standard_io_queue_creator::assign_io_queue(shard_id id, int queue_idx) {
-    if (_all_io_queues[queue_idx]->coordinator() == id) {
-        engine().my_io_queue.reset(_all_io_queues[queue_idx]);
-    }
     engine()._io_queue = _all_io_queues[queue_idx];
     engine()._io_coordinator = _all_io_queues[queue_idx]->coordinator();
 }

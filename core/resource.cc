@@ -156,7 +156,7 @@ struct distribute_objects {
 };
 
 static io_queue_topology
-allocate_io_queues(hwloc_topology_t& topology, configuration c, std::vector<cpu> cpus) {
+allocate_io_queues(hwloc_topology_t& topology, io_queue_config& c, std::vector<cpu> cpus) {
     unsigned num_io_queues = c.io_queues.value_or(cpus.size());
     unsigned max_io_requests = c.max_io_requests.value_or(128 * num_io_queues);
 
@@ -321,7 +321,7 @@ resources allocate(configuration c) {
         ret.cpus.push_back(std::move(this_cpu));
     }
 
-    ret.io_queues = allocate_io_queues(topology, c, ret.cpus);
+    ret.io_queues = allocate_io_queues(topology, c.io_queue_params, ret.cpus);
     return ret;
 }
 
@@ -348,7 +348,7 @@ namespace resource {
 
 // Without hwloc, we don't support tuning the number of IO queues. So each CPU gets their.
 static io_queue_topology
-allocate_io_queues(configuration c, std::vector<cpu> cpus) {
+allocate_io_queues(io_queue_config& c, std::vector<cpu> cpus) {
     io_queue_topology ret;
 
     unsigned nr_cpus = unsigned(cpus.size());
@@ -378,7 +378,7 @@ resources allocate(configuration c) {
         ret.cpus.push_back(cpu{i, {{mem / procs, 0}}});
     }
 
-    ret.io_queues = allocate_io_queues(c, ret.cpus);
+    ret.io_queues = allocate_io_queues(c.io_queue_params, ret.cpus);
     return ret;
 }
 

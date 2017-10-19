@@ -3739,6 +3739,37 @@ static void sigabrt_action() noexcept {
     print_with_backtrace("Aborting");
 }
 
+int standard_io_queue_creator::alloc_io_queue(unsigned shard) {
+    auto cid = _io_info.shard_to_coordinator[shard];
+    int vec_idx = 0;
+    for (auto& coordinator: _io_info.coordinators) {
+        if (coordinator.id != cid) {
+            vec_idx++;
+            continue;
+        }
+        if (shard == cid) {
+            struct io_queue::config cfg;
+            cfg.capacity = coordinator.capacity;
+            _all_io_queues[vec_idx] = new io_queue(coordinator.id, std::move(cfg), _io_info.shard_to_coordinator);
+        }
+        return vec_idx;
+    }
+    assert(0); // Impossible
+};
+
+void standard_io_queue_creator::assign_io_queue(shard_id id, int queue_idx) {
+    if (_all_io_queues[queue_idx]->coordinator() == id) {
+        engine().my_io_queue.reset(_all_io_queues[queue_idx]);
+    }
+    engine()._io_queue = _all_io_queues[queue_idx];
+    engine()._io_coordinator = _all_io_queues[queue_idx]->coordinator();
+}
+
+standard_io_queue_creator::standard_io_queue_creator(resource::io_queue_topology io_info)
+    : _all_io_queues(io_info.coordinators.size(), nullptr)
+    , _io_info(std::move(io_info))
+{}
+
 void smp::configure(boost::program_options::variables_map configuration)
 {
 #ifndef NO_EXCEPTION_HACK
@@ -3878,45 +3909,15 @@ void smp::configure(boost::program_options::variables_map configuration)
     static boost::barrier smp_queues_constructed(smp::count);
     static boost::barrier inited(smp::count);
 
-    auto io_info = std::move(resources.io_queues);
-
-    std::vector<io_queue*> all_io_queues;
-    all_io_queues.resize(io_info.coordinators.size());
+    seastar::shared_ptr<io_queue_creator> io_queue_creator = seastar::make_shared<standard_io_queue_creator>(std::move(resources.io_queues));
     io_queue::fill_shares_array();
-
-    auto alloc_io_queue = [io_info, &all_io_queues] (unsigned shard) {
-        auto cid = io_info.shard_to_coordinator[shard];
-        int vec_idx = 0;
-        for (auto& coordinator: io_info.coordinators) {
-            if (coordinator.id != cid) {
-                vec_idx++;
-                continue;
-            }
-            if (shard == cid) {
-                struct io_queue::config cfg;
-                cfg.capacity = coordinator.capacity;
-
-                all_io_queues[vec_idx] = new io_queue(coordinator.id, std::move(cfg), io_info.shard_to_coordinator);
-            }
-            return vec_idx;
-        }
-        assert(0); // Impossible
-    };
-
-    auto assign_io_queue = [&all_io_queues] (shard_id id, int queue_idx) {
-        if (all_io_queues[queue_idx]->coordinator() == id) {
-            engine().my_io_queue.reset(all_io_queues[queue_idx]);
-        }
-        engine()._io_queue = all_io_queues[queue_idx];
-        engine()._io_coordinator = all_io_queues[queue_idx]->coordinator();
-    };
 
     _all_event_loops_done.emplace(smp::count);
 
     unsigned i;
     for (i = 1; i < smp::count; i++) {
         auto allocation = allocations[i];
-        create_thread([configuration, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled, mbind] {
+        create_thread([configuration, hugepages_path, i, allocation, io_queue_creator, thread_affinity, heapprof_enabled, mbind] {
             auto thread_name = seastar::format("reactor-{}", i);
             pthread_setname_np(pthread_self(), thread_name.c_str());
             if (thread_affinity) {
@@ -3933,11 +3934,11 @@ void smp::configure(boost::program_options::variables_map configuration)
             throw_pthread_error(r);
             allocate_reactor(i);
             _reactors[i] = &engine();
-            auto queue_idx = alloc_io_queue(i);
+            auto queue_idx = io_queue_creator->alloc_io_queue(i);
             reactors_registered.wait();
             smp_queues_constructed.wait();
             start_all_queues();
-            assign_io_queue(i, queue_idx);
+            io_queue_creator->assign_io_queue(i, queue_idx);
             inited.wait();
             engine().configure(configuration);
             engine().run();
@@ -3946,7 +3947,7 @@ void smp::configure(boost::program_options::variables_map configuration)
 
     allocate_reactor(0);
     _reactors[0] = &engine();
-    auto queue_idx = alloc_io_queue(0);
+    auto queue_idx = io_queue_creator->alloc_io_queue(0);
 
 #ifdef HAVE_DPDK
     if (_using_dpdk) {
@@ -3967,7 +3968,7 @@ void smp::configure(boost::program_options::variables_map configuration)
     }
     smp_queues_constructed.wait();
     start_all_queues();
-    assign_io_queue(0, queue_idx);
+    io_queue_creator->assign_io_queue(0, queue_idx);
     inited.wait();
 
     engine().configure(configuration);

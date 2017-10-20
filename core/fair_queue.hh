@@ -101,6 +101,8 @@ public:
         std::function<float(uint64_t)> weight = std::function<float(uint64_t)>([] (uint64_t dummy) { return 1.0f; });
         uint64_t bytes_per_sec = std::numeric_limits<uint64_t>::max();
         uint64_t req_per_sec = std::numeric_limits<uint64_t>::max();
+        token_info* bytes_per_sec_token_info = nullptr;
+        token_info* req_per_sec_token_info = nullptr;
     };
 private:
     friend priority_class;
@@ -209,8 +211,8 @@ public:
     explicit fair_queue(config cfg)
         : _config(std::move(cfg))
         , _base(std::chrono::steady_clock::now())
-        , _req_per_sec(_config.req_per_sec)
-        , _bytes_per_sec(_config.bytes_per_sec)
+        , _req_per_sec(_config.req_per_sec, _config.req_per_sec_token_info)
+        , _bytes_per_sec(_config.bytes_per_sec, _config.bytes_per_sec_token_info)
     {
     }
 

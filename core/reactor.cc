@@ -101,6 +101,8 @@
 #include "execution_stage.hh"
 #include "exception_hacks.hh"
 
+#include "util/token_bucket.hh"
+
 namespace seastar {
 
 using namespace std::chrono_literals;
@@ -961,6 +963,54 @@ reactor::submit_io_write(const io_priority_class& pc, size_t len, Func prepare_i
     return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));
 }
 
+void io_queue::donate_excess_tokens_from_bucket(std::vector<token_info>* remote_token_info, auto&(io_queue::*get_bucket)()) {
+    auto&& bucket = (this->*get_bucket)();
+
+    auto donatable = bucket.donatable_tokens();
+    if (donatable == 0) {
+        return;
+    }
+
+    struct donations {
+        unsigned id;
+        uint64_t donation_needed;
+    } donations[resource::max_shards_per_io_queue_group];
+
+    unsigned idx = 0;
+    uint64_t donation_needed = 0;
+
+    // We will iterate over the remote peers so we can accumulate the total
+    // number of needed tokens and make the donations proportional to their needs.
+    // We will save that info in a stack variable so we don't have to do atomics twice.
+    for (auto& ti : *remote_token_info) {
+        auto d = ti.needed_donation();
+        donation_needed += d;
+        donations[idx].donation_needed = d;
+        donations[idx].id = ti.id();
+        ++idx;
+    }
+
+    if (!donation_needed) {
+        return;
+    }
+
+    for (unsigned i = 0; i < idx; ++i) {
+        auto& d = donations[i];
+        if (d.donation_needed) {
+            auto donation = (donatable * d.donation_needed) / donation_needed;
+            donation = std::min(donation, d.donation_needed);
+            bucket.donate_tokens(donation);
+            // If we can donate, then we don't need a donation. For sure this submit_to is to a remote
+            // shard.
+            smp::submit_to(d.id, [donation, get_bucket = std::move(get_bucket)] () mutable {
+                assert(engine().my_io_queue);
+                auto&& bucket = (engine().my_io_queue.get()->*get_bucket)();
+                bucket.receive_donation(donation);
+            });
+        }
+    }
+}
+
 bool reactor::process_io()
 {
     io_event ev[max_aio];
@@ -984,6 +1034,8 @@ fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
     cfg.capacity = iocfg.capacity;
     cfg.bytes_per_sec = iocfg.bytes_per_sec;
     cfg.req_per_sec = iocfg.req_per_sec;
+    cfg.bytes_per_sec_token_info = iocfg.bytes_per_sec_token_info;
+    cfg.req_per_sec_token_info = iocfg.req_per_sec_token_info;
     cfg.weight = [] (uint64_t len) { return 1 + len/(16 << 10); };
     return cfg;
 }
@@ -993,7 +1045,9 @@ io_queue::io_queue(shard_id coordinator, io_queue::config cfg, std::vector<shard
         , _capacity(cfg.capacity)
         , _io_topology(std::move(topology))
         , _priority_classes()
-        , _fq(make_fair_queue_config(cfg)) {
+        , _fq(make_fair_queue_config(cfg))
+        , _config(cfg)
+{
 }
 
 io_queue::~io_queue() {
@@ -3011,6 +3065,9 @@ int reactor::run() {
         }
 
         increment_nonatomically(_polls);
+        if (my_io_queue) {
+            my_io_queue->donate_excess_tokens();
+        }
 
         if (check_for_work()) {
             if (idle) {
@@ -3820,6 +3877,57 @@ standard_io_queue_creator::standard_io_queue_creator(resource::io_queue_topology
     , _default_cfg(std::move(default_config))
 {}
 
+loaning_io_queue_creator::token_info_vec*
+loaning_io_queue_creator::alloc_token_info(std::unique_ptr<token_info_vec>& dest, unsigned cid) {
+    dest = std::make_unique<token_info_vec>();
+    auto& buddies = _grouping_info.at(cid);
+    for (unsigned buddy_id = 0; buddy_id < buddies.size(); ++buddy_id) {
+        dest->emplace_back(token_info(buddy_id, buddies.size()));
+    }
+    return dest.get();
+}
+
+int loaning_io_queue_creator::alloc_io_queue(unsigned shard) {
+    return do_if_coordinator(_io_info, shard, [this, shard] (resource::io_queue& coordinator, unsigned vec_idx) {
+        auto cid = _io_info.shard_to_coordinator[shard];
+        _bytes_per_sec_token_info[vec_idx] = alloc_token_info(engine().my_bytes_per_sec_token_info, cid);
+        _req_per_sec_token_info[vec_idx] = alloc_token_info(engine().my_req_per_sec_token_info, cid);
+    });
+};
+
+void loaning_io_queue_creator::assign_io_queue(shard_id id, int queue_idx) {
+    auto coordinator = _io_info.shard_to_coordinator[id];
+    auto& my_group = _grouping_info.at(coordinator);
+    auto ti_index = std::distance(my_group.begin(), std::find(my_group.begin(), my_group.end(), id));
+
+    struct io_queue::config cfg = _default_cfg;
+
+    cfg.bytes_per_sec_remote_token_info = _bytes_per_sec_token_info[queue_idx];
+    cfg.bytes_per_sec_token_info = &(_bytes_per_sec_token_info[queue_idx]->at(ti_index));
+
+    cfg.req_per_sec_remote_token_info = _req_per_sec_token_info[queue_idx];
+    cfg.req_per_sec_token_info = &(_req_per_sec_token_info[queue_idx]->at(ti_index));
+
+    engine().my_io_queue = std::make_unique<io_queue>(id, std::move(cfg), _io_info.shard_to_coordinator);
+    engine()._io_queue = engine().my_io_queue.get();
+    engine()._io_coordinator = id;
+}
+
+loaning_io_queue_creator::loaning_io_queue_creator(resource::io_queue_topology io_info, io_queue::config default_config)
+    : _bytes_per_sec_token_info(io_info.coordinators.size(), nullptr)
+    , _req_per_sec_token_info(io_info.coordinators.size(), nullptr)
+    , _io_info(std::move(io_info))
+    , _default_cfg(std::move(default_config))
+{
+    for (unsigned shard = 0; shard < smp::count; ++shard) {
+        auto my_coordinator = _io_info.shard_to_coordinator[shard];
+        if (!_grouping_info.count(my_coordinator)) {
+            _grouping_info.emplace(my_coordinator, std::vector<unsigned>());
+        }
+        _grouping_info.at(my_coordinator).push_back(shard);
+    }
+}
+
 void smp::configure(boost::program_options::variables_map configuration)
 {
 #ifndef NO_EXCEPTION_HACK
@@ -3939,12 +4047,12 @@ void smp::configure(boost::program_options::variables_map configuration)
     struct io_queue::config iocfg;
     if (configuration.count("max-disk-megabytes-per-sec")) {
         auto bytes_per_sec = configuration["max-disk-megabytes-per-sec"].as<device_attribute>();
-        iocfg.bytes_per_sec = (bytes_per_sec.attribute << 20) / resources.io_queues.coordinators.size();
+        iocfg.bytes_per_sec = (bytes_per_sec.attribute << 20) / resources.io_queues.num_io_queues;
     }
 
     if (configuration.count("max-disk-req-per-sec")) {
         auto io_per_sec = configuration["max-disk-req-per-sec"].as<device_attribute>();
-        iocfg.req_per_sec = (io_per_sec.attribute) / resources.io_queues.coordinators.size();
+        iocfg.req_per_sec = (io_per_sec.attribute) / resources.io_queues.num_io_queues;
     }
 
     if (configuration.count("abort-on-seastar-bad-alloc")) {
@@ -3970,7 +4078,13 @@ void smp::configure(boost::program_options::variables_map configuration)
     static boost::barrier smp_queues_constructed(smp::count);
     static boost::barrier inited(smp::count);
 
-    seastar::shared_ptr<io_queue_creator> io_queue_creator = seastar::make_shared<standard_io_queue_creator>(std::move(resources.io_queues), iocfg);
+    seastar::shared_ptr<io_queue_creator> io_queue_creator;
+    if (resources.io_queues.io_from_all_shards) {
+       io_queue_creator = seastar::make_shared<loaning_io_queue_creator>(std::move(resources.io_queues), iocfg);
+    } else {
+       io_queue_creator = seastar::make_shared<standard_io_queue_creator>(std::move(resources.io_queues), iocfg);
+    }
+
     io_queue::fill_shares_array();
 
     _all_event_loops_done.emplace(smp::count);

@@ -558,8 +558,25 @@ public:
     struct config {
         unsigned capacity = std::numeric_limits<unsigned>::max();
         uint64_t bytes_per_sec = std::numeric_limits<uint64_t>::max();
+        token_info* bytes_per_sec_token_info = nullptr;
+        std::vector<token_info>* bytes_per_sec_remote_token_info = nullptr;
         uint64_t req_per_sec = std::numeric_limits<uint64_t>::max();
+        token_info* req_per_sec_token_info = nullptr;
+        std::vector<token_info>* req_per_sec_remote_token_info = nullptr;
     };
+private:
+    config _config;
+
+    auto& bytes_per_sec_bucket() {
+        return _fq.bytes_per_sec_bucket();
+    }
+
+    auto& req_per_sec_bucket() {
+        return _fq.req_per_sec_bucket();
+    }
+
+    void donate_excess_tokens_from_bucket(std::vector<token_info>* remote_token_info, auto&(io_queue::*get_bucket)());
+public:
 
     io_queue(shard_id coordinator, config cfg, std::vector<shard_id> topology);
     ~io_queue();
@@ -578,6 +595,16 @@ public:
 
     void poll_io_queue() {
         _fq.dispatch_requests();
+    }
+
+    void donate_excess_tokens() {
+        if (_config.bytes_per_sec_token_info) {
+            donate_excess_tokens_from_bucket(_config.bytes_per_sec_remote_token_info, &io_queue::bytes_per_sec_bucket);
+        }
+
+        if (_config.req_per_sec_token_info) {
+            donate_excess_tokens_from_bucket(_config.req_per_sec_remote_token_info, &io_queue::req_per_sec_bucket);
+        }
     }
 
     shard_id coordinator() const {
@@ -611,6 +638,22 @@ public:
     int alloc_io_queue(unsigned shard) override;
     void assign_io_queue(shard_id id, int queue_idx);
     standard_io_queue_creator(resource::io_queue_topology io_info, io_queue::config default_config);
+};
+
+class loaning_io_queue_creator final : public io_queue_creator {
+    using token_info_vec = std::vector<token_info>;
+
+    std::vector<token_info_vec*> _bytes_per_sec_token_info;
+    std::vector<token_info_vec*> _req_per_sec_token_info;
+    resource::io_queue_topology _io_info;
+    std::unordered_map<unsigned, std::vector<unsigned>> _grouping_info;
+    io_queue::config _default_cfg;
+
+    token_info_vec* alloc_token_info(std::unique_ptr<token_info_vec>& dest, unsigned cid);
+public:
+    int alloc_io_queue(unsigned shard) override;
+    void assign_io_queue(shard_id id, int queue_idx);
+    loaning_io_queue_creator(resource::io_queue_topology io_info, io_queue::config default_config);
 };
 
 class reactor {
@@ -720,6 +763,8 @@ private:
     // be stored here.
     std::unique_ptr<io_queue> my_io_queue = {};
 
+    std::unique_ptr<std::vector<token_info>> my_bytes_per_sec_token_info = {};
+    std::unique_ptr<std::vector<token_info>> my_req_per_sec_token_info = {};
 
     // For submiting the actual IO, all we need is the coordinator id. So storing it
     // separately saves us the pointer access.
@@ -727,6 +772,7 @@ private:
     io_queue* _io_queue;
     friend io_queue;
     friend class standard_io_queue_creator;
+    friend class loaning_io_queue_creator;
 
     std::vector<std::function<future<> ()>> _exit_funcs;
     unsigned _id = 0;

@@ -90,11 +90,13 @@ public:
         auto pos = _pos_distribution(random_generator) * _reqsize;
         return _fq.dma_read(pos, buf, _reqsize, cl._iop).then([bufptr = std::move(bufptr), &cl, this] (size_t size) {
             cl._bytes += size;
-            if ((std::chrono::steady_clock::now() - cl._start) < _duration) {
-                return this->read_class(cl);
-            } else {
-                return make_ready_future<>();
-            }
+            return sleep(engine().cpu_id() * 20ms).then([this, &cl] {
+                if ((std::chrono::steady_clock::now() - cl._start) < _duration) {
+                    return this->read_class(cl);
+                } else {
+                    return make_ready_future<>();
+                }
+            });
         });
     }
 

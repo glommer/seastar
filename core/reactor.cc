@@ -3739,23 +3739,32 @@ static void sigabrt_action() noexcept {
     print_with_backtrace("Aborting");
 }
 
-int standard_io_queue_creator::alloc_io_queue(unsigned shard) {
-    auto cid = _io_info.shard_to_coordinator[shard];
+
+template <typename Func>
+int io_queue_creator::do_if_coordinator(resource::io_queue_topology& io_info, unsigned shard, Func&& func) {
+    auto cid = io_info.shard_to_coordinator[shard];
     int vec_idx = 0;
-    for (auto& coordinator: _io_info.coordinators) {
+
+    for (auto& coordinator: io_info.coordinators) {
         if (coordinator.id != cid) {
             vec_idx++;
             continue;
         }
         if (shard == cid) {
-            struct io_queue::config cfg;
-            cfg.capacity = coordinator.capacity;
-            engine().my_io_queue = std::make_unique<io_queue>(coordinator.id, std::move(cfg), _io_info.shard_to_coordinator);
-            _all_io_queues[vec_idx] = engine().my_io_queue.get();
+            func(coordinator, vec_idx);
         }
         return vec_idx;
     }
     assert(0); // Impossible
+}
+
+int standard_io_queue_creator::alloc_io_queue(unsigned shard) {
+    return do_if_coordinator(_io_info, shard, [this, shard] (resource::io_queue& coordinator, unsigned vec_idx) {
+        struct io_queue::config cfg;
+        cfg.capacity = coordinator.capacity;
+        engine().my_io_queue = std::make_unique<io_queue>(coordinator.id, std::move(cfg), _io_info.shard_to_coordinator);
+        _all_io_queues[vec_idx] = engine().my_io_queue.get();
+    });
 };
 
 void standard_io_queue_creator::assign_io_queue(shard_id id, int queue_idx) {

@@ -594,6 +594,11 @@ constexpr unsigned max_scheduling_groups() { return 16; }
 struct io_queue_creator {
     virtual int alloc_io_queue(unsigned shard) = 0;
     virtual void assign_io_queue(shard_id id, int queue_idx) = 0;
+protected:
+    // If we are a coordinator: execute func, and return a unique queue_id.
+    // If we are not a coordinator: return the queue_id for our coordinator.
+    template <typename Func>
+    int do_if_coordinator(resource::io_queue_topology& io_info, unsigned shard, Func&& func);
 };
 
 class standard_io_queue_creator final : public io_queue_creator {

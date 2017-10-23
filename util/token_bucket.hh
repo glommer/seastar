@@ -125,13 +125,13 @@ public:
     /// \param rate_per_second the rate per second that this bucket limits
     /// \param token_info a pointer to a \ref token_info instance, where this bucket will publicize its token deficits. If nullptr, no donations allowed
     /// \param burst_period the maximum period for which to accumulate unused tokens
-    token_bucket(uint64_t rate_per_second, token_info* token_info, std::chrono::milliseconds burst_period = std::chrono::milliseconds(100))
+    token_bucket(uint64_t rate_per_second, token_info* token_info, std::chrono::microseconds burst_period = std::chrono::microseconds(500))
         : _last_update(Clock::now())
         , _last_update_big(Clock::now())
         , _tokens_per_microsecond(tokens_per_microsecond(rate_per_second))
-        , _max_capacity(_tokens_per_microsecond * std::chrono::duration_cast<std::chrono::microseconds>(burst_period).count())
+        , _max_capacity(_tokens_per_microsecond * burst_period.count())
         , _max_donation_capacity(token_info ?
-            _tokens_per_microsecond * std::chrono::duration_cast<std::chrono::microseconds>(burst_period).count() * token_info->nr_sharing() : 0
+            _tokens_per_microsecond * burst_period.count() * token_info->nr_sharing() : 0
         )
         , _token_info(token_info)
     {}
@@ -140,7 +140,7 @@ public:
     ///
     /// \param rate_per_second the rate per second that this bucket limits
     /// \param burst_period the maximum period for which to accumulate unused tokens
-    token_bucket(uint64_t rate_per_second, std::chrono::milliseconds burst_period = std::chrono::milliseconds(100))
+    token_bucket(uint64_t rate_per_second, std::chrono::microseconds burst_period = std::chrono::microseconds(500))
         : token_bucket(rate_per_second, nullptr, burst_period)
     {}
 

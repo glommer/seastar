@@ -1,0 +1,17 @@
+- name: big_writes
+  shards: all
+  type: seqread
+  shard_info:
+  - parallelism: 10
+    reqsize_kb: 256
+    shares: 10
+    think_time_us: 0
+
+- name: latency_reads
+  shards: [1]
+  type: randread
+  shard_info:
+  - parallelism: 1
+    reqsize_kb: 4
+    shares: 100
+    think_time_us: 1000

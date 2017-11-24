@@ -103,6 +103,9 @@
 
 #include "util/token_bucket.hh"
 
+uint64_t test_bytes_dispatched = 0;
+uint64_t test_bytes_completed = 0;
+
 namespace seastar {
 
 using namespace std::chrono_literals;
@@ -1156,7 +1159,8 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
         pclass.bytes += len;
         pclass.ops++;
         pclass.nr_queued++;
-        return queue._fq.queue(pclass.ptr, len, [&pclass, start, prepare_io = std::move(prepare_io)] {
+        return queue._fq.queue(pclass.ptr, len, [&pclass, start, prepare_io = std::move(prepare_io), len] {
+            test_bytes_dispatched += len;
             pclass.nr_queued--;
             pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
             return engine().submit_io(std::move(prepare_io));
@@ -3046,6 +3050,9 @@ int reactor::run() {
         return pure_poll_once() || have_more_tasks() || seastar::thread::try_run_one_yielded_thread();
     };
     auto t_run_completed = idle_end;
+
+    uint64_t last_bytes_dispatched = 0;
+    auto last_tp_dispatched = std::chrono::steady_clock::now();
     while (true) {
         run_some_tasks(t_run_completed);
         if (_stopped) {
@@ -3065,6 +3072,16 @@ int reactor::run() {
         }
 
         increment_nonatomically(_polls);
+        auto now = std::chrono::steady_clock::now();
+        if (now >= last_tp_dispatched + 100ms) {
+            auto delta = test_bytes_dispatched - last_bytes_dispatched;
+            last_bytes_dispatched = test_bytes_dispatched;
+
+            double delta_t = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_tp_dispatched).count();
+            last_tp_dispatched = now;
+            double bw = ((delta >> 10) / delta_t);
+            std::cout << " BW: " << bw << " kB/s" << std::endl;
+        }
         if (my_io_queue) {
             my_io_queue->donate_excess_tokens();
         }

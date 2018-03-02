@@ -56,7 +56,7 @@ static std::default_random_engine random_generator(random_seed);
 static constexpr uint64_t file_data_size = 1ull << 30;
 
 struct context;
-enum class request_type { seqread, seqwrite, randread, randwrite, append };
+enum class request_type { seqread, seqwrite, randread, randwrite, append, cpu };
 
 namespace std {
 
@@ -94,6 +94,7 @@ struct shard_info {
     unsigned shares = 10;
     uint64_t request_size = 4 << 10;
     std::chrono::duration<float> think_time = 0ms;
+    std::chrono::duration<float> execution_time = 1ms;
 };
 
 struct job_config {
@@ -115,7 +116,7 @@ class class_data {
     io_priority_class _iop;
     seastar::scheduling_group _sg;
 
-    size_t _bytes = 0;
+    size_t _data = 0;
     std::chrono::duration<float> _total_duration;
 
     std::chrono::steady_clock::time_point _start = {};
@@ -170,13 +171,7 @@ public:
                 auto buf = bufptr.get();
                 return do_until([this, stop] { return std::chrono::steady_clock::now() > stop; }, [this, buf] () mutable {
                     auto start = std::chrono::steady_clock::now();
-                    future<size_t> fut = make_ready_future<size_t>(0);
-                    if (this->is_read()) {
-                        fut = _file.dma_read(this->get_pos(), buf, this->req_size(), _iop);
-                    } else {
-                        fut = _file.dma_write(this->get_pos(), buf, this->req_size(), _iop);
-                    }
-                    return fut.then([this, start] (auto size) {
+                    return issue_request(buf).then([this, start] (auto size) {
                         this->add_result(size, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start));
                         return seastar::sleep(std::chrono::duration_cast<std::chrono::microseconds>(_config.shard_info.think_time));
                     });
@@ -196,10 +191,15 @@ public:
     // random reads      : will read the file at random positions, between 0 and EOF
     // random writes     : will overwrite the file at a random position, between 0 and EOF
     // append            : will write to the file from pos = EOF onwards, always appending to the end.
+    // cpu               : CPU-only load, file is not created.
     future<> start(sstring dir) {
         return seastar::create_scheduling_group(sprint("%s-%d", name(), engine().cpu_id()), shares()).then([this, dir] (seastar::scheduling_group sg) {
             _sg = sg;
-            return gen_test_file(dir);
+            if (!is_cpu()) {
+                return gen_test_file(dir);
+            } else {
+                return make_ready_future<>();
+            }
         });
     }
 protected:
@@ -210,6 +210,7 @@ protected:
             { request_type::randread, "RAND READ" },
             { request_type::randwrite, "RAND WRITE" },
             { request_type::append , "APPEND" },
+            { request_type::cpu , "CPU" },
         }[_config.type];;
     }
 
@@ -233,6 +234,14 @@ protected:
         return _config.shard_info.request_size;
     }
 
+    sstring req_description() const {
+        if (is_cpu()) {
+            return sprint("%d us execution time", std::chrono::duration_cast<std::chrono::microseconds>(_config.shard_info.execution_time).count());
+        } else {
+            return sprint("%d-byte", req_size());
+        }
+    }
+
     unsigned parallelism() const {
         return _config.shard_info.parallelism;
     }
@@ -245,8 +254,8 @@ protected:
         return _total_duration;
     }
 
-    uint64_t total_bytes() const {
-        return _bytes;
+    uint64_t total_data() const {
+        return _data;
     }
 
     uint64_t max_latency() const {
@@ -259,6 +268,10 @@ protected:
 
     uint64_t quantile_latency(double q) const {
         return quantile(_latencies, quantile_probability = q);
+    }
+
+    bool is_cpu() const {
+        return req_type() == request_type::cpu;
     }
 private:
     bool is_sequential() const {
@@ -286,8 +299,33 @@ private:
         return pos;
     }
 
-    void add_result(size_t bytes, std::chrono::microseconds latency) {
-        _bytes += bytes;
+    template <typename CharPtr>
+    future<size_t> issue_request(CharPtr buf) {
+        if (is_cpu()) {
+            // We wrap this under repeat so that the reactor has the chance to decide to do this
+            // later. If we just insert a busy loop, parallel_for_each will wait for each of them to
+            // execute (since its semantics is to run until the fiber blocks.
+            //
+            // We do want the execution time to be a busy loop, and not just a bunch of
+            // continuations until our time is up: by doing this we can also simulate the behavior
+            // of I/O continuations in the face of reactor stalls.
+            return repeat([this] {
+                auto start  = std::chrono::steady_clock::now();
+                do {
+                } while ((std::chrono::steady_clock::now() - start) < _config.shard_info.execution_time);
+                return stop_iteration::yes;
+            }).then([] {
+                return make_ready_future<size_t>(1);
+            });
+        } else if (is_read()) {
+            return _file.dma_read(this->get_pos(), buf, this->req_size(), _iop);
+        } else {
+            return _file.dma_write(this->get_pos(), buf, this->req_size(), _iop);
+        }
+    }
+
+    void add_result(size_t data, std::chrono::microseconds latency) {
+        _data += data;
         _latencies(latency.count());
     }
 };
@@ -295,7 +333,7 @@ private:
 // The following two classes inherit from class data and help with pretty printing the output data.
 struct class_data_description final : public class_data {
     friend std::basic_ostream<char>& operator<<(std::basic_ostream<char>& ss, const class_data_description& cl) {
-        ss << cl.name() << ": " << cl.shares() << " shares, " << cl.req_size() << "-byte " << cl.type_str() << ", " << cl.parallelism() << " concurrent requests, ";
+        ss << cl.name() << ": " << cl.shares() << " shares, " << cl.req_description() << " " << cl.type_str() << ", " << cl.parallelism() << " concurrent requests, ";
         ss << cl.think_time();
         return ss;
     }
@@ -304,7 +342,11 @@ struct class_data_description final : public class_data {
 
 struct class_data_results final : public class_data {
     friend std::basic_ostream<char>& operator<<(std::basic_ostream<char>& ss, const class_data_results& cl) {
-        auto throughput_kbs = (cl.total_bytes() >> 10) / cl.total_duration().count();
+        auto throughput_kbs = (cl.total_data() >> 10) / cl.total_duration().count();
+        if (cl.is_cpu()) {
+            ss << "  Throughput         : " << std::setw(8) << throughput_kbs << " continuations/s" << std::endl;
+            return ss;
+        }
         ss << "  Throughput         : " << std::setw(8) << throughput_kbs << " KB/s" << std::endl;
         ss << "  Lat average        : " << std::setw(8) << cl.average_latency() << " usec" << std::endl;
 
@@ -390,6 +432,7 @@ struct convert<request_type> {
             { "randread", request_type::randread },
             { "randwrite", request_type::randwrite },
             { "append", request_type::append},
+            { "cpu", request_type::cpu},
         };
         auto reqstr = node.as<std::string>();
         if (!mappings.count(reqstr)) {
@@ -414,6 +457,9 @@ struct convert<shard_info> {
         }
         if (node["think_time"]) {
             sl.think_time = node["think_time"].as<duration_time>().time;
+        }
+        if (node["execution_time"]) {
+            sl.execution_time = node["execution_time"].as<duration_time>().time;
         }
         return true;
     }

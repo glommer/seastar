@@ -572,6 +572,18 @@ public:
         return _fq.waiters();
     }
 
+    size_t in_flight() const {
+        return _fq.in_flight();
+    }
+
+    void requests_finished(size_t finished) {
+        _fq.requests_finished(finished);
+    }
+
+    void poll_io_queue() {
+        _fq.dispatch_requests();
+    }
+
     shard_id coordinator() const {
         return _coordinator;
     }
@@ -738,7 +750,6 @@ private:
     std::stack<::iocb*, boost::container::static_vector<::iocb*, max_aio>> _free_iocbs;
     boost::container::static_vector<::iocb*, max_aio> _pending_aio;
     boost::container::static_vector<::iocb*, max_aio> _pending_aio_retry;
-    semaphore _io_context_available;
     io_stats _io_stats;
     uint64_t _fsyncs = 0;
     uint64_t _cxx_exceptions = 0;
@@ -925,7 +936,8 @@ public:
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
     template <typename Func>
-    future<io_event> submit_io(Func prepare_io);
+    void submit_io(promise<io_event>*, Func prepare_io);
+
     template <typename Func>
     future<io_event> submit_io_read(const io_priority_class& priority_class, size_t len, Func prepare_io);
     template <typename Func>

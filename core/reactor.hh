@@ -320,7 +320,7 @@ class smp_message_queue {
     };
     struct work_item {
         virtual ~work_item() {}
-        virtual future<> process() = 0;
+        virtual void process(noncopyable_function<void(work_item*)>) = 0;
         virtual void complete() = 0;
     };
     template <typename Func>
@@ -333,18 +333,19 @@ class smp_message_queue {
         std::exception_ptr _ex; // if !_result
         typename futurator::promise_type _promise; // used on local side
         async_work_item(Func&& func) : _func(std::move(func)) {}
-        virtual future<> process() override {
+        virtual void process(noncopyable_function<void(work_item*)> respond) override {
             try {
-                return futurator::apply(this->_func).then_wrapped([this] (auto&& f) {
-                    try {
+                futurator::apply(this->_func).then_wrapped([this, respond = std::move(respond)] (auto f) {
+                    if (f.failed()) {
+                        _ex = f.get_exception();
+                    } else {
                         _result = f.get();
-                    } catch (...) {
-                        _ex = std::current_exception();
                     }
+                    respond(this);
                 });
             } catch (...) {
                 _ex = std::current_exception();
-                return make_ready_future();
+                respond(this);
             }
         }
         virtual void complete() override {

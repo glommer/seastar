@@ -2941,7 +2941,11 @@ int reactor::run() {
 
     std::optional<poller> io_poller = {};
     std::optional<poller> aio_poller = {};
+    std::experimental::optional<poller> smp_poller = {};
 
+    if (smp::count > 1) {
+        smp_poller = poller(std::make_unique<smp_pollfn>(*this));
+    }
     if (my_io_queue) {
 #ifndef HAVE_OSV
         io_poller = poller(std::make_unique<io_pollfn>(*this));
@@ -2982,12 +2986,6 @@ int reactor::run() {
             });
         }
     });
-
-    // Register smp queues poller
-    std::experimental::optional<poller> smp_poller;
-    if (smp::count > 1) {
-        smp_poller = poller(std::make_unique<smp_pollfn>(*this));
-    }
 
     poller syscall_poller(std::make_unique<syscall_pollfn>(*this));
 #ifndef HAVE_OSV

@@ -1018,12 +1018,19 @@ bool reactor::process_io()
     return n;
 }
 
-io_queue::io_queue(shard_id coordinator, size_t capacity, std::vector<shard_id> topology)
+fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
+    fair_queue::config cfg;
+    cfg.capacity = std::min(iocfg.capacity, reactor::max_aio);
+    cfg.weight = [] (uint64_t len) { return 1 + len/(16 << 10); };
+    return cfg;
+}
+
+io_queue::io_queue(shard_id coordinator, io_queue::config cfg, std::vector<shard_id> topology)
         : _coordinator(coordinator)
-        , _capacity(std::min(capacity, reactor::max_aio))
+        , _capacity(cfg.capacity)
         , _io_topology(std::move(topology))
         , _priority_classes()
-        , _fq(_capacity) {
+        , _fq(make_fair_queue_config(cfg)) {
 }
 
 io_queue::~io_queue() {
@@ -1129,7 +1136,6 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
     auto start = std::chrono::steady_clock::now();
     return smp::submit_to(coordinator, [start, &pc, len, prepare_io = std::move(prepare_io), owner = engine().cpu_id()] {
         auto& queue = *(engine()._io_queue);
-        unsigned weight = 1 + len/(16 << 10);
         // First time will hit here, and then we create the class. It is important
         // that we create the shared pointer in the same shard it will be used at later.
         auto& pclass = queue.find_or_create_class(pc, owner);
@@ -1138,7 +1144,7 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
         pclass.nr_queued++;
         auto pr = std::make_unique<promise<io_event>>();
         auto fut = pr->get_future();
-        queue._fq.queue(pclass.ptr, weight, [&pclass, &queue, start, prepare_io = std::move(prepare_io), pr = std::move(pr)] () mutable noexcept {
+        queue._fq.queue(pclass.ptr, len, [&pclass, &queue, start, prepare_io = std::move(prepare_io), pr = std::move(pr)] () mutable noexcept {
             try {
                 pclass.nr_queued--;
                 pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
@@ -3955,7 +3961,10 @@ void smp::configure(boost::program_options::variables_map configuration)
                 continue;
             }
             if (shard == cid) {
-                all_io_queues[vec_idx] = new io_queue(coordinator.id, coordinator.capacity, io_info.shard_to_coordinator);
+                struct io_queue::config cfg;
+                cfg.capacity = coordinator.capacity;
+
+                all_io_queues[vec_idx] = new io_queue(coordinator.id, std::move(cfg), io_info.shard_to_coordinator);
             }
             return vec_idx;
         }

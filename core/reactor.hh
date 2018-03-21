@@ -558,6 +558,8 @@ private:
     static void fill_shares_array();
     friend smp;
 public:
+    enum class request_type { read, write };
+
     struct config {
         unsigned capacity = std::numeric_limits<unsigned>::max();
     };
@@ -567,7 +569,7 @@ public:
 
     template <typename Func>
     static future<io_event>
-    queue_request(shard_id coordinator, const io_priority_class& pc, size_t len, Func do_io);
+    queue_request(shard_id coordinator, const io_priority_class& pc, size_t len, request_type req_type, Func do_io);
 
     size_t capacity() const {
         return _capacity;
@@ -583,8 +585,8 @@ public:
     }
 
     // Inform the underlying queue about the fact that some of our requests finished
-    void notify_requests_finished(size_t finished) {
-        _fq.notify_requests_finished(finished);
+    void notify_requests_finished(fair_queue_request_descriptor& desc) {
+        _fq.notify_requests_finished(desc);
     }
 
     // Dispatch requests that are pending in the I/O queue

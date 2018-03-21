@@ -36,6 +36,20 @@
 
 namespace seastar {
 
+/// \brief describes a request that passes through the fair queue
+///
+/// The user of the fair_queue may want to assign different classes of requests different weights
+/// for capacity enforcement purposes.
+///
+/// For instance, if the fair_queue is used to implement I/O priorities and write requests are twice
+/// as expensive as read requests the user may assign an count of 1 to every read request
+/// and 2 to every write request.
+/// \related fair_queue
+struct fair_queue_request_descriptor {
+    unsigned count;
+    unsigned size;
+};
+
 /// \addtogroup io-module
 /// @{
 
@@ -43,7 +57,7 @@ namespace seastar {
 class priority_class {
     struct request {
         noncopyable_function<void()> func;
-        uint64_t size;
+        fair_queue_request_descriptor desc;
     };
     friend class fair_queue;
     uint32_t _shares = 0;
@@ -203,18 +217,20 @@ public:
     ///
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
-    void queue(priority_class_ptr pc, size_t size, noncopyable_function<void()> func) {
+    void queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
         push_priority_class(pc);
-        pc->_queue.push_back(priority_class::request{std::move(func), size});
+        pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
         _requests_queued++;
     }
 
-    /// Notifies that \c finished requests finished
-    void notify_requests_finished(unsigned finished) {
-        _requests_executing -= finished;
+    /// Notifies that some requests finished
+    /// \param desc an instance of \c request_descripror structure describing the requests that just
+    /// finished.
+    void notify_requests_finished(fair_queue_request_descriptor& desc) {
+        _requests_executing -= desc.count;
     }
 
     /// Try to execute new requests if there is capacity left in the queue.
@@ -229,7 +245,7 @@ public:
             h->_queue.pop_front();
             _requests_executing++;
             _requests_queued--;
-            auto weight = _config.weight(req.size);
+            auto weight = _config.weight(req.desc.size);
 
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
             auto req_cost  = weight / h->_shares;

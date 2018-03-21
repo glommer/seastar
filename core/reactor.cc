@@ -883,6 +883,8 @@ static bool aio_nowait_supported = true;
 
 struct seastar_io_desc {
     promise<io_event> pr;
+    fair_queue_request_descriptor fq_desc;
+    seastar_io_desc(unsigned count, unsigned len) : fq_desc(fair_queue_request_descriptor{count, len}) {}
 };
 
 template <typename Ptr, typename Func>
@@ -920,8 +922,8 @@ reactor::handle_aio_error(::iocb* iocb, int ec) {
             } catch (...) {
                 desc->pr.set_exception(std::current_exception());
             }
+            my_io_queue->notify_requests_finished(desc->fq_desc);
             delete desc;
-            my_io_queue->notify_requests_finished(1);
             // if EBADF, it means that the first request has a bad fd, so
             // we will only remove it from _pending_aio and try again.
             return 1;
@@ -987,7 +989,7 @@ future<io_event>
 reactor::submit_io_read(const io_priority_class& pc, size_t len, Func prepare_io) {
     ++_io_stats.aio_reads;
     _io_stats.aio_read_bytes += len;
-    return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));
+    return io_queue::queue_request(_io_coordinator, pc, len, io_queue::request_type::read, std::move(prepare_io));
 }
 
 template <typename Func>
@@ -995,7 +997,7 @@ future<io_event>
 reactor::submit_io_write(const io_priority_class& pc, size_t len, Func prepare_io) {
     ++_io_stats.aio_writes;
     _io_stats.aio_write_bytes += len;
-    return io_queue::queue_request(_io_coordinator, pc, len, std::move(prepare_io));
+    return io_queue::queue_request(_io_coordinator, pc, len, io_queue::request_type::write, std::move(prepare_io));
 }
 
 bool reactor::process_io()
@@ -1016,9 +1018,9 @@ bool reactor::process_io()
         _free_iocbs.push(iocb);
         auto desc = reinterpret_cast<seastar_io_desc*>(ev[i].data);
         desc->pr.set_value(ev[i]);
+        my_io_queue->notify_requests_finished(desc->fq_desc);
         delete desc;
     }
-    my_io_queue->notify_requests_finished(n - nr_retry);
     return n;
 }
 
@@ -1136,9 +1138,9 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
 
 template <typename Func>
 future<io_event>
-io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_t len, Func prepare_io) {
+io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_t len, io_queue::request_type req_type, Func prepare_io) {
     auto start = std::chrono::steady_clock::now();
-    return smp::submit_to(coordinator, [start, &pc, len, prepare_io = std::move(prepare_io), owner = engine().cpu_id()] {
+    return smp::submit_to(coordinator, [start, &pc, len, req_type, prepare_io = std::move(prepare_io), owner = engine().cpu_id()] {
         auto& queue = *(engine()._io_queue);
         // First time will hit here, and then we create the class. It is important
         // that we create the shared pointer in the same shard it will be used at later.
@@ -1146,9 +1148,10 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
         pclass.bytes += len;
         pclass.ops++;
         pclass.nr_queued++;
-        auto desc = std::make_unique<seastar_io_desc>();
+        auto desc = std::make_unique<seastar_io_desc>(1, len);
+        auto fq_desc = desc->fq_desc;
         auto fut = desc->pr.get_future();
-        queue._fq.queue(pclass.ptr, len, [&pclass, &queue, start, prepare_io = std::move(prepare_io), desc = std::move(desc)] () mutable noexcept {
+        queue._fq.queue(pclass.ptr, std::move(fq_desc), [&pclass, &queue, start, prepare_io = std::move(prepare_io), desc = std::move(desc)] () mutable noexcept {
             try {
                 pclass.nr_queued--;
                 pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
@@ -1156,7 +1159,7 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
                 desc.release();
             } catch (...) {
                 desc->pr.set_exception(std::current_exception());
-                queue.notify_requests_finished(1);
+                queue.notify_requests_finished(desc->fq_desc);
             }
         });
         return fut;

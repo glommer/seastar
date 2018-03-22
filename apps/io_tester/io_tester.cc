@@ -595,8 +595,12 @@ int main(int ac, char** av) {
                         return c.issue_requests();
                     });
                 }).then([&ctx] {
-                    return ctx.invoke_on_all([] (auto& c) {
-                        return c.print_stats();
+                    return do_with(boost::irange(0u, smp::count), [&ctx] (auto& range) mutable {
+                        return do_for_each(range, [&ctx] (auto shard) {
+                            return ctx.invoke_on(shard, [] (auto& c) {
+                                return c.print_stats();
+                            });
+                        });
                     });
                 }).or_terminate();
             });

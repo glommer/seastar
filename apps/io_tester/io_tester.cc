@@ -95,6 +95,7 @@ struct shard_info {
     uint64_t request_size = 4 << 10;
     std::chrono::duration<float> think_time = 0ms;
     std::chrono::duration<float> execution_time = 1ms;
+    seastar::scheduling_group scheduling_group = seastar::default_scheduling_group();
 };
 
 class class_data;
@@ -136,6 +137,7 @@ public:
         : _config(std::move(cfg))
         , _alignment(_config.shard_info.request_size >= 4096 ? 4096 : 512)
         , _iop(engine().register_one_priority_class(sprint("test-class-%d", idgen()), _config.shard_info.shares))
+        , _sg(cfg.shard_info.scheduling_group)
         , _latencies(extended_p_square_probabilities = quantiles)
         , _pos_distribution(0,  file_data_size / _config.shard_info.request_size)
     {}
@@ -180,10 +182,7 @@ public:
     // append            : will write to the file from pos = EOF onwards, always appending to the end.
     // cpu               : CPU-only load, file is not created.
     future<> start(sstring dir) {
-        return seastar::create_scheduling_group(sprint("%s-%d", name(), engine().cpu_id()), shares()).then([this, dir] (seastar::scheduling_group sg) {
-            _sg = sg;
-            return do_start(dir);
-        });
+        return do_start(dir);
     }
 protected:
     sstring type_str() const {
@@ -581,29 +580,37 @@ int main(int ac, char** av) {
             auto& duration = opts["duration"].as<unsigned>();
             auto& yaml = opts["conf"].as<sstring>();
             YAML::Node doc = YAML::LoadFile(yaml);
-            auto reqs = doc.as<std::vector<job_config>>();
-            return ctx.start(directory, reqs, duration).then([&ctx] {
-                engine().at_exit([&ctx] {
-                    return ctx.stop();
+            return do_with(doc.as<std::vector<job_config>>(), [&ctx, directory, duration] (auto& reqs) {
+                return parallel_for_each(reqs, [] (auto& r) {
+                    return seastar::create_scheduling_group(r.name, r.shard_info.shares).then([&r] (seastar::scheduling_group sg) {
+                        r.shard_info.scheduling_group = sg;
+                    });
+                }).then([&ctx, &reqs, directory, duration] {
+                    return ctx.start(directory, reqs, duration).then([&ctx] {
+                        engine().at_exit([&ctx] {
+                            return ctx.stop();
+                        });
+                    });
                 });
+            }).then([&ctx] {
                 std::cout << "Creating initial files..." << std::endl;
                 return ctx.invoke_on_all([] (auto& c) {
                     return c.start();
-                }).then([&ctx] {
-                    std::cout << "Starting evaluation..." << std::endl;
-                    return ctx.invoke_on_all([] (auto& c) {
-                        return c.issue_requests();
-                    });
-                }).then([&ctx] {
-                    return do_with(boost::irange(0u, smp::count), [&ctx] (auto& range) mutable {
-                        return do_for_each(range, [&ctx] (auto shard) {
-                            return ctx.invoke_on(shard, [] (auto& c) {
-                                return c.print_stats();
-                            });
+                });
+            }).then([&ctx] {
+               std::cout << "Starting evaluation..." << std::endl;
+                return ctx.invoke_on_all([] (auto& c) {
+                    return c.issue_requests();
+                });
+            }).then([&ctx] {
+                return do_with(boost::irange(0u, smp::count), [&ctx] (auto& range) mutable {
+                    return do_for_each(range, [&ctx] (auto shard) {
+                        return ctx.invoke_on(shard, [] (auto& c) {
+                            return c.print_stats();
                         });
                     });
-                }).or_terminate();
-            });
+                });
+            }).or_terminate();
         });
     });
 }

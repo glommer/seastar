@@ -1028,15 +1028,17 @@ fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
     fair_queue::config cfg;
     cfg.capacity = std::min(iocfg.capacity, reactor::max_aio);
     cfg.weight = [] (uint64_t len) { return 1 + len/(16 << 10); };
+    cfg.max_req_count = iocfg.max_req_count;
+    cfg.max_bytes_count = iocfg.max_bytes_count;
     return cfg;
 }
 
 io_queue::io_queue(shard_id coordinator, io_queue::config cfg, std::vector<shard_id> topology)
         : _coordinator(coordinator)
-        , _capacity(cfg.capacity)
         , _io_topology(std::move(topology))
         , _priority_classes()
-        , _fq(make_fair_queue_config(cfg)) {
+        , _fq(make_fair_queue_config(cfg))
+        , _config(std::move(cfg)) {
 }
 
 io_queue::~io_queue() {
@@ -1148,7 +1150,13 @@ io_queue::queue_request(shard_id coordinator, const io_priority_class& pc, size_
         pclass.bytes += len;
         pclass.ops++;
         pclass.nr_queued++;
-        auto desc = std::make_unique<seastar_io_desc>(1, len);
+        unsigned count = io_queue::read_request_base_count;
+        size_t size = len;
+        if (req_type == io_queue::request_type::write) {
+            count = unsigned(queue._config.disk_req_write_to_read_ratio * io_queue::read_request_base_count);
+            size = unsigned(queue._config.disk_bytes_write_to_read_ratio * len);
+        }
+        auto desc = std::make_unique<seastar_io_desc>(count, size);
         auto fq_desc = desc->fq_desc;
         auto fut = desc->pr.get_future();
         queue._fq.queue(pclass.ptr, std::move(fq_desc), [&pclass, &queue, start, prepare_io = std::move(prepare_io), desc = std::move(desc)] () mutable noexcept {
@@ -3667,6 +3675,10 @@ smp::get_options_description()
 #else
         ("max-io-requests", bpo::value<unsigned>(), "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of processors")
 #endif
+        ("max-disk-read-mb-per-second", bpo::value<uint64_t>(), "Maximum bandwidth in MB/s that the disk can sustain when reading")
+        ("max-disk-write-mb-per-second", bpo::value<uint64_t>(), "Maximum bandwidth in MB/s that the disk can sustain when writing")
+        ("max-disk-read-req-per-second", bpo::value<uint64_t>(), "Maximum IOPS that the disk can sustain when reading")
+        ("max-disk-write-req-per-second", bpo::value<uint64_t>(), "Maximum IOPS that the disk can sustain when writing")
         ("mbind", bpo::value<bool>()->default_value(true), "enable mbind")
 #ifndef NO_EXCEPTION_HACK
         ("enable-glibc-exception-scaling-workaround", bpo::value<bool>()->default_value(true), "enable workaround for glibc/gcc c++ exception scalablity problem")
@@ -3814,6 +3826,80 @@ static void sigabrt_action() noexcept {
     print_with_backtrace("Aborting");
 }
 
+class disk_config_params {
+public:
+    unsigned _num_io_queues = smp::count;
+    unsigned _capacity = std::numeric_limits<unsigned>::max();
+    uint64_t _read_bytes_rate = std::numeric_limits<uint64_t>::max();
+    uint64_t _write_bytes_rate = std::numeric_limits<uint64_t>::max();
+    uint64_t _read_req_rate = std::numeric_limits<uint64_t>::max();
+    uint64_t _write_req_rate = std::numeric_limits<uint64_t>::max();
+    unsigned throughput_options = 0;
+    std::chrono::duration<double> _latency_goal;
+
+    void read_bandwidth_option(boost::program_options::variables_map& configuration, uint64_t& value, const char *opt) {
+        if (configuration.count(opt)) {
+            throughput_options++;
+            value = configuration[opt].as<uint64_t>() << 20;
+        }
+    }
+
+    void read_iops_option(boost::program_options::variables_map& configuration, uint64_t& value, const char *opt) {
+        if (configuration.count(opt)) {
+            throughput_options++;
+            value = configuration[opt].as<uint64_t>();
+        }
+    }
+
+    uint64_t per_io_queue(uint64_t qty) const {
+        return std::max(qty / _num_io_queues, 1ul);
+    }
+public:
+    void parse_config(boost::program_options::variables_map& configuration) {
+        if (configuration.count("max-io-requests")) {
+            _capacity = configuration["max-io-requests"].as<unsigned>();
+        }
+
+        if (configuration.count("num-io-queues")) {
+            _num_io_queues = configuration["num-io-queues"].as<unsigned>();
+        }
+
+        _latency_goal = std::chrono::duration_cast<std::chrono::duration<double>>(configuration["task-quota-ms"].as<double>() * 1.5 * 1ms);
+        read_bandwidth_option(configuration, _read_bytes_rate, "max-disk-read-mb-per-second");
+        read_bandwidth_option(configuration, _write_bytes_rate, "max-disk-write-mb-per-second");
+        read_iops_option(configuration, _read_req_rate, "max-disk-read-req-per-second");
+        read_iops_option(configuration, _write_req_rate, "max-disk-write-req-per-second");
+
+        // It is fine to use all defaults, and if --max-io-requests is used also won't see any of
+        // the troughput based options. But if one of them is specified, we expect to see all of
+        // them. Otherwise we can be left with ill-posed setups.
+        if ((throughput_options != 0) && (throughput_options != 4)) {
+            throw std::invalid_argument(fmt::format("Disk not fully specified. Saw only {} options out of 4", throughput_options));
+        }
+    }
+
+    unsigned num_io_queues() const {
+        return _num_io_queues;
+    }
+
+    struct io_queue::config generate_config() const {
+        struct io_queue::config cfg;
+        uint64_t max_bandwidth = std::max(_read_bytes_rate, _write_bytes_rate);
+        uint64_t max_iops = std::max(_read_req_rate, _write_req_rate);
+
+        cfg.capacity = per_io_queue(_capacity);
+        cfg.disk_bytes_write_to_read_ratio = float(_read_bytes_rate) / _write_bytes_rate;
+        cfg.disk_req_write_to_read_ratio = float(_read_req_rate) / _write_req_rate;
+        cfg.max_req_count = max_bandwidth == std::numeric_limits<uint64_t>::max()
+            ? std::numeric_limits<unsigned>::max()
+            : io_queue::read_request_base_count * per_io_queue(max_iops * _latency_goal.count());
+        cfg.max_bytes_count = max_iops == std::numeric_limits<uint64_t>::max()
+            ? std::numeric_limits<unsigned>::max()
+            : per_io_queue(max_bandwidth * _latency_goal.count());
+        return cfg;
+    }
+};
+
 void smp::configure(boost::program_options::variables_map configuration)
 {
 #ifndef NO_EXCEPTION_HACK
@@ -3916,20 +4002,9 @@ void smp::configure(boost::program_options::variables_map configuration)
     rc.cpus = smp::count;
     rc.cpu_set = std::move(cpu_set);
 
-    struct disk_config_params {
-        unsigned capacity = reactor::max_aio * smp::count;
-        unsigned num_io_queues = smp::count;
-    };
-
     disk_config_params disk_config;
-    if (configuration.count("max-io-requests")) {
-        disk_config.capacity = configuration["max-io-requests"].as<unsigned>();
-    }
-
-    if (configuration.count("num-io-queues")) {
-        disk_config.num_io_queues = configuration["num-io-queues"].as<unsigned>();
-    }
-    rc.io_queues =  disk_config.num_io_queues;
+    disk_config.parse_config(configuration);
+    rc.io_queues =  disk_config.num_io_queues();
 
     auto resources = resource::allocate(rc);
     std::vector<resource::cpu> allocations = std::move(resources.cpus);
@@ -3976,9 +4051,7 @@ void smp::configure(boost::program_options::variables_map configuration)
                 continue;
             }
             if (shard == cid) {
-                struct io_queue::config cfg;
-                cfg.capacity = std::max(disk_config.capacity / disk_config.num_io_queues, 1u);
-
+                struct io_queue::config cfg = disk_config.generate_config();
                 all_io_queues[vec_idx] = new io_queue(coordinator, std::move(cfg), io_info.shard_to_coordinator);
             }
             return vec_idx;

@@ -120,6 +120,8 @@ public:
         unsigned capacity = std::numeric_limits<unsigned>::max();
         std::chrono::microseconds tau = std::chrono::milliseconds(100);
         noncopyable_function<float(uint64_t)> weight = noncopyable_function<float(uint64_t)>([] (uint64_t dummy) { return 1.0f; });
+        unsigned max_req_count = std::numeric_limits<unsigned>::max();
+        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
     };
 private:
     friend priority_class;
@@ -133,6 +135,8 @@ private:
     config _config;
     unsigned _requests_executing = 0;
     unsigned _requests_queued = 0;
+    unsigned _req_count_executing = 0;
+    unsigned _bytes_count_executing = 0;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
@@ -226,16 +230,19 @@ public:
         _requests_queued++;
     }
 
-    /// Notifies that some requests finished
-    /// \param desc an instance of \c request_descripror structure describing the requests that just
+    /// Notifies that one request finished
+    /// \param desc an instance of \c request_descripror structure describing the request that just
     /// finished.
     void notify_requests_finished(fair_queue_request_descriptor& desc) {
-        _requests_executing -= desc.count;
+        _requests_executing--;
+        _req_count_executing -= desc.count;
+        _bytes_count_executing -= desc.size;
     }
 
     /// Try to execute new requests if there is capacity left in the queue.
     void dispatch_requests() {
-        while (_requests_queued && (_requests_executing < _config.capacity)) {
+        while (_requests_queued && (_requests_executing < _config.capacity) &&
+               (_req_count_executing < _config.max_req_count) && (_bytes_count_executing < _config.max_bytes_count)) {
             priority_class_ptr h;
             do {
                 h = pop_priority_class();
@@ -245,6 +252,9 @@ public:
             h->_queue.pop_front();
             _requests_executing++;
             _requests_queued--;
+
+            _req_count_executing += req.desc.count;
+            _bytes_count_executing += req.desc.size;
             auto weight = _config.weight(req.desc.size);
 
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);

@@ -560,8 +560,21 @@ private:
 public:
     enum class request_type { read, write };
 
+    // We want to represent the fact that write requests are (maybe) more expensive
+    // than read requests. To avoid dealing with floating point math we will scale one
+    // read request to be counted by this amount.
+    //
+    // A write request that is 30 % more expensive than a read will be accounted as 130.
+    // It is also technically possible for reads to be the expensive ones, in which case
+    // writes will have an integer value lower than 100.
+    static constexpr unsigned read_request_base_count = 100;
+
     struct config {
         unsigned capacity = std::numeric_limits<unsigned>::max();
+        unsigned max_req_count = std::numeric_limits<unsigned>::max();
+        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
+        float disk_req_write_to_read_ratio = 1.0;
+        float disk_bytes_write_to_read_ratio = 1.0;
     };
 
     io_queue(shard_id coordinator, config cfg, std::vector<shard_id> topology);
@@ -572,7 +585,7 @@ public:
     queue_request(shard_id coordinator, const io_priority_class& pc, size_t len, request_type req_type, Func do_io);
 
     size_t capacity() const {
-        return _capacity;
+        return _config.capacity;
     }
 
     size_t queued_requests() const {
@@ -605,6 +618,7 @@ public:
 
     friend class reactor;
 private:
+    config _config;
     static fair_queue::config make_fair_queue_config(config cfg);
 };
 

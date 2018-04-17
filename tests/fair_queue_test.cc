@@ -71,20 +71,27 @@ struct test_env {
 
     void do_op(unsigned index, unsigned weight)  {
         auto cl = classes[index];
-        promise<> pr;
-        inflight.push_back(pr.get_future());
+        struct request {
+            promise<> pr;
+            fair_queue_request_descriptor fqdesc;
+        };
 
-        fq.queue(cl, fair_queue_request_descriptor{weight}, [this, index, pr = std::move(pr)] () mutable noexcept {
+        auto req = std::make_unique<request>();
+        req->fqdesc.fairness_weight = weight;
+        inflight.push_back(req->pr.get_future());
+        auto fqdesc = req->fqdesc;
+
+        fq.queue(cl, fqdesc, [this, index, req = std::move(req)] () mutable noexcept {
             try {
                 results[index]++;
-                sleep(100us).then_wrapped([this, pr = std::move(pr)] (future<> f) mutable {
-                    f.forward_to(std::move(pr));
-                    fq.notify_requests_finished(1);
+                sleep(100us).then_wrapped([this, req = std::move(req)] (future<> f) mutable {
+                    f.forward_to(std::move(req->pr));
+                    fq.notify_requests_finished(req->fqdesc);
                     fq.dispatch_requests();
                 });
             } catch (...) {
-                pr.set_exception(std::current_exception());
-                fq.notify_requests_finished(1);
+                req->pr.set_exception(std::current_exception());
+                fq.notify_requests_finished(req->fqdesc);
                 fq.dispatch_requests();
             }
         });

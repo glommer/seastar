@@ -43,6 +43,7 @@
 #include "systemwide_memory_barrier.hh"
 #include "report_exception.hh"
 #include "core/stall_sampler.hh"
+#include "core/thread_cputime_clock.hh"
 #include "util/log.hh"
 #include "file-impl.hh"
 #include <cassert>
@@ -2528,6 +2529,10 @@ void reactor::register_metrics() {
             sm::make_gauge("utilization", [this] { return (1-_load)  * 100; }, sm::description("CPU utilization")),
             sm::make_derive("cpu_busy_ns", [this] () -> int64_t { return std::chrono::duration_cast<std::chrono::nanoseconds>(total_busy_time()).count(); },
                     sm::description("Total cpu busy time in nanoseconds")),
+            sm::make_derive("cpu_runtime_ns", [this] () -> int64_t { return std::chrono::duration_cast<std::chrono::nanoseconds>(total_cpu_run_time()).count(); },
+                    sm::description("Total time in nanoseconds for which the reactor was executed. Includes busy time and the busy poll part of idle time")),
+            sm::make_derive("cpu_thread_runtime_ns", [this] () -> int64_t { return std::chrono::duration_cast<std::chrono::nanoseconds>(total_thread_run_time()).count(); },
+                    sm::description("Total time in nanoseconds for which the reactor thread was executed by the Operating System.")),
             // total_operations value:DERIVE:0:U
             sm::make_derive("aio_reads", _io_stats.aio_reads, sm::description("Total aio-reads operations")),
 
@@ -3217,6 +3222,7 @@ int reactor::run() {
                     // We may have slept for a while, so freshen idle_end
                     idle_end = sched_clock::now();
                     add_nonatomically(_stall_detector_missed_ticks, uint64_t((idle_end - start_sleep)/_task_quota));
+                    _total_sleep += idle_end - start_sleep;
                     _task_quota_timer.timerfd_settime(0, task_quote_itimerspec);
                 }
             } else {
@@ -4656,6 +4662,14 @@ reactor::sched_clock::duration reactor::total_idle_time() {
 
 reactor::sched_clock::duration reactor::total_busy_time() {
     return sched_clock::now() - _start_time - _total_idle;
+}
+
+thread_cputime_clock::duration reactor::total_thread_run_time() {
+    return thread_cputime_clock::now() - _start_thread_runtime;
+}
+
+thread_cputime_clock::duration reactor::total_cpu_run_time() {
+    return sched_clock::now() - _start_time - _total_sleep;
 }
 
 void

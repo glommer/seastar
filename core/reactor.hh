@@ -580,6 +580,7 @@ public:
         unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
         unsigned disk_req_write_to_read_multiplier = read_request_base_count;
         unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
+        sstring mountpoint = "undefined";
     };
 
     io_queue(config cfg);
@@ -610,6 +611,10 @@ public:
     // Dispatch requests that are pending in the I/O queue
     void poll_io_queue() {
         _fq.dispatch_requests();
+    }
+
+    sstring mountpoint() const {
+        return _config.mountpoint;
     }
 
     shard_id coordinator() const {
@@ -737,17 +742,19 @@ private:
     sigset_t _active_sigmask; // holds sigmask while sleeping with sig disabled
     std::vector<pollfn*> _pollers;
 
-    static constexpr unsigned max_aio = 128;
+    static constexpr unsigned max_aio_per_queue = 128;
+    static constexpr unsigned max_queues = 8;
+    static constexpr unsigned max_aio = max_aio_per_queue * max_queues;
     // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
     // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
     // be stored here.
-    std::unique_ptr<io_queue> my_io_queue = {};
+    std::vector<std::unique_ptr<io_queue>> my_io_queues = {};
 
 
     // For submiting the actual IO, all we need is the coordinator id. So storing it
     // separately saves us the pointer access.
     shard_id _io_coordinator;
-    io_queue* _io_queue;
+    std::unordered_map<uint64_t, io_queue*> _io_queues;
     friend io_queue;
 
     std::vector<std::function<future<> ()>> _exit_funcs;
@@ -910,8 +917,13 @@ public:
     ~reactor();
     void operator=(const reactor&) = delete;
 
-    io_queue& get_io_queue() {
-        return *_io_queue;
+    io_queue& get_io_queue(uint64_t devid) {
+        auto queue = _io_queues.find(devid);
+        if (queue == _io_queues.end()) {
+            return *_io_queues[0];
+        } else {
+            return *(queue->second);
+        }
     }
 
     io_priority_class register_one_priority_class(sstring name, uint32_t shares) {
@@ -927,7 +939,9 @@ public:
     /// \param shares the new shares value
     /// \return a future that is ready when the share update is applied
     future<> update_shares_for_class(io_priority_class pc, uint32_t shares) {
-        return _io_queue->update_shares_for_class(pc, shares);
+        for (auto& queue : _io_queues) {
+            return queue.second->update_shares_for_class(pc, shares);
+        }
     }
 
     void configure(boost::program_options::variables_map config);

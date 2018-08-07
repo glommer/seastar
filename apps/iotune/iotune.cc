@@ -577,6 +577,8 @@ fs::path mountpoint_of(sstring filename) {
     return mnt_candidate;
 }
 
+static constexpr unsigned task_quotas_in_default_latency_goal = 3;
+
 int main(int ac, char** av) {
     namespace bpo = boost::program_options;
     bool fs_check = false;
@@ -674,9 +676,10 @@ int main(int ac, char** av) {
             unsigned num_io_queues = smp::count;
             for (auto& desc : disk_descriptors) {
                 // Allow each I/O Queue to have at least 10k IOPS and 100MB. Values decided based
-                // on the write performance, which tends to be lower.
-                num_io_queues = std::min(smp::count, unsigned(desc.write_iops / 10000));
-                num_io_queues = std::min(smp::count, unsigned(desc.write_bw / (100 * 1024 * 1024)));
+                // on the write performance, which tends to be lower. Because our default latency goal is larger
+                // than a task quota, we will adjust those values based on that.
+                num_io_queues = std::min(smp::count, unsigned((task_quotas_in_default_latency_goal * desc.write_iops) / 10000));
+                num_io_queues = std::min(num_io_queues, unsigned((task_quotas_in_default_latency_goal * desc.write_bw) / (100 * 1024 * 1024)));
                 num_io_queues = std::max(num_io_queues, 1u);
             }
             fmt::print("Recommended --num-io-queues: {}\n", num_io_queues);

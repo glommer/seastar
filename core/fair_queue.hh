@@ -41,6 +41,9 @@ namespace seastar {
 struct fair_queue_request_descriptor {
     unsigned weight = 1; ///< the weight of this request for capacity purposes (IOPS).
     unsigned size = 1;        ///< the effective size of this request
+    virtual void operator()() noexcept = 0; ///< function to be executed when the request is ready
+    virtual ~fair_queue_request_descriptor() {}
+    fair_queue_request_descriptor(unsigned w, unsigned s) : weight(w), size(s) {}
 };
 
 /// \addtogroup io-module
@@ -48,14 +51,10 @@ struct fair_queue_request_descriptor {
 
 /// \cond internal
 class priority_class {
-    struct request {
-        noncopyable_function<void()> func;
-        fair_queue_request_descriptor desc;
-    };
     friend class fair_queue;
     uint32_t _shares = 0;
     float _accumulated = 0;
-    circular_buffer<request> _queue;
+    circular_buffer<fair_queue_request_descriptor*> _queue;
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
@@ -218,12 +217,12 @@ public:
     ///
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
-    void queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
+    void queue(priority_class_ptr pc, fair_queue_request_descriptor* desc) {
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
         push_priority_class(pc);
-        pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
+        pc->_queue.push_back(std::move(desc));
         _requests_queued++;
     }
 
@@ -246,12 +245,12 @@ public:
             auto req = std::move(h->_queue.front());
             h->_queue.pop_front();
             _requests_executing++;
-            _req_count_executing += req.desc.weight;
-            _bytes_count_executing += req.desc.size;
+            _req_count_executing += req->weight;
+            _bytes_count_executing += req->size;
             _requests_queued--;
 
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-            auto req_cost  = (float(req.desc.weight) / _config.max_req_count + float(req.desc.size) / _config.max_bytes_count) / h->_shares;
+            auto req_cost  = (float(req->weight) / _config.max_req_count + float(req->size) / _config.max_bytes_count) / h->_shares;
             auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
             float next_accumulated = h->_accumulated + cost;
             while (std::isinf(next_accumulated)) {
@@ -266,7 +265,7 @@ public:
             if (!h->_queue.empty()) {
                 push_priority_class(h);
             }
-            req.func();
+            (*req)();
         }
     }
 

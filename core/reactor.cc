@@ -1245,6 +1245,11 @@ io_queue::priority_class_data::priority_class_data(sstring name, sstring mountpo
 }
 
 future<io_queue::priority_class_data*> io_queue::find_or_create_class(const io_priority_class& pc, shard_id owner) {
+    auto it_pclass = engine()._local_priority_classes.find(pc.id());
+    if (it_pclass != engine()._local_priority_classes.end()) {
+        return make_ready_future<io_queue::priority_class_data*>(it_pclass->second);
+    }
+
     return smp::submit_to(coordinator(), [&pc, owner, this] {
     auto it_pclass = _priority_classes.find(pc.id());
     if (it_pclass == _priority_classes.end()) {
@@ -1269,6 +1274,9 @@ future<io_queue::priority_class_data*> io_queue::find_or_create_class(const io_p
         it_pclass = ret.first;
     }
     return make_ready_future<io_queue::priority_class_data*>(&*(it_pclass->second));
+    }).then([this, &pc] (io_queue::priority_class_data* pclass_ptr) {
+        engine()._local_priority_classes.emplace(pc.id(), pclass_ptr);
+        return make_ready_future<io_queue::priority_class_data*>(pclass_ptr);
     });
 }
 

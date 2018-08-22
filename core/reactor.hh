@@ -537,7 +537,7 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
-private:
+public:
     struct priority_class_data {
         priority_class_ptr ptr;
         size_t bytes;
@@ -547,6 +547,7 @@ private:
         metrics::metric_groups _metric_groups;
         priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr, shard_id owner);
     };
+private:
 
     std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;
     fair_queue _fq;
@@ -918,6 +919,8 @@ public:
     reactor(const reactor&) = delete;
     ~reactor();
     void operator=(const reactor&) = delete;
+
+    std::unordered_map<unsigned, io_queue::priority_class_data*> _local_priority_classes;
 
     io_queue& get_io_queue(dev_t devid = 0) {
         auto queue = _io_queues.find(devid);

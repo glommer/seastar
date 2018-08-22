@@ -1291,7 +1291,6 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
             weight = io_queue::read_request_base_count;
             size = io_queue::read_request_base_count * len;
         }
-        return smp::submit_to(coordinator(), [pclass, start, weight, size, prepare_io = std::move(prepare_io), this] {
             auto desc = std::make_unique<io_desc>(this, weight, size, [pclass, start, prepare_io = std::move(prepare_io), this] (io_desc* desc) mutable {
                 pclass->nr_queued--;
                 pclass->queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
@@ -1300,7 +1299,6 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
             auto fut = desc->get_future();
             _fq.queue(pclass->ptr, desc.release());
             return fut;
-        });
     });
 }
 

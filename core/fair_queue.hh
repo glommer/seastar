@@ -27,11 +27,15 @@
 #include "print.hh"
 #include "circular_buffer.hh"
 #include "util/noncopyable_function.hh"
+#include "util/spinlock.hh"
 #include <queue>
 #include <type_traits>
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
+#include <mutex>
+#include <atomic>
+#include <boost/lockfree/spsc_queue.hpp>
 
 namespace seastar {
 
@@ -54,7 +58,10 @@ class priority_class {
     friend class fair_queue;
     uint32_t _shares = 0;
     float _accumulated = 0;
-    circular_buffer<fair_queue_request_descriptor*> _queue;
+    using lf_queue = boost::lockfree::spsc_queue<fair_queue_request_descriptor*,
+                            boost::lockfree::capacity<4096>>;
+
+    lf_queue _queue;
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
@@ -125,14 +132,16 @@ private:
     unsigned _requests_executing = 0;
     unsigned _req_count_executing = 0;
     unsigned _bytes_count_executing = 0;
-    unsigned _requests_queued = 0;
+    std::atomic<unsigned> _requests_queued = { 0 };
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
+    util::spinlock _handles_lock;
     std::unordered_set<priority_class_ptr> _all_classes;
 
     void push_priority_class(priority_class_ptr pc) {
+        std::lock_guard<util::spinlock> g(_handles_lock);
         if (!pc->_queued) {
             _handles.push(pc);
             pc->_queued = true;
@@ -141,6 +150,7 @@ private:
 
     priority_class_ptr pop_priority_class() {
         assert(!_handles.empty());
+        std::lock_guard<util::spinlock> g(_handles_lock);
         auto h = _handles.top();
         _handles.pop();
         assert(h->_queued);
@@ -162,7 +172,7 @@ private:
     }
 
     bool can_dispatch() const {
-        return _requests_queued &&
+        return _requests_queued.load(std::memory_order_relaxed) &&
                (_requests_executing < _config.capacity) &&
                (_req_count_executing < _config.max_req_count) &&
                (_bytes_count_executing < _config.max_bytes_count);
@@ -202,7 +212,7 @@ public:
 
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const {
-        return _requests_queued;
+        return _requests_queued.load(std::memory_order_relaxed);
     }
 
     /// \return the number of requests currently executing
@@ -218,12 +228,12 @@ public:
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
     void queue(priority_class_ptr pc, fair_queue_request_descriptor* desc) {
+        pc->_queue.push(std::move(desc));
+        _requests_queued.fetch_add(1, std::memory_order_relaxed);
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
         push_priority_class(pc);
-        pc->_queue.push_back(std::move(desc));
-        _requests_queued++;
     }
 
     /// Notifies that ont request finished
@@ -243,11 +253,11 @@ public:
             } while (h->_queue.empty());
 
             auto req = std::move(h->_queue.front());
-            h->_queue.pop_front();
+            h->_queue.pop();
             _requests_executing++;
             _req_count_executing += req->weight;
             _bytes_count_executing += req->size;
-            _requests_queued--;
+            _requests_queued.fetch_sub(1, std::memory_order_relaxed);
 
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
             auto req_cost  = (float(req->weight) / _config.max_req_count + float(req->size) / _config.max_bytes_count) / h->_shares;

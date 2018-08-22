@@ -18,6 +18,7 @@
 /*
  * Copyright (C) 2017 ScyllaDB
  */
+#include <random>
 #include "core/app-template.hh"
 #include "core/distributed.hh"
 #include "core/reactor.hh"
@@ -43,7 +44,6 @@
 #include <boost/range/adaptor/map.hpp>
 #include <boost/array.hpp>
 #include <iomanip>
-#include <random>
 #include <yaml-cpp/yaml.h>
 
 using namespace seastar;

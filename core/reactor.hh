@@ -557,7 +557,7 @@ private:
 
     static io_priority_class register_one_priority_class(sstring name, uint32_t shares);
 
-    priority_class_data& find_or_create_class(const io_priority_class& pc, shard_id owner);
+    future<priority_class_data*> find_or_create_class(const io_priority_class& pc, shard_id owner);
     static void fill_shares_array();
     friend smp;
 public:

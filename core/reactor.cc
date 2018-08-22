@@ -1244,7 +1244,8 @@ io_queue::priority_class_data::priority_class_data(sstring name, sstring mountpo
     });
 }
 
-io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_class& pc, shard_id owner) {
+future<io_queue::priority_class_data*> io_queue::find_or_create_class(const io_priority_class& pc, shard_id owner) {
+    return smp::submit_to(coordinator(), [&pc, owner, this] {
     auto it_pclass = _priority_classes.find(pc.id());
     if (it_pclass == _priority_classes.end()) {
         auto shares = _registered_shares.at(pc.id()).load(std::memory_order_acquire);
@@ -1267,20 +1268,20 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
         auto ret = _priority_classes.emplace(pc.id(), make_lw_shared<priority_class_data>(name, mountpoint(), _fq.register_priority_class(shares), owner));
         it_pclass = ret.first;
     }
-    return *(it_pclass->second);
+    return make_ready_future<io_queue::priority_class_data*>(&*(it_pclass->second));
+    });
 }
 
 template <typename Func>
 future<io_event>
 io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::request_type req_type, Func prepare_io) {
     auto start = std::chrono::steady_clock::now();
-    return smp::submit_to(coordinator(), [start, &pc, len, req_type, prepare_io = std::move(prepare_io), owner = engine().cpu_id(), this] {
+    return find_or_create_class(pc, engine().cpu_id()).then([start, len, req_type, prepare_io = std::move(prepare_io), this] (io_queue::priority_class_data* pclass) mutable {
         // First time will hit here, and then we create the class. It is important
         // that we create the shared pointer in the same shard it will be used at later.
-        auto& pclass = find_or_create_class(pc, owner);
-        pclass.bytes += len;
-        pclass.ops++;
-        pclass.nr_queued++;
+        pclass->bytes += len;
+        pclass->ops++;
+        pclass->nr_queued++;
         unsigned weight;
         size_t size;
         if (req_type == io_queue::request_type::write) {
@@ -1290,23 +1291,23 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
             weight = io_queue::read_request_base_count;
             size = io_queue::read_request_base_count * len;
         }
-        auto desc = std::make_unique<io_desc>(this, weight, size, [&pclass, start, prepare_io = std::move(prepare_io), this] (io_desc* desc) mutable {
-            pclass.nr_queued--;
-            pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-            engine().submit_io(desc, std::move(prepare_io));
+        return smp::submit_to(coordinator(), [pclass, start, weight, size, prepare_io = std::move(prepare_io), this] {
+            auto desc = std::make_unique<io_desc>(this, weight, size, [pclass, start, prepare_io = std::move(prepare_io), this] (io_desc* desc) mutable {
+                pclass->nr_queued--;
+                pclass->queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
+                engine().submit_io(desc, std::move(prepare_io));
+            });
+            auto fut = desc->get_future();
+            _fq.queue(pclass->ptr, desc.release());
+            return fut;
         });
-
-        auto fut = desc->get_future();
-        _fq.queue(pclass.ptr, desc.release());
-        return fut;
     });
 }
 
 future<>
 io_queue::update_shares_for_class(const io_priority_class pc, size_t new_shares) {
-    return smp::submit_to(coordinator(), [this, pc, owner = engine().cpu_id(), new_shares] {
-        auto& pclass = find_or_create_class(pc, owner);
-        _fq.update_shares(pclass.ptr, new_shares);
+    return find_or_create_class(pc, engine().cpu_id()).then([this, new_shares] (io_queue::priority_class_data* pclass) {
+        _fq.update_shares(pclass->ptr, new_shares);
     });
 }
 

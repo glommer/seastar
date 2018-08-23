@@ -129,9 +129,9 @@ private:
     };
 
     config _config;
-    unsigned _requests_executing = 0;
-    unsigned _req_count_executing = 0;
-    unsigned _bytes_count_executing = 0;
+    std::atomic<unsigned> _requests_executing = { 0 };
+    std::atomic<unsigned> _req_count_executing = { 0 };
+    std::atomic<unsigned> _bytes_count_executing = { 0 };
     std::atomic<unsigned> _requests_queued = { 0 };
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
@@ -173,9 +173,9 @@ private:
 
     bool can_dispatch() const {
         return _requests_queued.load(std::memory_order_relaxed) &&
-               (_requests_executing < _config.capacity) &&
-               (_req_count_executing < _config.max_req_count) &&
-               (_bytes_count_executing < _config.max_bytes_count);
+               (_requests_executing.load(std::memory_order_relaxed) < _config.capacity) &&
+               (_req_count_executing.load(std::memory_order_relaxed) < _config.max_req_count) &&
+               (_bytes_count_executing.load(std::memory_order_relaxed) < _config.max_bytes_count);
     }
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
@@ -217,7 +217,7 @@ public:
 
     /// \return the number of requests currently executing
     size_t requests_currently_executing() const {
-        return _requests_executing;
+        return _requests_executing.load(std::memory_order_relaxed);
     }
 
     /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
@@ -239,9 +239,9 @@ public:
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished.
     void notify_requests_finished(fair_queue_request_descriptor& desc) {
-        _requests_executing--;
-        _req_count_executing -= desc.weight;
-        _bytes_count_executing -= desc.size;
+        _requests_executing.fetch_sub(1, std::memory_order_relaxed);
+        _req_count_executing.fetch_sub(desc.weight, std::memory_order_relaxed);
+        _bytes_count_executing.fetch_sub(desc.size, std::memory_order_relaxed);
     }
 
     /// Try to execute new requests if there is capacity left in the queue.
@@ -254,9 +254,9 @@ public:
 
             auto req = std::move(h->_queue.front());
             h->_queue.pop();
-            _requests_executing++;
-            _req_count_executing += req->weight;
-            _bytes_count_executing += req->size;
+            _requests_executing.fetch_add(1, std::memory_order_relaxed);
+            _req_count_executing.fetch_add(req->weight, std::memory_order_relaxed);
+            _bytes_count_executing.fetch_add(req->size, std::memory_order_relaxed);
             _requests_queued.fetch_sub(1, std::memory_order_relaxed);
 
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);

@@ -27,6 +27,7 @@
 #include "print.hh"
 #include "circular_buffer.hh"
 #include "util/noncopyable_function.hh"
+#include "util/spinlock.hh"
 #include <queue>
 #include <type_traits>
 #include <chrono>
@@ -34,6 +35,7 @@
 #include <cmath>
 #include <stack>
 #include <boost/container/static_vector.hpp>
+#include <mutex>
 
 namespace seastar {
 
@@ -132,6 +134,8 @@ private:
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
 
+    util::spinlock _fair_queue_lock;
+
     std::array<priority_class, _max_classes> _all_classes;
     std::stack<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>> _available_classes;
 
@@ -194,6 +198,8 @@ public:
     ///
     /// \param shares, how many shares to create this class with
     priority_class_ptr register_priority_class(uint32_t shares) {
+        std::lock_guard<util::spinlock> g(_fair_queue_lock);
+
         if (_available_classes.empty()) {
             throw std::runtime_error("No more room for new I/O priority classes");
         }
@@ -208,6 +214,8 @@ public:
     ///
     /// It is illegal to unregister a priority class that still have pending requests.
     void unregister_priority_class(priority_class_ptr pclass) {
+        std::lock_guard<util::spinlock> g(_fair_queue_lock);
+
         assert(pclass->_queue.empty());
         _available_classes.push(pclass);
     }

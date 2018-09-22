@@ -1096,8 +1096,8 @@ reactor::handle_aio_error(::iocb* iocb, int ec) {
 
 bool
 reactor::flush_pending_aio() {
-    for (auto& ioq : my_io_queues) {
-        ioq->poll_io_queue();
+    for (auto& ioq : _io_queues) {
+        ioq.second.poll_io_queue();
     }
 
     bool did_work = false;
@@ -1194,9 +1194,9 @@ fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
     return cfg;
 }
 
-io_queue::io_queue(io_queue::config cfg)
+io_queue::io_queue(io_queue::config cfg, fair_queue* fq)
     : _priority_classes()
-    , _fq(make_fair_queue_config(cfg))
+    , _fq(fq)
     , _config(std::move(cfg)) {
 }
 
@@ -1208,7 +1208,7 @@ io_queue::~io_queue() {
     // And that will happen only when there are no more fibers to run. If we ever change
     // that, then this has to change.
     for (auto&& pclasses: _priority_classes) {
-        _fq.unregister_priority_class(pclasses.second->ptr);
+        _fq->unregister_priority_class(pclasses.second->ptr);
     }
 }
 
@@ -1240,7 +1240,7 @@ io_priority_class io_queue::register_one_priority_class(sstring name, uint32_t s
 
 seastar::metrics::label io_queue_shard("ioshard");
 
-io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr, shard_id owner)
+io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr)
     : ptr(ptr)
     , bytes(0)
     , ops(0)
@@ -1249,6 +1249,7 @@ io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring na
 {
     namespace sm = seastar::metrics;
     auto shard = ioq_ptr->coordinator();
+    auto owner = engine().cpu_id();
 
     auto ioq_group = sm::label("mountpoint");
     auto mountlabel = ioq_group(ioq_ptr->mountpoint());
@@ -1277,7 +1278,7 @@ io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring na
     });
 }
 
-io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_class& pc, shard_id owner) {
+io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_class& pc) {
     auto it_pclass = _priority_classes.find(pc.id());
     if (it_pclass == _priority_classes.end()) {
         auto shares = _registered_shares.at(pc.id()).load(std::memory_order_acquire);
@@ -1297,7 +1298,7 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
         // This conveys all the information we need and allows one to easily group all classes from
         // the same I/O queue (by filtering by shard)
 
-        auto ret = _priority_classes.emplace(pc.id(), make_lw_shared<priority_class_data>(this, name, _fq.register_priority_class(shares), owner));
+        auto ret = _priority_classes.emplace(pc.id(), make_lw_shared<priority_class_data>(this, name, _fq->register_priority_class(shares)));
         it_pclass = ret.first;
     }
     return *(it_pclass->second);
@@ -1307,10 +1308,10 @@ template <typename Func>
 future<io_event>
 io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::request_type req_type, Func prepare_io) {
     auto start = std::chrono::steady_clock::now();
-    return smp::submit_to(coordinator(), [start, &pc, len, req_type, prepare_io = std::move(prepare_io), owner = engine().cpu_id(), this] {
-        // First time will hit here, and then we create the class. It is important
-        // that we create the shared pointer in the same shard it will be used at later.
-        auto& pclass = find_or_create_class(pc, owner);
+    // First time will hit here, and then we create the class. It is important
+    // that we create the shared pointer in the same shard it will be used at later.
+    auto& pclass = find_or_create_class(pc);
+    return smp::submit_to(coordinator(), [start, &pclass, len, req_type, prepare_io = std::move(prepare_io), this] () mutable {
         pclass.bytes += len;
         pclass.ops++;
         pclass.nr_queued++;
@@ -1326,7 +1327,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
         auto desc = std::make_unique<io_desc>(this, weight, size);
         auto fq_desc = desc->fq_descriptor();
         auto fut = desc->get_future();
-        _fq.queue(pclass.ptr, std::move(fq_desc), [&pclass, start, prepare_io = std::move(prepare_io), desc = std::move(desc), this] () mutable noexcept {
+        _fq->queue(pclass.ptr, std::move(fq_desc), [&pclass, start, prepare_io = std::move(prepare_io), desc = std::move(desc), this] () mutable noexcept {
             try {
                 pclass.nr_queued--;
                 pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
@@ -1343,9 +1344,9 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
 
 future<>
 io_queue::update_shares_for_class(const io_priority_class pc, size_t new_shares) {
-    return smp::submit_to(coordinator(), [this, pc, owner = engine().cpu_id(), new_shares] {
-        auto& pclass = find_or_create_class(pc, owner);
-        _fq.update_shares(pclass.ptr, new_shares);
+    auto& pclass = find_or_create_class(pc);
+    return smp::submit_to(coordinator(), [this, &pclass, new_shares] {
+        _fq->update_shares(pclass.ptr, new_shares);
     });
 }
 
@@ -2649,11 +2650,13 @@ void reactor::register_metrics() {
     });
 
     auto ioq_group = sm::label("mountpoint");
-    for (auto& ioq : my_io_queues) {
-        auto ioq_name = ioq_group(ioq->mountpoint());
+    if (_io_coordinator == engine().cpu_id()) {
+    for (auto& ioq : _io_queues) {
+        auto ioq_name = ioq_group(ioq.second.mountpoint());
         _metric_groups.add_group("reactor", {
-                sm::make_gauge("io_queue_requests", [&ioq] { return ioq->queued_requests(); } , sm::description("Number of requests in the io queue"), {ioq_name}),
+                sm::make_gauge("io_queue_requests", [this, &ioq] { return ioq.second.queued_requests(); } , sm::description("Number of requests in the io queue"), {ioq_name}),
         });
+    }
     }
 
     using namespace seastar::metrics;
@@ -2800,8 +2803,8 @@ public:
         //
         // Alternatively, if we enabled _aio_eventfd, we can always enter
         unsigned executing = 0;
-        for (auto& ioq : _r.my_io_queues) {
-            executing += ioq->requests_currently_executing();
+        for (auto& ioq : _r._io_queues) {
+            executing += ioq.second.requests_currently_executing();
         }
         return executing == 0 || _r._aio_eventfd;
     }
@@ -3169,7 +3172,7 @@ int reactor::run() {
     if (smp::count > 1) {
         smp_poller = poller(std::make_unique<smp_pollfn>(*this));
     }
-    if (my_io_queues.size() > 0) {
+    if (my_fair_queues.size() > 0) {
 #ifndef HAVE_OSV
         io_poller = poller(std::make_unique<io_pollfn>(*this));
 #endif
@@ -3331,7 +3334,8 @@ int reactor::run() {
     // This is needed because the reactor is destroyed from the thread_local destructors. If
     // the I/O queue happens to use any other infrastructure that is also kept this way (for
     // instance, collectd), we will not have any way to guarantee who is destroyed first.
-    my_io_queues.clear();
+    _io_queues.clear();
+    my_fair_queues.clear();
     return _return;
 }
 
@@ -4266,7 +4270,12 @@ void smp::configure(boost::program_options::variables_map configuration)
 
     auto io_info = std::move(resources.io_queues);
 
-    std::unordered_map<dev_t, std::vector<io_queue*>> all_io_queues;
+    struct io_queue_creator {
+        io_queue::config cfg;
+        fair_queue* fq_ptr;
+    };
+
+    std::unordered_map<dev_t, std::vector<io_queue_creator>> all_io_queues;
     io_queue::fill_shares_array();
 
     for (auto& id : disk_config.device_ids()) {
@@ -4286,7 +4295,7 @@ void smp::configure(boost::program_options::variables_map configuration)
                     struct io_queue::config cfg = disk_config.generate_config(id);
                     cfg.coordinator = coordinator;
                     cfg.io_topology = io_info.shard_to_coordinator;
-                    all_io_queues[id][vec_idx] = new io_queue(std::move(cfg));
+                    all_io_queues[id][vec_idx] = io_queue_creator{std::move(cfg), new fair_queue(io_queue::make_fair_queue_config(cfg))};
                 }
             }
             return vec_idx;
@@ -4296,11 +4305,12 @@ void smp::configure(boost::program_options::variables_map configuration)
 
     auto assign_io_queue = [&all_io_queues, &disk_config] (shard_id shard_id, int queue_idx) {
         for (auto& dev_id : disk_config.device_ids()) {
-            if (all_io_queues[dev_id][queue_idx]->coordinator() == shard_id) {
-                engine().my_io_queues.emplace_back(all_io_queues[dev_id][queue_idx]);
+            auto& creator = all_io_queues[dev_id][queue_idx];
+            if (creator.cfg.coordinator == shard_id) {
+                engine().my_fair_queues.emplace_back(all_io_queues[dev_id][queue_idx].fq_ptr);
             }
-            engine()._io_queues.emplace(dev_id, all_io_queues[dev_id][queue_idx]);
-            engine()._io_coordinator = all_io_queues[dev_id][queue_idx]->coordinator();
+            engine()._io_queues.emplace(std::piecewise_construct, std::make_tuple(dev_id), std::make_tuple(creator.cfg, creator.fq_ptr));
+            engine()._io_coordinator = creator.cfg.coordinator;
         }
     };
 

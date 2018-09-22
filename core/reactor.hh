@@ -545,11 +545,11 @@ private:
         uint32_t nr_queued;
         std::chrono::duration<double> queue_time;
         metrics::metric_groups _metric_groups;
-        priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr, shard_id owner);
+        priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr);
     };
 
     std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;
-    fair_queue _fq;
+    fair_queue* _fq;
 
     static constexpr unsigned _max_classes = 2048;
     static std::array<std::atomic<uint32_t>, _max_classes> _registered_shares;
@@ -557,7 +557,7 @@ private:
 
     static io_priority_class register_one_priority_class(sstring name, uint32_t shares);
 
-    priority_class_data& find_or_create_class(const io_priority_class& pc, shard_id owner);
+    priority_class_data& find_or_create_class(const io_priority_class& pc);
     static void fill_shares_array();
     friend smp;
 public:
@@ -583,7 +583,7 @@ public:
         sstring mountpoint = "undefined";
     };
 
-    io_queue(config cfg);
+    io_queue(config cfg, fair_queue* fq);
     ~io_queue();
 
     template <typename Func>
@@ -595,22 +595,22 @@ public:
     }
 
     size_t queued_requests() const {
-        return _fq.waiters();
+        return _fq->waiters();
     }
 
     // How many requests are sent to disk but not yet returned.
     size_t requests_currently_executing() const {
-        return _fq.requests_currently_executing();
+        return _fq->requests_currently_executing();
     }
 
     // Inform the underlying queue about the fact that some of our requests finished
     void notify_requests_finished(fair_queue_request_descriptor& desc) {
-        _fq.notify_requests_finished(desc);
+        _fq->notify_requests_finished(desc);
     }
 
     // Dispatch requests that are pending in the I/O queue
     void poll_io_queue() {
-        _fq.dispatch_requests();
+        _fq->dispatch_requests();
     }
 
     sstring mountpoint() const {
@@ -747,16 +747,14 @@ private:
     static constexpr unsigned max_queues = 8;
     static constexpr unsigned max_aio = max_aio_per_queue * max_queues;
     friend disk_config_params;
-    // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
-    // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
-    // be stored here.
-    std::vector<std::unique_ptr<io_queue>> my_io_queues = {};
-
+    // All reactors have local IO queues, but those I/O queues will potentially share a fair queue.
+    // If this reactor holds a valid IO queue, it will be stored here.
+    std::vector<std::unique_ptr<fair_queue>> my_fair_queues = {};
 
     // For submiting the actual IO, all we need is the coordinator id. So storing it
     // separately saves us the pointer access.
     shard_id _io_coordinator;
-    std::unordered_map<dev_t, io_queue*> _io_queues;
+    std::unordered_map<dev_t, io_queue> _io_queues;
     friend io_queue;
 
     std::vector<std::function<future<> ()>> _exit_funcs;
@@ -930,9 +928,9 @@ public:
     io_queue& get_io_queue(dev_t devid = 0) {
         auto queue = _io_queues.find(devid);
         if (queue == _io_queues.end()) {
-            return *_io_queues[0];
+            return _io_queues.at(0);
         } else {
-            return *(queue->second);
+            return queue->second;
         }
     }
 
@@ -950,7 +948,7 @@ public:
     /// \return a future that is ready when the share update is applied
     future<> update_shares_for_class(io_priority_class pc, uint32_t shares) {
         return parallel_for_each(_io_queues, [pc, shares] (auto& queue) {
-            return queue.second->update_shares_for_class(pc, shares);
+            return queue.second.update_shares_for_class(pc, shares);
         });
     }
 

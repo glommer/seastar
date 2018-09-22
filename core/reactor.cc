@@ -1240,7 +1240,7 @@ io_priority_class io_queue::register_one_priority_class(sstring name, uint32_t s
 
 seastar::metrics::label io_queue_shard("ioshard");
 
-io_queue::priority_class_data::priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr, shard_id owner)
+io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr, shard_id owner)
     : ptr(ptr)
     , bytes(0)
     , ops(0)
@@ -1248,10 +1248,10 @@ io_queue::priority_class_data::priority_class_data(sstring name, sstring mountpo
     , queue_time(1s)
 {
     namespace sm = seastar::metrics;
-    auto shard = sm::impl::shard();
+    auto shard = ioq_ptr->coordinator();
 
     auto ioq_group = sm::label("mountpoint");
-    auto mountlabel = ioq_group(mountpoint);
+    auto mountlabel = ioq_group(ioq_ptr->mountpoint());
 
     auto class_label_type = sm::label("class");
     auto class_label = class_label_type(name);
@@ -1297,7 +1297,7 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
         // This conveys all the information we need and allows one to easily group all classes from
         // the same I/O queue (by filtering by shard)
 
-        auto ret = _priority_classes.emplace(pc.id(), make_lw_shared<priority_class_data>(name, mountpoint(), _fq.register_priority_class(shares), owner));
+        auto ret = _priority_classes.emplace(pc.id(), make_lw_shared<priority_class_data>(this, name, _fq.register_priority_class(shares), owner));
         it_pclass = ret.first;
     }
     return *(it_pclass->second);

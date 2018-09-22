@@ -545,7 +545,7 @@ private:
         uint32_t nr_queued;
         std::chrono::duration<double> queue_time;
         metrics::metric_groups _metric_groups;
-        priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr, shard_id owner);
+        priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr, shard_id owner);
     };
 
     std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;

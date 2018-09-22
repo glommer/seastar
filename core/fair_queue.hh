@@ -32,6 +32,8 @@
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
+#include <stack>
+#include <boost/container/static_vector.hpp>
 
 namespace seastar {
 
@@ -53,13 +55,10 @@ class priority_class {
         fair_queue_request_descriptor desc;
     };
     friend class fair_queue;
-    uint32_t _shares = 0;
+    uint32_t _shares = 1u;
     float _accumulated = 0;
     circular_buffer<request> _queue;
     bool _queued = false;
-
-    friend struct shared_ptr_no_esft<priority_class>;
-    explicit priority_class(uint32_t shares) : _shares(std::max(shares, 1u)) {}
 
     void update_shares(uint32_t shares) {
         _shares = (std::max(shares, 1u));
@@ -80,7 +79,7 @@ public:
 /// to the \ref fair_queue to identify a given class.
 ///
 /// \related fair_queue
-using priority_class_ptr = lw_shared_ptr<priority_class>;
+using priority_class_ptr = priority_class*;
 
 /// \brief Fair queuing class
 ///
@@ -114,6 +113,7 @@ public:
         unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
     };
 private:
+    static constexpr unsigned _max_classes = 2048;
     friend priority_class;
 
     struct class_compare {
@@ -131,7 +131,9 @@ private:
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
-    std::unordered_set<priority_class_ptr> _all_classes;
+
+    std::array<priority_class, _max_classes> _all_classes;
+    std::stack<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>> _available_classes;
 
     void push_priority_class(priority_class_ptr pc) {
         if (!pc->_queued) {
@@ -158,7 +160,7 @@ private:
         // time_delta is negative; and this may advance _base into the future
         _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
         for (auto& pc: _all_classes) {
-            pc->_accumulated *= normalize_factor();
+            pc._accumulated *= normalize_factor();
         }
     }
 
@@ -175,7 +177,11 @@ public:
     explicit fair_queue(config cfg)
         : _config(std::move(cfg))
         , _base(std::chrono::steady_clock::now())
-    {}
+    {
+        for (size_t i = 0; i < _max_classes; ++i) {
+            _available_classes.push(&_all_classes[i]);
+        }
+    }
 
     /// Constructs a fair queue with a given \c capacity.
     ///
@@ -188,9 +194,14 @@ public:
     ///
     /// \param shares, how many shares to create this class with
     priority_class_ptr register_priority_class(uint32_t shares) {
-        priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
-        _all_classes.insert(pclass);
-        return pclass;
+        if (_available_classes.empty()) {
+            throw std::runtime_error("No more room for new I/O priority classes");
+        }
+
+        auto ptr = _available_classes.top();
+        ptr->update_shares(shares);
+        _available_classes.pop();
+        return ptr;
     }
 
     /// Unregister a priority class.
@@ -198,7 +209,7 @@ public:
     /// It is illegal to unregister a priority class that still have pending requests.
     void unregister_priority_class(priority_class_ptr pclass) {
         assert(pclass->_queue.empty());
-        _all_classes.erase(pclass);
+        _available_classes.push(pclass);
     }
 
     /// \return how many waiters are currently queued for all classes.

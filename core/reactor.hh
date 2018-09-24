@@ -537,6 +537,17 @@ inline open_flags operator|(open_flags a, open_flags b) {
 }
 
 class io_queue {
+public:
+    struct config {
+        shard_id coordinator;
+        std::vector<shard_id> io_topology;
+        unsigned capacity = std::numeric_limits<unsigned>::max();
+        unsigned max_req_count = std::numeric_limits<unsigned>::max();
+        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
+        unsigned disk_req_write_to_read_multiplier = read_request_base_count;
+        unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
+        sstring mountpoint = "undefined";
+    };
 private:
     struct priority_class_data {
         priority_class_ptr ptr;
@@ -548,16 +559,17 @@ private:
         priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr);
     };
 
-    std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;
     fair_queue* _fq;
+    config _config;
+    std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;
 
     static constexpr unsigned _max_classes = 2048;
     static std::array<std::atomic<uint32_t>, _max_classes> _registered_shares;
     static std::array<sstring, _max_classes> _registered_names;
 
-    static io_priority_class register_one_priority_class(sstring name, uint32_t shares);
+    void register_one_priority_class(io_priority_class iop, sstring name, uint32_t shares);
 
-    priority_class_data& find_or_create_class(const io_priority_class& pc);
+    priority_class_data& find_class(const io_priority_class& pc);
     static void fill_shares_array();
     friend smp;
 public:
@@ -571,17 +583,6 @@ public:
     // It is also technically possible for reads to be the expensive ones, in which case
     // writes will have an integer value lower than 100.
     static constexpr unsigned read_request_base_count = 128;
-
-    struct config {
-        shard_id coordinator;
-        std::vector<shard_id> io_topology;
-        unsigned capacity = std::numeric_limits<unsigned>::max();
-        unsigned max_req_count = std::numeric_limits<unsigned>::max();
-        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
-        unsigned disk_req_write_to_read_multiplier = read_request_base_count;
-        unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
-        sstring mountpoint = "undefined";
-    };
 
     io_queue(config cfg, fair_queue* fq);
     ~io_queue();
@@ -628,7 +629,6 @@ public:
 
     friend class reactor;
 private:
-    config _config;
     static fair_queue::config make_fair_queue_config(config cfg);
 };
 
@@ -934,9 +934,7 @@ public:
         }
     }
 
-    io_priority_class register_one_priority_class(sstring name, uint32_t shares) {
-        return io_queue::register_one_priority_class(std::move(name), shares);
-    }
+    future<io_priority_class> create_io_priority_class(sstring name, uint32_t shares);
 
     /// \brief Updates the current amount of shares for a given priority class
     ///

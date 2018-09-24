@@ -86,14 +86,7 @@ struct file_open_options {
 
 /// \cond internal
 class io_queue;
-class io_priority_class {
-    unsigned val;
-    friend io_queue;
-public:
-    unsigned id() const {
-        return val;
-    }
-};
+using io_priority_class = unsigned;
 
 const io_priority_class& default_priority_class();
 

@@ -1140,10 +1140,8 @@ reactor::flush_pending_aio() {
 }
 
 const io_priority_class& default_priority_class() {
-    static thread_local auto shard_default_class = [] {
-        return engine().register_one_priority_class("default", 1);
-    }();
-    return shard_default_class;
+    static io_priority_class default_iop = 0;
+    return default_iop;
 }
 
 template <typename Func>
@@ -1195,9 +1193,9 @@ fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
 }
 
 io_queue::io_queue(io_queue::config cfg, fair_queue* fq)
-    : _priority_classes()
-    , _fq(fq)
-    , _config(std::move(cfg)) {
+    : _fq(fq)
+    , _config(std::move(cfg))
+    , _priority_classes({{0, make_lw_shared<priority_class_data>(this, "default", _fq->register_priority_class(1)) }}) {
 }
 
 io_queue::~io_queue() {
@@ -1212,30 +1210,22 @@ io_queue::~io_queue() {
     }
 }
 
-std::array<std::atomic<uint32_t>, io_queue::_max_classes> io_queue::_registered_shares;
-// We could very well just add the name to the io_priority_class. However, because that
-// structure is passed along all the time - and sometimes we can't help but copy it, better keep
-// it lean. The name won't really be used for anything other than monitoring.
-std::array<sstring, io_queue::_max_classes> io_queue::_registered_names;
 
-void io_queue::fill_shares_array() {
-    for (unsigned i = 0; i < _max_classes; ++i) {
-        _registered_shares[i].store(0);
-    }
+future<io_priority_class> reactor::register_one_priority_class(sstring name, uint32_t shares) {
+    static std::atomic<io_priority_class> registered_classes =  { 1 };
+    // Class 0 is the default class
+    unsigned new_class = registered_classes.fetch_add(1, std::memory_order_relaxed);
+    return parallel_for_each(_io_queues | boost::adaptors::map_values, [new_class, name = std::move(name), shares] (io_queue& queue) {
+        return queue.register_one_priority_class(new_class, name, shares);
+    }).then([new_class] {
+        return make_ready_future<io_priority_class>(new_class);
+    });
 }
 
-io_priority_class io_queue::register_one_priority_class(sstring name, uint32_t shares) {
-    for (unsigned i = 0; i < _max_classes; ++i) {
-        uint32_t unused = 0;
-        auto s = _registered_shares[i].compare_exchange_strong(unused, shares, std::memory_order_acq_rel);
-        if (s) {
-            io_priority_class p;
-            _registered_names[i] = name;
-            p.val = i;
-            return p;
-        };
-    }
-    throw std::runtime_error("No more room for new I/O priority classes");
+future<> io_queue::register_one_priority_class(io_priority_class iop, sstring name, uint32_t shares) {
+    return smp::invoke_on_all([this, iop, name = std::move(name), shares] () mutable {
+        _priority_classes.emplace(iop, make_lw_shared<priority_class_data>(this, std::move(name), _fq->register_priority_class(shares)));
+    });
 }
 
 seastar::metrics::label io_queue_shard("ioshard");
@@ -1278,30 +1268,8 @@ io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring na
     });
 }
 
-io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_class& pc) {
-    auto it_pclass = _priority_classes.find(pc.id());
-    if (it_pclass == _priority_classes.end()) {
-        auto shares = _registered_shares.at(pc.id()).load(std::memory_order_acquire);
-        auto name = _registered_names.at(pc.id());
-        // A note on naming:
-        //
-        // We could just add the owner as the instance id and have something like:
-        //  io_queue-<class_owner>-<counter>-<class_name>
-        //
-        // However, when there are more than one shard per I/O queue, it is very useful
-        // to know which shards are being served by the same queue. Therefore, a better name
-        // scheme is:
-        //
-        //  io_queue-<queue_owner>-<counter>-<class_name>, shard=<class_owner>
-        //  using the shard label to hold the owner number
-        //
-        // This conveys all the information we need and allows one to easily group all classes from
-        // the same I/O queue (by filtering by shard)
-
-        auto ret = _priority_classes.emplace(pc.id(), make_lw_shared<priority_class_data>(this, name, _fq->register_priority_class(shares)));
-        it_pclass = ret.first;
-    }
-    return *(it_pclass->second);
+io_queue::priority_class_data& io_queue::find_class(const io_priority_class& pc) {
+    return *_priority_classes.at(pc);
 }
 
 template <typename Func>
@@ -1310,7 +1278,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
     auto start = std::chrono::steady_clock::now();
     // First time will hit here, and then we create the class. It is important
     // that we create the shared pointer in the same shard it will be used at later.
-    auto& pclass = find_or_create_class(pc);
+    auto& pclass = find_class(pc);
     return smp::submit_to(coordinator(), [start, &pclass, len, req_type, prepare_io = std::move(prepare_io), this] () mutable {
         pclass.bytes += len;
         pclass.ops++;
@@ -1344,7 +1312,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
 
 future<>
 io_queue::update_shares_for_class(const io_priority_class pc, size_t new_shares) {
-    auto& pclass = find_or_create_class(pc);
+    auto& pclass = find_class(pc);
     return smp::submit_to(coordinator(), [this, &pclass, new_shares] {
         _fq->update_shares(pclass.ptr, new_shares);
     });
@@ -4276,7 +4244,6 @@ void smp::configure(boost::program_options::variables_map configuration)
     };
 
     std::unordered_map<dev_t, std::vector<io_queue_creator>> all_io_queues;
-    io_queue::fill_shares_array();
 
     for (auto& id : disk_config.device_ids()) {
         all_io_queues.emplace(id, io_info.coordinators.size());

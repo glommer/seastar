@@ -97,6 +97,7 @@ struct shard_info {
     std::chrono::duration<float> think_time = 0ms;
     std::chrono::duration<float> execution_time = 1ms;
     seastar::scheduling_group scheduling_group = seastar::default_scheduling_group();
+    io_priority_class io_priority;
 };
 
 class class_data;
@@ -137,7 +138,7 @@ public:
     class_data(job_config cfg)
         : _config(std::move(cfg))
         , _alignment(_config.shard_info.request_size >= 4096 ? 4096 : 512)
-        , _iop(engine().register_one_priority_class(sprint("test-class-%d", idgen()), _config.shard_info.shares))
+        , _iop(_config.shard_info.io_priority)
         , _sg(cfg.shard_info.scheduling_group)
         , _latencies(extended_p_square_probabilities = quantiles)
         , _pos_distribution(0,  file_data_size / _config.shard_info.request_size)
@@ -587,6 +588,10 @@ int main(int ac, char** av) {
             parallel_for_each(reqs, [] (auto& r) {
                 return seastar::create_scheduling_group(r.name, r.shard_info.shares).then([&r] (seastar::scheduling_group sg) {
                     r.shard_info.scheduling_group = sg;
+                    return engine().register_one_priority_class(r.name, r.shard_info.shares);
+                }).then([&r] (io_priority_class iop) {
+                    r.shard_info.io_priority = iop;
+                    return make_ready_future<>();
                 });
             }).get();
 

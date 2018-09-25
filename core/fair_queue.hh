@@ -36,6 +36,7 @@
 #include <stack>
 #include <boost/container/static_vector.hpp>
 #include <mutex>
+#include <boost/lockfree/spsc_queue.hpp>
 
 namespace seastar {
 
@@ -45,6 +46,9 @@ namespace seastar {
 struct fair_queue_request_descriptor {
     unsigned weight = 1; ///< the weight of this request for capacity purposes (IOPS).
     unsigned size = 1;        ///< the effective size of this request
+    virtual void operator()() noexcept = 0; ///< function to be executed when the request is ready
+    virtual ~fair_queue_request_descriptor() {}
+    fair_queue_request_descriptor(unsigned w, unsigned s) : weight(w), size(s) {}
 };
 
 /// \addtogroup io-module
@@ -52,14 +56,17 @@ struct fair_queue_request_descriptor {
 
 /// \cond internal
 class priority_class {
-    struct request {
-        noncopyable_function<void()> func;
-        fair_queue_request_descriptor desc;
-    };
+public:
+    static constexpr unsigned queue_capacity = 128;
+private:
     friend class fair_queue;
     uint32_t _shares = 1u;
     float _accumulated = 0;
-    circular_buffer<request> _queue;
+    using lf_queue = boost::lockfree::spsc_queue<fair_queue_request_descriptor*,
+                                                 boost::lockfree::capacity<queue_capacity>>;
+
+    lf_queue _queue;
+
     bool _queued = false;
 
     void update_shares(uint32_t shares) {
@@ -125,13 +132,13 @@ private:
     };
 
     config _config;
-    unsigned _requests_executing = 0;
-    unsigned _req_count_executing = 0;
-    unsigned _bytes_count_executing = 0;
-    unsigned _requests_queued = 0;
+    std::atomic<unsigned> _requests_executing = { 0 };
+    std::atomic<unsigned> _req_count_executing = { 0 };
+    std::atomic<unsigned> _bytes_count_executing = { 0 };
+    std::atomic<unsigned> _requests_queued = { 0 };
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
-    using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
+    using prioq = std::priority_queue<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>, class_compare>;
     prioq _handles;
 
     util::spinlock _fair_queue_lock;
@@ -140,19 +147,31 @@ private:
     std::stack<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>> _available_classes;
 
     void push_priority_class(priority_class_ptr pc) {
-        if (!pc->_queued) {
+        std::lock_guard<util::spinlock> g(_fair_queue_lock);
+        if (!pc->_queue.empty() && !pc->_queued) {
             _handles.push(pc);
             pc->_queued = true;
         }
     }
 
-    priority_class_ptr pop_priority_class() {
-        assert(!_handles.empty());
+    struct atomic_pop {
+        priority_class_ptr ptr = nullptr;
+        fair_queue_request_descriptor* req = nullptr;
+    };
+
+    atomic_pop pop_priority_class() {
+        std::lock_guard<util::spinlock> g(_fair_queue_lock);
+        if (_handles.empty()) {
+            return atomic_pop{};
+        }
         auto h = _handles.top();
         _handles.pop();
-        assert(h->_queued);
         h->_queued = false;
-        return h;
+
+        fair_queue_request_descriptor* req;
+        auto ret = h->_queue.pop(req);
+        assert(ret);
+        return atomic_pop{h, req};
     }
 
     float normalize_factor() const {
@@ -169,10 +188,10 @@ private:
     }
 
     bool can_dispatch() const {
-        return _requests_queued &&
-               (_requests_executing < _config.capacity) &&
-               (_req_count_executing < _config.max_req_count) &&
-               (_bytes_count_executing < _config.max_bytes_count);
+        return _requests_queued.load(std::memory_order_relaxed) &&
+               (_requests_executing.load(std::memory_order_relaxed) < _config.capacity) &&
+               (_req_count_executing.load(std::memory_order_relaxed) < _config.max_req_count) &&
+               (_bytes_count_executing.load(std::memory_order_relaxed) < _config.max_bytes_count);
     }
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
@@ -222,12 +241,12 @@ public:
 
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const {
-        return _requests_queued;
+        return _requests_queued.load(std::memory_order_relaxed);
     }
 
     /// \return the number of requests currently executing
     size_t requests_currently_executing() const {
-        return _requests_executing;
+        return _requests_executing.load(std::memory_order_relaxed);
     }
 
     /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
@@ -237,43 +256,46 @@ public:
     ///
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
-    void queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
+    void queue(priority_class_ptr pc, fair_queue_request_descriptor* desc) {
+        auto ret = pc->_queue.push(desc);
+        assert(ret);
         // We need to return a future in this function on which the caller can wait.
         // Since we don't know which queue we will use to execute the next request - if ours or
         // someone else's, we need a separate promise at this point.
         push_priority_class(pc);
-        pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
-        _requests_queued++;
+        _requests_queued.fetch_add(1, std::memory_order_relaxed);
     }
 
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished.
     void notify_requests_finished(fair_queue_request_descriptor& desc) {
-        _requests_executing--;
-        _req_count_executing -= desc.weight;
-        _bytes_count_executing -= desc.size;
+        _requests_executing.fetch_sub(1, std::memory_order_relaxed);
+        _req_count_executing.fetch_sub(desc.weight, std::memory_order_relaxed);
+        _bytes_count_executing.fetch_sub(desc.size, std::memory_order_relaxed);
     }
 
     /// Try to execute new requests if there is capacity left in the queue.
     void dispatch_requests() {
         while (can_dispatch()) {
-            priority_class_ptr h;
-            do {
-                h = pop_priority_class();
-            } while (h->_queue.empty());
+            auto ret = pop_priority_class();
+            priority_class_ptr h = ret.ptr;
+            fair_queue_request_descriptor* req = ret.req;
+            if (!h) {
+                return;
+            }
 
-            auto req = std::move(h->_queue.front());
-            h->_queue.pop_front();
-            _requests_executing++;
-            _req_count_executing += req.desc.weight;
-            _bytes_count_executing += req.desc.size;
-            _requests_queued--;
+
+            _requests_executing.fetch_add(1, std::memory_order_relaxed);
+            _req_count_executing.fetch_add(req->weight, std::memory_order_relaxed);
+            _bytes_count_executing.fetch_add(req->size, std::memory_order_relaxed);
+            _requests_queued.fetch_sub(1, std::memory_order_relaxed);
 
             auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-            auto req_cost  = (float(req.desc.weight) / _config.max_req_count + float(req.desc.size) / _config.max_bytes_count) / h->_shares;
+            auto req_cost  = (float(req->weight) / _config.max_req_count + float(req->size) / _config.max_bytes_count) / h->_shares;
             auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
             float next_accumulated = h->_accumulated + cost;
             while (std::isinf(next_accumulated)) {
+                std::lock_guard<util::spinlock> g(_fair_queue_lock);
                 normalize_stats();
                 // If we have renormalized, our time base will have changed. This should happen very infrequently
                 delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
@@ -281,11 +303,9 @@ public:
                 next_accumulated = h->_accumulated + cost;
             }
             h->_accumulated = next_accumulated;
+            push_priority_class(h);
 
-            if (!h->_queue.empty()) {
-                push_priority_class(h);
-            }
-            req.func();
+            (*req)();
         }
     }
 

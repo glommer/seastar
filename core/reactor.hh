@@ -536,6 +536,56 @@ inline open_flags operator|(open_flags a, open_flags b) {
     return open_flags(static_cast<unsigned int>(a) | static_cast<unsigned int>(b));
 }
 
+class priority_class_data;
+
+class io_desc : public fair_queue_request_descriptor  {
+    promise<io_event> _pr;
+    priority_class_data* _pclass;
+    noncopyable_function<void(io_desc* )> _submit;
+    shard_id _owner;
+    compat::optional<semaphore_units<>> _queue_permit;
+
+    void notify_requests_finished();
+public:
+    io_desc();
+    io_desc(priority_class_data& pclass, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit);
+
+    void set_exception(std::exception_ptr eptr);
+    void set_value(io_event& ev);
+    future<io_event> get_future();
+    void operator()() noexcept override;
+};
+
+struct priority_class_data {
+    semaphore sem = { priority_class::queue_capacity };
+    priority_class_ptr ptr;
+    size_t bytes;
+    uint64_t ops;
+    uint32_t nr_queued;
+    std::chrono::duration<double> queue_time;
+    metrics::metric_groups _metric_groups;
+    io_queue* ioq_ptr;
+    priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr);
+
+    template <typename... Args>
+    io_desc* get_free_io_desc(Args&&... args) {
+        io_desc* ptr = _free_io_desc.top();
+        _free_io_desc.pop();
+        ptr->~io_desc();
+        return new (ptr) io_desc(std::forward<Args>(args)...);
+    }
+    void free_io_desc(io_desc* desc) {
+        _free_io_desc.push(desc);
+    }
+private:
+    // Want to enqueue new requests as soon as the old ones are taken out of the queue,
+    // even if they are still in flight. Worst case is queue_capacity in flight requests
+    // not yet finished, an another queue_capacity queued.
+    static constexpr unsigned io_desc_capacity = priority_class::queue_capacity * 2;
+    std::array<io_desc, io_desc_capacity> _iodesc_array;
+    std::stack<io_desc*, boost::container::static_vector<io_desc*, io_desc_capacity>> _free_io_desc;
+};
+
 class io_queue {
 public:
     struct config {
@@ -549,16 +599,6 @@ public:
         sstring mountpoint = "undefined";
     };
 private:
-    struct priority_class_data {
-        priority_class_ptr ptr;
-        size_t bytes;
-        uint64_t ops;
-        uint32_t nr_queued;
-        std::chrono::duration<double> queue_time;
-        metrics::metric_groups _metric_groups;
-        priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr);
-    };
-
     fair_queue* _fq;
     config _config;
     std::unordered_map<unsigned, lw_shared_ptr<priority_class_data>> _priority_classes;

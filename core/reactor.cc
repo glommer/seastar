@@ -1016,36 +1016,48 @@ void reactor_backend_epoll::complete_epoll_event(pollable_fd_state& pfd, promise
 
 static bool aio_nowait_supported = true;
 
-class io_desc {
-    promise<io_event> _pr;
-    io_queue* _ioq_ptr;
-    fair_queue_request_descriptor _fq_desc;
-public:
-    io_desc(io_queue* ioq, unsigned weight, unsigned size)
-        : _ioq_ptr(ioq)
-        , _fq_desc(fair_queue_request_descriptor{weight, size})
-    {}
+io_desc::io_desc()
+    : fair_queue_request_descriptor(0, 0)
+{}
 
-    fair_queue_request_descriptor& fq_descriptor() {
-        return _fq_desc;
-    }
+io_desc::io_desc(priority_class_data& pclass, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit)
+    : fair_queue_request_descriptor(weight, size)
+    , _pclass(&pclass)
+    , _submit(std::move(submit))
+    , _owner(engine().cpu_id())
+    , _queue_permit(std::move(permit))
+{}
 
-    void notify_requests_finished() {
-        _ioq_ptr->notify_requests_finished(_fq_desc);
-    }
+void io_desc::notify_requests_finished() {
+    _pclass->ioq_ptr->notify_requests_finished(*this);
+    _pclass->free_io_desc(this);
+}
 
-    void set_exception(std::exception_ptr eptr) {
-        _pr.set_exception(std::move(eptr));
-    }
+void io_desc::set_exception(std::exception_ptr eptr) {
+    _pr.set_exception(std::move(eptr));
+    notify_requests_finished();
+}
 
-    void set_value(io_event& ev) {
-        _pr.set_value(ev);
-    }
+void io_desc::set_value(io_event& ev) {
+    _pr.set_value(ev);
+    notify_requests_finished();
+}
 
-    future<io_event> get_future() {
-        return _pr.get_future();
-    }
-};
+future<io_event> io_desc::get_future() {
+    return _pr.get_future();
+}
+
+void io_desc::operator()() noexcept {
+    smp::submit_to(_owner, [this] {
+        _queue_permit = {};
+        try {
+            _submit(this);
+        } catch (...) {
+            set_exception(std::current_exception());
+            notify_requests_finished();
+        }
+    });
+}
 
 template <typename Func>
 void
@@ -1082,8 +1094,6 @@ reactor::handle_aio_error(::iocb* iocb, int ec) {
             } catch (...) {
                 desc->set_exception(std::current_exception());
             }
-            desc->notify_requests_finished();
-            delete desc;
             // if EBADF, it means that the first request has a bad fd, so
             // we will only remove it from _pending_aio and try again.
             return 1;
@@ -1178,8 +1188,6 @@ bool reactor::process_io()
         _free_iocbs.push(iocb);
         auto desc = reinterpret_cast<io_desc*>(ev[i].data);
         desc->set_value(ev[i]);
-        desc->notify_requests_finished();
-        delete desc;
     }
     return n;
 }
@@ -1231,12 +1239,13 @@ void io_queue::register_one_priority_class(io_priority_class iop, sstring name, 
 
 seastar::metrics::label io_queue_shard("ioshard");
 
-io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr)
+priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring name, priority_class_ptr ptr)
     : ptr(ptr)
     , bytes(0)
     , ops(0)
     , nr_queued(0)
     , queue_time(1s)
+    , ioq_ptr(ioq_ptr)
 {
     namespace sm = seastar::metrics;
     auto shard = ioq_ptr->coordinator();
@@ -1267,9 +1276,13 @@ io_queue::priority_class_data::priority_class_data(io_queue* ioq_ptr, sstring na
                 return this->ptr->shares();
             }, sm::description("current amount of shares"), {io_queue_shard(shard), sm::shard_label(owner), mountlabel, class_label})
     });
+
+    for (auto& desc : _iodesc_array) {
+        _free_io_desc.push(&desc);
+    }
 }
 
-io_queue::priority_class_data& io_queue::find_class(const io_priority_class& pc) {
+priority_class_data& io_queue::find_class(const io_priority_class& pc) {
     return *_priority_classes.at(pc);
 }
 
@@ -1280,10 +1293,10 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
     // First time will hit here, and then we create the class. It is important
     // that we create the shared pointer in the same shard it will be used at later.
     auto& pclass = find_class(pc);
-    return smp::submit_to(coordinator(), [start, &pclass, len, req_type, prepare_io = std::move(prepare_io), this] () mutable {
+    pclass.nr_queued++;
+    return get_units(pclass.sem, 1).then([this, start, &pclass, len, req_type, prepare_io = std::move(prepare_io)] (auto permit) mutable {
         pclass.bytes += len;
         pclass.ops++;
-        pclass.nr_queued++;
         unsigned weight;
         size_t size;
         if (req_type == io_queue::request_type::write) {
@@ -1293,20 +1306,15 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
             weight = io_queue::read_request_base_count;
             size = io_queue::read_request_base_count * len;
         }
-        auto desc = std::make_unique<io_desc>(this, weight, size);
-        auto fq_desc = desc->fq_descriptor();
-        auto fut = desc->get_future();
-        _fq->queue(pclass.ptr, std::move(fq_desc), [&pclass, start, prepare_io = std::move(prepare_io), desc = std::move(desc), this] () mutable noexcept {
-            try {
-                pclass.nr_queued--;
-                pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-                engine().submit_io(desc.get(), std::move(prepare_io));
-                desc.release();
-            } catch (...) {
-                desc->set_exception(std::current_exception());
-                notify_requests_finished(desc->fq_descriptor());
-            }
+
+        auto desc = pclass.get_free_io_desc(pclass, weight, size, std::move(permit), [&pclass, start, prepare_io = std::move(prepare_io), this] (io_desc* desc) mutable {
+            pclass.nr_queued--;
+            pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
+            engine().submit_io(desc, std::move(prepare_io));
         });
+
+        auto fut = desc->get_future();
+        _fq->queue(pclass.ptr, desc);
         return fut;
     });
 }
@@ -3141,12 +3149,10 @@ int reactor::run() {
     if (smp::count > 1) {
         smp_poller = poller(std::make_unique<smp_pollfn>(*this));
     }
-    if (my_fair_queues.size() > 0) {
 #ifndef HAVE_OSV
-        io_poller = poller(std::make_unique<io_pollfn>(*this));
+    io_poller = poller(std::make_unique<io_pollfn>(*this));
 #endif
-        aio_poller = poller(std::make_unique<aio_batch_submit_pollfn>(*this));
-    }
+    aio_poller = poller(std::make_unique<aio_batch_submit_pollfn>(*this));
 
     ::sched_param sp;
     sp.sched_priority = 1;

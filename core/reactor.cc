@@ -4016,7 +4016,8 @@ void smp::qs_deleter::operator()(smp_message_queue** qs) const {
 
 class disk_config_params {
 public:
-    unsigned _num_io_queues = smp::count;
+    unsigned _max_io_queues = smp::count;
+    unsigned _num_io_queues = 0;
     compat::optional<unsigned> _capacity;
     std::unordered_map<dev_t, mountpoint_params> _mountpoints;
     std::chrono::duration<double> _latency_goal;
@@ -4025,8 +4026,12 @@ public:
         return std::max(qty / _num_io_queues, 1ul);
     }
 public:
-    unsigned num_io_queues() const {
-        return _num_io_queues;
+    unsigned max_io_queues() const {
+        return _max_io_queues;
+    }
+
+    void set_num_io_queues(unsigned num_io_queues) {
+        _num_io_queues = num_io_queues;
     }
 
     void parse_config(boost::program_options::variables_map& configuration) {
@@ -4034,9 +4039,6 @@ public:
             _capacity = configuration["max-io-requests"].as<unsigned>();
         }
 
-        if (configuration.count("num-io-queues")) {
-            _num_io_queues = configuration["num-io-queues"].as<unsigned>();
-        }
         if (configuration.count("io-properties-file") && configuration.count("io-properties")) {
             throw std::runtime_error("Both io-properties and io-properties-file specified. Don't know which to trust!");
         }
@@ -4074,7 +4076,18 @@ public:
                 }
             }
         }
-        _latency_goal = std::chrono::duration_cast<std::chrono::duration<double>>(configuration["task-quota-ms"].as<double>() * 1.5 * 1ms);
+
+        auto task_quotas_in_default_latency_goal = 1.5;
+        _latency_goal = std::chrono::duration_cast<std::chrono::duration<double>>(configuration["task-quota-ms"].as<double>() * task_quotas_in_default_latency_goal * 1ms);
+        auto multiplier = task_quotas_in_default_latency_goal * _latency_goal.count();
+
+        for (auto& p: _mountpoints | boost::adaptors::map_values) {
+            uint64_t max_bandwidth = std::max(p.read_bytes_rate, p.write_bytes_rate);
+            uint64_t max_iops = std::max(p.read_req_rate, p.write_req_rate);
+            _max_io_queues = std::min(_max_io_queues, unsigned((multiplier * max_iops) / 4));
+            _max_io_queues = std::min(_max_io_queues, unsigned((max_bandwidth) / (4 * 4096)));
+        }
+        _max_io_queues = std::max(_max_io_queues, 1u);
     }
 
     struct io_queue::config generate_config(dev_t devid) const {
@@ -4210,7 +4223,7 @@ void smp::configure(boost::program_options::variables_map configuration)
 
     disk_config_params disk_config;
     disk_config.parse_config(configuration);
-    rc.io_queues =  disk_config.num_io_queues();
+    rc.max_io_queues =  disk_config.max_io_queues();
 
     auto resources = resource::allocate(rc);
     std::vector<resource::cpu> allocations = std::move(resources.cpus);
@@ -4218,6 +4231,7 @@ void smp::configure(boost::program_options::variables_map configuration)
         smp::pin(allocations[0].cpu_id);
     }
     memory::configure(allocations[0].mem, mbind, hugepages_path);
+    disk_config.set_num_io_queues(resources.io_queues.coordinators.size());
 
     if (configuration.count("abort-on-seastar-bad-alloc")) {
         memory::enable_abort_on_allocation_failure();

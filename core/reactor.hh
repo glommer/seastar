@@ -548,12 +548,15 @@ class io_desc : public fair_queue_request_descriptor  {
     void notify_requests_finished();
 public:
     io_desc();
-    io_desc(priority_class_data& pclass, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit);
+    io_desc(priority_class_data& pclass, ::aio_context_t io_context, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit);
 
     void set_exception(std::exception_ptr eptr);
     void set_value(io_event& ev);
     future<io_event> get_future();
     void operator()() noexcept override;
+
+    template <typename Func>
+    void prepare_io(Func&& f);
 };
 
 struct priority_class_data {
@@ -650,8 +653,8 @@ public:
     }
 
     // Dispatch requests that are pending in the I/O queue
-    void poll_io_queue() {
-        _fq->dispatch_requests();
+    void poll_io_queue(iocb_map_per_context& iocb_map) {
+        _fq->dispatch_requests(iocb_map);
     }
 
     sstring mountpoint() const {
@@ -824,9 +827,6 @@ private:
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link> _manual_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link>::timer_list_t _expired_manual_timers;
     ::aio_context_t _io_context;
-    alignas(cache_line_size) std::array<::iocb, max_aio> _iocb_pool;
-    std::stack<::iocb*, boost::container::static_vector<::iocb*, max_aio>> _free_iocbs;
-    boost::container::static_vector<::iocb*, max_aio> _pending_aio;
     boost::container::static_vector<::iocb*, max_aio> _pending_aio_retry;
     io_stats _io_stats;
     uint64_t _fsyncs = 0;
@@ -1028,8 +1028,7 @@ public:
     // In the following three methods, prepare_io is not guaranteed to execute in the same processor
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
-    template <typename Func>
-    void submit_io(io_desc* desc, Func prepare_io);
+    void aio_set_eventfd_notification(io_desc* desc);
 
     template <typename Func>
     future<io_event> submit_io_read(io_queue* ioq, const io_priority_class& priority_class, size_t len, Func prepare_io);

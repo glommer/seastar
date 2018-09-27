@@ -37,18 +37,22 @@
 #include <boost/container/static_vector.hpp>
 #include <mutex>
 #include <boost/lockfree/spsc_queue.hpp>
+#include "linux-aio.hh"
 
 namespace seastar {
 
+using iocb_map_per_context = std::unordered_map<::aio_context_t, boost::container::static_vector<::iocb*, 128>>;
 /// \brief describes a request that passes through the fair queue
 ///
 /// \related fair_queue
 struct fair_queue_request_descriptor {
+    alignas(cache_line_size) ::iocb iocb;
+    ::aio_context_t aio_context; ///< the aio_context under which we need to dispatch this request
     unsigned weight = 1; ///< the weight of this request for capacity purposes (IOPS).
     unsigned size = 1;        ///< the effective size of this request
     virtual void operator()() noexcept = 0; ///< function to be executed when the request is ready
     virtual ~fair_queue_request_descriptor() {}
-    fair_queue_request_descriptor(unsigned w, unsigned s) : weight(w), size(s) {}
+    fair_queue_request_descriptor(::aio_context_t ctx, unsigned w, unsigned s) : aio_context(ctx), weight(w), size(s) {}
 };
 
 /// \addtogroup io-module
@@ -275,7 +279,7 @@ public:
     }
 
     /// Try to execute new requests if there is capacity left in the queue.
-    void dispatch_requests() {
+    void dispatch_requests(iocb_map_per_context& iocb_map) {
         while (can_dispatch()) {
             auto ret = pop_priority_class();
             priority_class_ptr h = ret.ptr;
@@ -306,6 +310,7 @@ public:
             push_priority_class(h);
 
             (*req)();
+            iocb_map[req->aio_context].push_back(&req->iocb);
         }
     }
 

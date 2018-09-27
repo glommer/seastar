@@ -554,9 +554,6 @@ reactor::reactor(unsigned id)
     _task_queues.push_back(std::make_unique<task_queue>(1, "atexit", 1000));
     _at_destroy_tasks = _task_queues.back().get();
     seastar::thread_impl::init();
-    for (unsigned i = 0; i != max_aio; ++i) {
-        _free_iocbs.push(&_iocb_pool[i]);
-    }
     auto r = io_setup(max_aio, &_io_context);
     assert(r >= 0);
 #ifdef HAVE_OSV
@@ -1017,11 +1014,13 @@ void reactor_backend_epoll::complete_epoll_event(pollable_fd_state& pfd, promise
 static bool aio_nowait_supported = true;
 
 io_desc::io_desc()
-    : fair_queue_request_descriptor(0, 0)
+    : fair_queue_request_descriptor(0, 0, 0)
 {}
 
-io_desc::io_desc(priority_class_data& pclass, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit)
-    : fair_queue_request_descriptor(weight, size)
+io_desc::io_desc(priority_class_data& pclass, ::aio_context_t io_context,
+                 unsigned weight, unsigned size, semaphore_units<> permit,
+                 noncopyable_function<void(io_desc* desc)> submit)
+    : fair_queue_request_descriptor(io_context, weight, size)
     , _pclass(&pclass)
     , _submit(std::move(submit))
     , _owner(engine().cpu_id())
@@ -1031,6 +1030,8 @@ io_desc::io_desc(priority_class_data& pclass, unsigned weight, unsigned size, se
 void io_desc::notify_requests_finished() {
     _pclass->ioq_ptr->notify_requests_finished(*this);
     _pclass->free_io_desc(this);
+    _pclass->nr_queued--;
+    _queue_permit = {};
 }
 
 void io_desc::set_exception(std::exception_ptr eptr) {
@@ -1048,31 +1049,24 @@ future<io_event> io_desc::get_future() {
 }
 
 void io_desc::operator()() noexcept {
-    smp::submit_to(_owner, [this] {
-        _queue_permit = {};
-        try {
-            _submit(this);
-        } catch (...) {
-            set_exception(std::current_exception());
-            notify_requests_finished();
-        }
-    });
+    return _submit(this);
 }
 
 template <typename Func>
 void
-reactor::submit_io(io_desc* desc, Func prepare_io) {
-    iocb& io = *_free_iocbs.top();
-    _free_iocbs.pop();
-    prepare_io(io);
-    if (_aio_eventfd) {
-        set_eventfd_notification(io, _aio_eventfd->get_fd());
-    }
+io_desc::prepare_io(Func&& func) {
+    func(iocb);
     if (aio_nowait_supported) {
-        set_nowait(io, true);
+        set_nowait(iocb, true);
     }
-    set_user_data(io, desc);
-    _pending_aio.push_back(&io);
+    set_user_data(iocb, this);
+}
+
+void
+reactor::aio_set_eventfd_notification(io_desc* desc) {
+    if (_aio_eventfd) {
+        set_eventfd_notification(desc->iocb, _aio_eventfd->get_fd());
+    }
 }
 
 // Returns: number of iocbs consumed (0 or 1)
@@ -1088,7 +1082,6 @@ reactor::handle_aio_error(::iocb* iocb, int ec) {
             return 0;
         case EBADF: {
             auto desc = reinterpret_cast<io_desc*>(get_user_data(*iocb));
-            _free_iocbs.push(iocb);
             try {
                 throw std::system_error(EBADF, std::system_category());
             } catch (...) {
@@ -1106,27 +1099,33 @@ reactor::handle_aio_error(::iocb* iocb, int ec) {
 
 bool
 reactor::flush_pending_aio() {
+    iocb_map_per_context iocb_map = {};
+
     for (auto& ioq : _io_queues) {
-        ioq.second.poll_io_queue();
+        ioq.second.poll_io_queue(iocb_map);
     }
 
     bool did_work = false;
-    while (!_pending_aio.empty()) {
-        auto nr = _pending_aio.size();
-        auto iocbs = _pending_aio.data();
-        auto r = io_submit(_io_context, nr, iocbs);
-        size_t nr_consumed;
-        if (r == -1) {
-            nr_consumed = handle_aio_error(iocbs[0], errno);
-        } else {
-            nr_consumed = size_t(r);
-        }
+    for (auto& context: iocb_map) {
+        auto io_context = context.first;
+        auto& pending_aio = context.second;
+        while (!pending_aio.empty()) {
+            auto nr = pending_aio.size();
+            auto iocbs = pending_aio.data();
+            auto r = io_submit(io_context, nr, iocbs);
+            size_t nr_consumed;
+            if (r == -1) {
+                nr_consumed = handle_aio_error(iocbs[0], errno);
+            } else {
+                nr_consumed = size_t(r);
+            }
 
-        did_work = true;
-        if (nr_consumed == nr) {
-            _pending_aio.clear();
-        } else {
-            _pending_aio.erase(_pending_aio.begin(), _pending_aio.begin() + nr_consumed);
+            did_work = true;
+            if (nr_consumed == nr) {
+                pending_aio.clear();
+            } else {
+                pending_aio.erase(pending_aio.begin(), pending_aio.begin() + nr_consumed);
+            }
         }
     }
     if (!_pending_aio_retry.empty()) {
@@ -1185,7 +1184,6 @@ bool reactor::process_io()
             _pending_aio_retry.push_back(iocb);
             continue;
         }
-        _free_iocbs.push(iocb);
         auto desc = reinterpret_cast<io_desc*>(ev[i].data);
         desc->set_value(ev[i]);
     }
@@ -1307,11 +1305,11 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
             size = io_queue::read_request_base_count * len;
         }
 
-        auto desc = pclass.get_free_io_desc(pclass, weight, size, std::move(permit), [&pclass, start, prepare_io = std::move(prepare_io), this] (io_desc* desc) mutable {
-            pclass.nr_queued--;
+        auto desc = pclass.get_free_io_desc(pclass, engine()._io_context, weight, size, std::move(permit), [&pclass, start, this] (io_desc* desc) mutable {
             pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-            engine().submit_io(desc, std::move(prepare_io));
+            engine().aio_set_eventfd_notification(desc);
         });
+        desc->prepare_io(std::move(prepare_io));
 
         auto fut = desc->get_future();
         _fq->queue(pclass.ptr, desc);

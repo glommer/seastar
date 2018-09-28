@@ -198,10 +198,6 @@ protected:
         }[_config.type];;
     }
 
-   const sstring name() const {
-        return _config.name;
-    }
-
     request_type req_type() const {
         return _config.type;
     }
@@ -273,6 +269,14 @@ protected:
     }
 
 public:
+    const sstring name() const {
+        return _config.name;
+    }
+
+    float throughput() const {
+        return total_data() / total_duration().count();
+    }
+
     virtual sstring describe_class() = 0;
     virtual sstring describe_results() = 0;
 };
@@ -542,13 +546,17 @@ public:
         });
     }
 
-    void print_stats() {
+    std::unordered_map<sstring, float>
+    print_stats() {
+        std::unordered_map<sstring, float> data;
         fmt::print("Shard {:>2}\n", engine().cpu_id());
         auto idx = 0;
         for (auto& cl: _cl) {
             fmt::print("Class {:>2} ({})\n", idx++, cl->describe_class());
             fmt::print("{}\n", cl->describe_results());
+            data.emplace(cl->name(), cl->throughput());
         }
+        return data;
     }
 };
 
@@ -606,10 +614,19 @@ int main(int ac, char** av) {
             ctx.invoke_on_all([] (auto& c) {
                 return c.issue_requests();
             }).get();
+
+            std::unordered_map<sstring, uint64_t> summary_data;
             for (unsigned i = 0; i < smp::count; ++i) {
-                ctx.invoke_on(i, [] (auto& c) {
-                    c.print_stats();
-                }).get();
+                auto stats = ctx.invoke_on(i, [] (auto& c) {
+                    return c.print_stats();
+                }).get0();
+                for (auto& d : stats) {
+                    summary_data[d.first] += d.second;
+                }
+            }
+            fmt::print("Summary\n======\n");
+            for (auto& d : summary_data) {
+                fmt::print("Class {}, Total Throughput {} K/s\n", d.first, d.second >> 20);
             }
         }).or_terminate();
     });

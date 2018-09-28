@@ -537,19 +537,18 @@ public:
             return cl->issue_requests(std::chrono::steady_clock::now() + _duration).finally([this] {
                 _finished.signal(1);
             });
+        }).finally([this] {;
+            return _finished.wait(_cl.size());
         });
     }
 
-    future<> print_stats() {
-        return _finished.wait(_cl.size()).then([this] {
-            fmt::print("Shard {:>2}\n", engine().cpu_id());
-            auto idx = 0;
-            for (auto& cl: _cl) {
-                fmt::print("Class {:>2} ({})\n", idx++, cl->describe_class());
-                fmt::print("{}\n", cl->describe_results());
-            }
-            return make_ready_future<>();
-        });
+    void print_stats() {
+        fmt::print("Shard {:>2}\n", engine().cpu_id());
+        auto idx = 0;
+        for (auto& cl: _cl) {
+            fmt::print("Class {:>2} ({})\n", idx++, cl->describe_class());
+            fmt::print("{}\n", cl->describe_results());
+        }
     }
 };
 
@@ -609,7 +608,7 @@ int main(int ac, char** av) {
             }).get();
             for (unsigned i = 0; i < smp::count; ++i) {
                 ctx.invoke_on(i, [] (auto& c) {
-                    return c.print_stats();
+                    c.print_stats();
                 }).get();
             }
         }).or_terminate();

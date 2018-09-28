@@ -160,6 +160,7 @@ static io_queue_topology
 allocate_io_queues(hwloc_topology_t& topology, configuration c, std::vector<cpu> cpus) {
     unsigned depth = hwloc_get_type_depth(topology, HWLOC_OBJ_PACKAGE);
 
+    printf("package %d, depth %d\n", HWLOC_OBJ_PACKAGE, depth);
     unsigned num_io_queues = 0;
     // We will try to put one I/O queue per each physical package. But we also want to
     // keep a minimum bandwidth / iops per queue. So we will arrive here knowing what is
@@ -168,6 +169,7 @@ allocate_io_queues(hwloc_topology_t& topology, configuration c, std::vector<cpu>
     depth++;
     do {
         auto io_queue_placement = hwloc_get_depth_type(topology, --depth);
+        printf("placement %d, new depth %d\n", io_queue_placement, depth);
         num_io_queues = hwloc_get_nbobjs_by_type(topology, io_queue_placement);
     } while (num_io_queues >= c.max_io_queues);
 
@@ -203,6 +205,11 @@ allocate_io_queues(hwloc_topology_t& topology, configuration c, std::vector<cpu>
                 ret.shard_to_coordinator[shard] = io_coordinator;
             }
         }
+    }
+
+    printf("there are %ld io queues. Mapping:\n", ret.coordinators.size());
+    for (size_t i = 0; i < ret.shard_to_coordinator.size(); ++i) {
+        printf("\t%ld -> %d\n", i, ret.shard_to_coordinator[i]);
     }
     return ret;
 }

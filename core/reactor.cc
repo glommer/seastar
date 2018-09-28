@@ -1017,10 +1017,11 @@ io_desc::io_desc()
     : fair_queue_request_descriptor(0, 0, 0)
 {}
 
-io_desc::io_desc(priority_class_data& pclass, ::aio_context_t io_context,
+io_desc::io_desc(priority_class_data& pclass, size_t len, ::aio_context_t io_context,
                  unsigned weight, unsigned size, semaphore_units<> permit,
                  noncopyable_function<void(io_desc* desc)> submit)
     : fair_queue_request_descriptor(io_context, weight, size)
+    , _real_len(len)
     , _pclass(&pclass)
     , _submit(std::move(submit))
     , _owner(engine().cpu_id())
@@ -1031,6 +1032,8 @@ void io_desc::notify_requests_finished() {
     _pclass->ioq_ptr->notify_requests_finished(*this);
     _pclass->free_io_desc(this);
     _pclass->nr_queued--;
+    _pclass->bytes += _real_len;
+    _pclass->ops++;
     _queue_permit = {};
 }
 
@@ -1293,8 +1296,6 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
     auto& pclass = find_class(pc);
     pclass.nr_queued++;
     return get_units(pclass.sem, 1).then([this, start, &pclass, len, req_type, prepare_io = std::move(prepare_io)] (auto permit) mutable {
-        pclass.bytes += len;
-        pclass.ops++;
         unsigned weight;
         size_t size;
         if (req_type == io_queue::request_type::write) {
@@ -1305,7 +1306,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
             size = io_queue::read_request_base_count * len;
         }
 
-        auto desc = pclass.get_free_io_desc(pclass, engine()._io_context, weight, size, std::move(permit), [&pclass, start, this] (io_desc* desc) mutable {
+        auto desc = pclass.get_free_io_desc(pclass, len, engine()._io_context, weight, size, std::move(permit), [&pclass, start, this] (io_desc* desc) mutable {
             pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
             engine().aio_set_eventfd_notification(desc);
         });

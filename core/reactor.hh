@@ -539,6 +539,7 @@ inline open_flags operator|(open_flags a, open_flags b) {
 class priority_class_data;
 
 class io_desc : public fair_queue_request_descriptor  {
+    size_t _real_len;
     promise<io_event> _pr;
     priority_class_data* _pclass;
     noncopyable_function<void(io_desc* )> _submit;
@@ -548,7 +549,7 @@ class io_desc : public fair_queue_request_descriptor  {
     void notify_requests_finished();
 public:
     io_desc();
-    io_desc(priority_class_data& pclass, ::aio_context_t io_context, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit);
+    io_desc(priority_class_data& pclass, size_t len, ::aio_context_t io_context, unsigned weight, unsigned size, semaphore_units<> permit, noncopyable_function<void(io_desc* desc)> submit);
 
     void set_exception(std::exception_ptr eptr);
     void set_value(io_event& ev);

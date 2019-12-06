@@ -103,11 +103,16 @@ public:
         return _classes.size() - 1;
     }
 
-    void do_op(unsigned index, unsigned weight) {
+    void do_op(unsigned index, unsigned weight, timeout_clock::time_point timeout = no_timeout)  {
         auto cl = _classes[index];
         auto req = request(weight, index);
 
-        _fq.queue(cl, req.fqdesc, [this, index, req] () mutable noexcept {
+        _fq.queue(cl, req.fqdesc, [this, index, req] (std::exception_ptr eptr) mutable noexcept {
+            if (eptr) {
+                _exceptions[index].push_back(eptr);
+                return;
+            }
+
             try {
                 _inflight.push_back(std::move(req));
             } catch (...) {
@@ -115,7 +120,7 @@ public:
                 _exceptions[index].push_back(eptr);
                 _fq.notify_requests_finished(req.fqdesc);
             }
-        });
+        }, timeout);
     }
 
     void update_shares(unsigned index, uint32_t shares) {
@@ -148,7 +153,71 @@ public:
             BOOST_REQUIRE(_exceptions[i].size() == 0);
         }
     }
+
+    template <typename Exception>
+    void verify_exception(sstring name, int index, size_t expected_exp) {
+        fmt::print("{}: exp[{}] = {}\n", name, index, _exceptions[index].size());
+        BOOST_REQUIRE(_exceptions[index].size() == expected_exp);
+        for (auto&& exp : _exceptions[index]) {
+            BOOST_CHECK_THROW(std::rethrow_exception(exp), Exception);
+        }
+    }
 };
+
+// Requests should time out correctly.
+SEASTAR_TEST_CASE(test_fair_queue_timeout_past) {
+    return seastar::async([] {
+        test_env env(1);
+
+        auto a = env.register_priority_class(10);
+
+        env.do_op(a, 1, timeout_clock::now() - std::chrono::milliseconds(2));
+        // make sure to fire timers
+        later().get();
+        env.tick();
+        env.verify_exception<timeout_exception>("timeout_past", 0, 1);
+    });
+}
+
+SEASTAR_TEST_CASE(test_fair_queue_no_expire) {
+    return seastar::async([] {
+        test_env env(1);
+
+        auto a = env.register_priority_class(10);
+
+        env.do_op(a, 1, timeout_clock::now() + std::chrono::milliseconds(20));
+        sleep(2ms).get();
+        env.tick();
+        env.verify_exception<timeout_exception>("timeout_no_expire", 0, 0);
+    });
+}
+
+SEASTAR_TEST_CASE(test_fair_queue_timeout_future) {
+    return seastar::async([] {
+        test_env env(1);
+
+        auto a = env.register_priority_class(10);
+
+        env.do_op(a, 1, timeout_clock::now() + std::chrono::milliseconds(2));
+        sleep(100ms).get();
+        env.tick();
+        return env.verify_exception<timeout_exception>("timeout_future", 0, 1);
+    });
+}
+
+SEASTAR_TEST_CASE(test_fair_queue_partial_timeout) {
+    return seastar::async([] {
+        test_env env(1);
+
+        auto a = env.register_priority_class(10);
+
+        env.do_op(a, 1, timeout_clock::now() + std::chrono::milliseconds(2));
+        env.do_op(a, 1, timeout_clock::now() + std::chrono::milliseconds(2000));
+        sleep(100ms).get();
+        env.tick(2);
+        return env.verify_exception<timeout_exception>("timeout_partial", 0, 1);
+    });
+}
 
 // Equal ratios. Expected equal results.
 SEASTAR_TEST_CASE(test_fair_queue_equal_2classes) {

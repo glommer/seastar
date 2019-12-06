@@ -59,6 +59,10 @@ public:
         io_desc::set_exception(std::move(eptr));
     }
 
+    void set_early_exception(std::exception_ptr eptr) {
+        io_desc::set_exception(std::move(eptr));
+    }
+
     void set_value(io_event& ev) {
         notify_requests_finished();
         io_desc::set_value(ev);
@@ -241,16 +245,21 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, io_queue::reque
         auto desc = std::make_unique<io_desc_read_write>(this, weight, size);
         auto fq_desc = desc->fq_descriptor();
         auto fut = desc->get_future();
-        _fq.queue(pclass.ptr, std::move(fq_desc), [&pclass, start, prepare_io = std::move(prepare_io), desc = std::move(desc), len, this] () mutable noexcept {
-            try {
-                pclass.nr_queued--;
-                pclass.ops++;
-                pclass.bytes += len;
-                pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-                engine().submit_io(desc.get(), std::move(prepare_io));
-                desc.release();
-            } catch (...) {
-                desc->set_exception(std::current_exception());
+        _fq.queue(pclass.ptr, std::move(fq_desc), [&pclass, start, prepare_io = std::move(prepare_io), desc = std::move(desc), len, this] (std::exception_ptr ptr) mutable noexcept {
+            pclass.nr_queued--;
+
+            if (ptr) {
+                desc->set_early_exception(ptr);
+            } else {
+                try {
+                    pclass.ops++;
+                    pclass.bytes += len;
+                    pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
+                    engine().submit_io(desc.get(), std::move(prepare_io));
+                    desc.release();
+                } catch (...) {
+                    desc->set_exception(std::current_exception());
+                }
             }
         });
         return fut;

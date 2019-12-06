@@ -22,7 +22,8 @@
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/circular_buffer.hh>
+#include <seastar/core/expiring_fifo.hh>
+#include <seastar/core/timeout_clock.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <queue>
 #include <chrono>
@@ -41,20 +42,34 @@ struct fair_queue_request_descriptor {
 /// \addtogroup io-module
 /// @{
 
+class fair_queue;
+
 /// \cond internal
 class priority_class {
     struct request {
-        noncopyable_function<void()> func;
+        noncopyable_function<void(std::exception_ptr)> func;
         fair_queue_request_descriptor desc;
     };
     friend class fair_queue;
     uint32_t _shares = 0;
     float _accumulated = 0;
-    circular_buffer<request> _queue;
+
+    class expiry_handler {
+        fair_queue *_fq;
+    public:
+        void operator()(request& r) noexcept;
+        expiry_handler() = delete;
+        expiry_handler(fair_queue* fq) : _fq(fq) {}
+    };
+    expiring_fifo<request, expiry_handler, timeout_clock> _queue;
+
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
-    explicit priority_class(uint32_t shares) : _shares(std::max(shares, 1u)) {}
+    explicit priority_class(uint32_t shares, fair_queue *fq)
+        : _shares(std::max(shares, 1u))
+        , _queue(fq)
+    {}
 
     void update_shares(uint32_t shares) {
         _shares = (std::max(shares, 1u));
@@ -110,6 +125,7 @@ public:
     };
 private:
     friend priority_class;
+    friend priority_class::expiry_handler;
 
     struct class_compare {
         bool operator() (const priority_class_ptr& lhs, const priority_class_ptr& rhs) const {
@@ -137,6 +153,8 @@ private:
     void normalize_stats();
 
     bool can_dispatch() const;
+
+    void notify_request_retired();
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
@@ -176,10 +194,10 @@ public:
     ///
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
-    void queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func);
+    void queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void(std::exception_ptr)> func, timeout_clock::time_point timeout = no_timeout);
 
     /// Notifies that ont request finished
-    /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished.
+    /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished. Can only be called in a request that has already started executing
     void notify_requests_finished(fair_queue_request_descriptor& desc);
 
     /// Try to execute new requests if there is capacity left in the queue.

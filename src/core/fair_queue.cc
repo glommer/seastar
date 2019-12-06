@@ -31,6 +31,11 @@
 
 namespace seastar {
 
+void priority_class::expiry_handler::operator()(request& r) noexcept {
+    _fq->notify_request_retired();
+    r.func(make_exception_ptr(timeout_exception("waiting on the fair queue")));
+}
+
 void fair_queue::push_priority_class(priority_class_ptr pc) {
     if (!pc->_queued) {
         _handles.push(pc);
@@ -68,7 +73,7 @@ bool fair_queue::can_dispatch() const {
 }
 
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
-    priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
+    priority_class_ptr pclass = make_lw_shared<priority_class>(shares, this);
     _all_classes.insert(pclass);
     return pclass;
 }
@@ -86,13 +91,14 @@ size_t fair_queue::requests_currently_executing() const {
     return _requests_executing;
 }
 
-void fair_queue::queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
-    // We need to return a future in this function on which the caller can wait.
-    // Since we don't know which queue we will use to execute the next request - if ours or
-    // someone else's, we need a separate promise at this point.
+void fair_queue::queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void(std::exception_ptr)> func, timeout_clock::time_point timeout) {
     push_priority_class(pc);
-    pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
+    pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)}, timeout);
     _requests_queued++;
+}
+
+void fair_queue::notify_request_retired() {
+    _requests_queued--;
 }
 
 void fair_queue::notify_requests_finished(fair_queue_request_descriptor& desc) {
@@ -132,7 +138,7 @@ void fair_queue::dispatch_requests() {
         if (!h->_queue.empty()) {
             push_priority_class(h);
         }
-        req.func();
+        req.func(nullptr);
     }
 }
 

@@ -160,7 +160,6 @@ private:
 
     class io_pollfn;
     class signal_pollfn;
-    class aio_batch_submit_pollfn;
     class batch_flush_pollfn;
     class smp_pollfn;
     class drain_cross_cpu_freelist_pollfn;
@@ -171,7 +170,6 @@ private:
     class execution_stage_pollfn;
     friend io_pollfn;
     friend signal_pollfn;
-    friend aio_batch_submit_pollfn;
     friend batch_flush_pollfn;
     friend smp_pollfn;
     friend drain_cross_cpu_freelist_pollfn;

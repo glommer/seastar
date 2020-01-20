@@ -2252,7 +2252,7 @@ class reactor::io_pollfn final : public reactor::pollfn {
 public:
     io_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() override final {
-        return _r.process_io();
+        return _r.process_io() | _r.flush_pending_aio();
     }
     virtual bool pure_poll() override final {
         return poll(); // actually performs work, but triggers no user continuations, so okay
@@ -2307,25 +2307,6 @@ public:
     batch_flush_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() final override {
         return _r.flush_tcp_batches();
-    }
-    virtual bool pure_poll() override final {
-        return poll(); // actually performs work, but triggers no user continuations, so okay
-    }
-    virtual bool try_enter_interrupt_mode() override {
-        // This is a passive poller, so if a previous poll
-        // returned false (idle), there's no more work to do.
-        return true;
-    }
-    virtual void exit_interrupt_mode() override final {
-    }
-};
-
-class reactor::aio_batch_submit_pollfn final : public reactor::pollfn {
-    reactor& _r;
-public:
-    aio_batch_submit_pollfn(reactor& r) : _r(r) {}
-    virtual bool poll() final override {
-        return _r.flush_pending_aio();
     }
     virtual bool pure_poll() override final {
         return poll(); // actually performs work, but triggers no user continuations, so okay
@@ -2649,7 +2630,6 @@ int reactor::run() {
 #ifndef HAVE_OSV
     io_poller = poller(std::make_unique<io_pollfn>(*this));
 #endif
-    poller aio_poller(std::make_unique<aio_batch_submit_pollfn>(*this));
 
     poller batch_flush_poller(std::make_unique<batch_flush_pollfn>(*this));
     poller execution_stage_poller(std::make_unique<execution_stage_pollfn>());

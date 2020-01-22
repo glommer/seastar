@@ -26,12 +26,16 @@
 #include <seastar/core/internal/pollable_fd.hh>
 #include <seastar/core/internal/poll.hh>
 #include <seastar/core/linux-aio.hh>
+#include <seastar/core/cacheline.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/internal/io_request.hh>
 #include <sys/time.h>
 #include <signal.h>
 #include <thread>
 #include <stack>
 #include <boost/any.hpp>
 #include <boost/program_options.hpp>
+#include <boost/container/static_vector.hpp>
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
@@ -40,6 +44,47 @@
 namespace seastar {
 
 class reactor;
+class io_desc;
+
+class aio_storage_context {
+public:
+    static constexpr unsigned max_aio = 1024;
+
+    class aio_storage_context_pollfn : public seastar::pollfn {
+        aio_storage_context* _ctx;
+    public:
+        virtual bool poll() override;
+        virtual bool pure_poll() override;
+        virtual bool try_enter_interrupt_mode() override;
+        virtual void exit_interrupt_mode() override;
+        explicit aio_storage_context_pollfn(aio_storage_context* ctx) : _ctx(ctx) {}
+    };
+
+    explicit aio_storage_context(reactor *r);
+    ~aio_storage_context();
+
+    void submit_io(io_desc* desc, internal::io_request req);
+
+    std::unique_ptr<seastar::pollfn> create_poller();
+private:
+    reactor* _r;
+    internal::linux_abi::aio_context_t _io_context;
+
+    size_t handle_aio_error(internal::linux_abi::iocb* iocb, int ec);
+    bool flush_pending_aio();
+    bool process_io();
+
+    alignas(cache_line_size) std::array<internal::linux_abi::iocb, max_aio> _iocb_pool;
+    semaphore _sem{0};
+    std::stack<internal::linux_abi::iocb*, boost::container::static_vector<internal::linux_abi::iocb*, max_aio>> _free_iocbs;
+
+    future<internal::linux_abi::iocb*> get_one();
+    void put_one(internal::linux_abi::iocb* io);
+    unsigned outstanding() const;
+
+    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio;
+    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio_retry;
+};
 
 // The "reactor_backend" interface provides a method of waiting for various
 // basic events on one thread. We have one implementation based on epoll and
@@ -68,6 +113,9 @@ public:
     virtual void reset_preemption_monitor() = 0;
     virtual void request_preemption() = 0;
     virtual void start_handling_signal() = 0;
+
+    virtual std::unique_ptr<pollfn> create_backend_poller() = 0;
+    virtual void submit_io(io_desc* desc, internal::io_request req) = 0;
 };
 
 // reactor backend using file-descriptor & epoll, suitable for running on
@@ -84,6 +132,7 @@ private:
             promise<> pollable_fd_state::* pr, int event);
     void complete_epoll_event(pollable_fd_state& fd,
             promise<> pollable_fd_state::* pr, int events, int event);
+    aio_storage_context _aio_storage_context;
 public:
     explicit reactor_backend_epoll(reactor* r);
     virtual ~reactor_backend_epoll() override;
@@ -99,6 +148,9 @@ public:
     virtual void reset_preemption_monitor() override;
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;
+
+    virtual std::unique_ptr<pollfn> create_backend_poller() override;
+    virtual void submit_io(io_desc* desc, internal::io_request req) override;
 };
 
 class reactor_backend_aio : public reactor_backend {
@@ -118,6 +170,8 @@ class reactor_backend_aio : public reactor_backend {
     };
     context _preempting_io{2}; // Used for the timer tick and the high resolution timer
     context _polling_io{max_polls}; // FIXME: unify with disk aio_context
+    aio_storage_context _aio_storage_context;
+
     file_desc _steady_clock_timer = make_timerfd();
     internal::linux_abi::iocb _task_quota_timer_iocb;
     internal::linux_abi::iocb _timerfd_iocb;
@@ -161,6 +215,9 @@ public:
     virtual void reset_preemption_monitor() override;
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;
+
+    virtual std::unique_ptr<pollfn> create_backend_poller() override;
+    virtual void submit_io(io_desc* desc, internal::io_request req) override;
 };
 
 #ifdef HAVE_OSV
@@ -181,6 +238,8 @@ public:
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual void forget(pollable_fd_state& fd) override;
     void enable_timer(steady_clock_type::time_point when);
+    virtual std::unique_ptr<pollfn> create_backend_poller() override;
+    virtual void submit_io(io_desc* desc, internal::io_request req) override;
 };
 #endif /* HAVE_OSV */
 

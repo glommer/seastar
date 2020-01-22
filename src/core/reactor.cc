@@ -164,36 +164,6 @@ namespace seastar {
 seastar::logger seastar_logger("seastar");
 seastar::logger sched_logger("scheduler");
 
-reactor::iocb_pool::iocb_pool() {
-    for (unsigned i = 0; i != max_aio; ++i) {
-        _free_iocbs.push(&_iocb_pool[i]);
-    }
-    _sem.signal(max_aio);
-}
-
-inline
-future<internal::linux_abi::iocb*>
-reactor::iocb_pool::get_one() {
-    return _sem.wait(1).then([this] {
-        auto io = _free_iocbs.top();
-        _free_iocbs.pop();
-        return io;
-    });
-}
-
-inline
-void
-reactor::iocb_pool::put_one(internal::linux_abi::iocb* io) {
-    _free_iocbs.push(io);
-    _sem.signal(1);
-}
-
-inline
-unsigned
-reactor::iocb_pool::outstanding() const {
-    return max_aio - _free_iocbs.size();
-}
-
 io_priority_class
 reactor::register_one_priority_class(sstring name, uint32_t shares) {
     return io_queue::register_one_priority_class(std::move(name), shares);
@@ -521,7 +491,7 @@ constexpr unsigned reactor::max_queues;
 constexpr unsigned reactor::max_aio_per_queue;
 
 // Broken (returns spurious EIO). Cause/fix unknown.
-static bool aio_nowait_supported = false;
+bool aio_nowait_supported = false;
 
 static bool sched_debug() {
     return false;
@@ -869,7 +839,6 @@ reactor::reactor(unsigned id, reactor_backend_selector rbs, reactor_config cfg)
 #endif
     , _cpu_started(0)
     , _cpu_stall_detector(std::make_unique<cpu_stall_detector>(this))
-    , _io_context(0)
     , _reuseport(posix_reuseport_detect())
     , _thread_pool(std::make_unique<thread_pool>(this, seastar::format("syscall-{}", id))) {
     /*
@@ -885,7 +854,6 @@ reactor::reactor(unsigned id, reactor_backend_selector rbs, reactor_config cfg)
     seastar::thread_impl::init();
     _backend->start_tick();
 
-    setup_aio_context(max_aio, &_io_context);
 #ifdef HAVE_OSV
     _timer_thread.start();
 #else
@@ -919,7 +887,6 @@ reactor::~reactor() {
     eraser(_expired_timers);
     eraser(_expired_lowres_timers);
     eraser(_expired_manual_timers);
-    io_destroy(_io_context);
     for (auto&& tq : _task_queues) {
         if (tq) {
             // The following line will preserve the convention that constructor and destructor functions
@@ -1435,28 +1402,8 @@ reactor::connect(socket_address sa, socket_address local, transport proto) {
     return _network_stack->connect(sa, local, proto);
 }
 
-void prepare_iocb(io_request& req, iocb& iocb) {
-    switch (req.opcode()) {
-    case io_request::operation::fdatasync:
-        iocb = make_fdsync_iocb(req.fd());
-        break;
-    case io_request::operation::write:
-        iocb = make_write_iocb(req.fd(), req.pos(), req.address(), req.size());
-        break;
-    case io_request::operation::writev:
-        iocb = make_writev_iocb(req.fd(), req.pos(), reinterpret_cast<const iovec*>(req.address()), req.size());
-        break;
-    case io_request::operation::read:
-        iocb = make_read_iocb(req.fd(), req.pos(), req.address(), req.size());
-        break;
-    case io_request::operation::readv:
-        iocb = make_readv_iocb(req.fd(), req.pos(), reinterpret_cast<const iovec*>(req.address()), req.size());
-        break;
-    }
-}
-
 sstring io_request::opname() const {
-    switch (_op) {
+   switch (_op) {
     case io_request::operation::fdatasync:
         return "fdatasync";
     case io_request::operation::write:
@@ -1473,46 +1420,7 @@ sstring io_request::opname() const {
 
 void
 reactor::submit_io(io_desc* desc, io_request req) {
-  // We can ignore the future returned here, because the submitted aio will be polled
-  // for and completed in process_io().
-  (void)_iocb_pool.get_one().then([this, desc, req = std::move(req)] (linux_abi::iocb* iocb) mutable {
-    auto& io = *iocb;
-    prepare_iocb(req, io);
-    if (_aio_eventfd) {
-        set_eventfd_notification(io, _aio_eventfd->get_fd());
-    }
-    if (aio_nowait_supported) {
-        set_nowait(io, true);
-    }
-    set_user_data(io, desc);
-    _pending_aio.push_back(&io);
-  });
-}
-
-// Returns: number of iocbs consumed (0 or 1)
-size_t
-reactor::handle_aio_error(linux_abi::iocb* iocb, int ec) {
-    switch (ec) {
-        case EAGAIN:
-            return 0;
-        case EBADF: {
-            auto desc = reinterpret_cast<io_desc*>(get_user_data(*iocb));
-            _iocb_pool.put_one(iocb);
-            try {
-                throw std::system_error(EBADF, std::system_category());
-            } catch (...) {
-                desc->set_exception(std::current_exception());
-            }
-            delete desc;
-            // if EBADF, it means that the first request has a bad fd, so
-            // we will only remove it from _pending_aio and try again.
-            return 1;
-        }
-        default:
-            ++_io_stats.aio_errors;
-            throw_system_error_on(true, "io_submit");
-            abort();
-    }
+  _backend->submit_io(desc, std::move(req));
 }
 
 bool
@@ -1523,42 +1431,6 @@ reactor::flush_pending_aio() {
         did_work |= ioq->poll_io_queue();
     }
 
-    while (!_pending_aio.empty()) {
-        auto nr = _pending_aio.size();
-        auto iocbs = _pending_aio.data();
-        auto r = io_submit(_io_context, nr, iocbs);
-        size_t nr_consumed;
-        if (r == -1) {
-            nr_consumed = handle_aio_error(iocbs[0], errno);
-        } else {
-            nr_consumed = size_t(r);
-        }
-
-        did_work = true;
-        if (nr_consumed == nr) {
-            _pending_aio.clear();
-        } else {
-            _pending_aio.erase(_pending_aio.begin(), _pending_aio.begin() + nr_consumed);
-        }
-    }
-    if (!_pending_aio_retry.empty()) {
-        auto retries = std::exchange(_pending_aio_retry, {});
-        // FIXME: future is discarded
-        (void)_thread_pool->submit<syscall_result<int>>([this, retries] () mutable {
-            auto r = io_submit(_io_context, retries.size(), retries.data());
-            return wrap_syscall<int>(r);
-        }).then([this, retries] (syscall_result<int> result) {
-            auto iocbs = retries.data();
-            size_t nr_consumed = 0;
-            if (result.result == -1) {
-                nr_consumed = handle_aio_error(iocbs[0], result.error);
-            } else {
-                nr_consumed = result.result;
-            }
-            std::copy(retries.begin() + nr_consumed, retries.end(), std::back_inserter(_pending_aio_retry));
-        });
-        did_work = true;
-    }
     return did_work;
 }
 
@@ -1581,37 +1453,6 @@ reactor::submit_io_write(io_queue* ioq, const io_priority_class& pc, size_t len,
     ++_io_stats.aio_writes;
     _io_stats.aio_write_bytes += len;
     return ioq->queue_request(pc, len, std::move(req));
-}
-
-bool reactor::process_io()
-{
-    io_event ev[max_aio];
-    struct timespec timeout = {0, 0};
-    auto n = io_getevents(_io_context, 1, max_aio, ev, &timeout, _force_io_getevents_syscall);
-    if (n == -1 && errno == EINTR) {
-        n = 0;
-    }
-    assert(n >= 0);
-    unsigned nr_retry = 0;
-    for (size_t i = 0; i < size_t(n); ++i) {
-        auto iocb = get_iocb(ev[i]);
-        if (ev[i].res == -EAGAIN) {
-            ++nr_retry;
-            set_nowait(*iocb, false);
-            _pending_aio_retry.push_back(iocb);
-            continue;
-        }
-        _iocb_pool.put_one(iocb);
-        auto desc = reinterpret_cast<io_desc*>(ev[i].data);
-        try {
-            this->handle_io_result(ev[i].res);
-            desc->set_value(size_t(ev[i].res));
-        } catch (...) {
-            desc->set_exception(std::current_exception());
-        }
-        delete desc;
-    }
-    return n;
 }
 
 namespace internal {
@@ -2252,18 +2093,13 @@ class reactor::io_pollfn final : public reactor::pollfn {
 public:
     io_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() override final {
-        return _r.process_io() | _r.flush_pending_aio();
+        return _r.flush_pending_aio();
     }
     virtual bool pure_poll() override final {
         return poll(); // actually performs work, but triggers no user continuations, so okay
     }
     virtual bool try_enter_interrupt_mode() override {
-        // Because aio depends on polling, it cannot generate events to wake us up, Therefore, sleep
-        // is only possible if there are no in-flight aios. If there are, we need to keep polling.
-        //
-        // Alternatively, if we enabled _aio_eventfd, we can always enter
-        unsigned executing = _r._iocb_pool.outstanding();
-        return executing == 0 || _r._aio_eventfd;
+        return true;
     }
     virtual void exit_interrupt_mode() override {
         // nothing to do
@@ -2618,7 +2454,6 @@ int reactor::run() {
 
     register_metrics();
 
-    compat::optional<poller> io_poller = {};
     compat::optional<poller> smp_poller = {};
 
     // I/O Performance greatly increases if the smp poller runs before the I/O poller. This is
@@ -2627,9 +2462,9 @@ int reactor::run() {
     if (smp::count > 1) {
         smp_poller = poller(std::make_unique<smp_pollfn>(*this));
     }
-#ifndef HAVE_OSV
-    io_poller = poller(std::make_unique<io_pollfn>(*this));
-#endif
+
+    poller io_poller(std::make_unique<io_pollfn>(*this));
+    poller backend_poller(_backend->create_backend_poller());
 
     poller batch_flush_poller(std::make_unique<batch_flush_pollfn>(*this));
     poller execution_stage_poller(std::make_unique<execution_stage_pollfn>());

@@ -183,7 +183,8 @@ public:
     void notify_requests_finished(fair_queue_request_descriptor& desc);
 
     /// Try to execute new requests if there is capacity left in the queue.
-    void dispatch_requests();
+    /// \return the number of requests dispatched.
+    size_t dispatch_requests();
 
     /// Updates the current shares of this priority class
     ///

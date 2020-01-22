@@ -133,8 +133,8 @@ public:
     }
 
     // Dispatch requests that are pending in the I/O queue
-    void poll_io_queue() {
-        _fq.dispatch_requests();
+    size_t poll_io_queue() {
+        return _fq.dispatch_requests();
     }
 
     sstring mountpoint() const {

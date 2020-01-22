@@ -1481,11 +1481,12 @@ reactor::handle_aio_error(linux_abi::iocb* iocb, int ec) {
 
 bool
 reactor::flush_pending_aio() {
+    bool did_work = false;
+
     for (auto& ioq : my_io_queues) {
-        ioq->poll_io_queue();
+        did_work |= ioq->poll_io_queue();
     }
 
-    bool did_work = false;
     while (!_pending_aio.empty()) {
         auto nr = _pending_aio.size();
         auto iocbs = _pending_aio.data();

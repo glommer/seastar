@@ -102,7 +102,8 @@ void fair_queue::notify_requests_finished(fair_queue_request_descriptor& desc) {
 }
 
 
-void fair_queue::dispatch_requests() {
+size_t fair_queue::dispatch_requests() {
+    size_t dispatched = 0;
     while (can_dispatch()) {
         priority_class_ptr h;
         do {
@@ -115,6 +116,7 @@ void fair_queue::dispatch_requests() {
         _req_count_executing += req.desc.weight;
         _bytes_count_executing += req.desc.size;
         _requests_queued--;
+        dispatched++;
 
         auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
         auto req_cost  = (float(req.desc.weight) / _config.max_req_count + float(req.desc.size) / _config.max_bytes_count) / h->_shares;
@@ -134,6 +136,7 @@ void fair_queue::dispatch_requests() {
         }
         req.func();
     }
+    return dispatched;
 }
 
 void fair_queue::update_shares(priority_class_ptr pc, uint32_t new_shares) {

@@ -153,6 +153,7 @@ public:
     friend class reactor;
 private:
     config _config;
+    bool _iopoll_available = false;
     static fair_queue::config make_fair_queue_config(config cfg);
 };
 

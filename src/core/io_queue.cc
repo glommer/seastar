@@ -33,6 +33,7 @@
 #include "core/io_desc.hh"
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include <sys/vfs.h>
 
 namespace seastar {
 
@@ -79,8 +80,20 @@ fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
 io_queue::io_queue(io_queue::config cfg)
     : _priority_classes()
     , _fq(make_fair_queue_config(cfg))
-    , _config(std::move(cfg)) {
-}
+    , _config(std::move(cfg))
+    , _iopoll_available([this] {
+        struct statfs fs_buf;
+        if (_config.mountpoint == "undefined") {
+            return false;
+        }
+        auto ret = statfs(_config.mountpoint.c_str(), &fs_buf);
+        // XFS doesn't support I/O poll in all kernels. However we'll
+        // not go into details here and trust that whoever wants to use
+        // iopoll checks if they are in a kernel with high enough
+        // functionality (uring)
+        return ((ret >= 0) && (fs_buf.f_type == 0x58465342));
+    }())
+{}
 
 io_queue::~io_queue() {
     // It is illegal to stop the I/O queue with pending requests.
@@ -242,6 +255,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, internal::io_re
         } else {
             throw std::runtime_error(fmt::format("Unrecognized request passing through I/O queue {} ", req.opname()));
         }
+        req._iopoll_available = _iopoll_available;
 
         auto desc = std::make_unique<io_desc_read_write>(this, weight, size);
         auto fq_desc = desc->fq_descriptor();

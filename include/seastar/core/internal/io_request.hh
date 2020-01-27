@@ -23,8 +23,11 @@
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/linux-aio.hh>
+#include <seastar/core/internal/liburing.hh>
 
 namespace seastar {
+class io_queue;
+
 namespace internal {
 
 class io_request {
@@ -35,6 +38,9 @@ public:
     uint64_t _pos;
     void *_address;
     size_t _size;
+    bool _iopoll_available = false;
+    friend class io_queue;
+
     io_request(operation op, int fd, uint64_t pos, void* address, size_t size)
         : _op(op)
         , _fd(fd)
@@ -72,6 +78,10 @@ public:
 
     size_t size() const {
         return _size;
+    }
+
+    bool device_supports_iopoll() const {
+        return _iopoll_available;
     }
 
     static io_request make_read(int fd, uint64_t pos, void *address, size_t size) {

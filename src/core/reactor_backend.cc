@@ -24,6 +24,7 @@
 #include "core/syscall_result.hh"
 #include <seastar/core/print.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/internal/liburing.hh>
 #include <seastar/util/defer.hh>
 #include <chrono>
 #include <sys/poll.h>
@@ -35,9 +36,14 @@
 
 namespace seastar {
 
+namespace internal {
+bool io_uring_preempt = false;
+}
+
 using namespace std::chrono_literals;
 using namespace internal;
 using namespace internal::linux_abi;
+
 
 aio_storage_context::aio_storage_context(reactor *r)
     : _r(r)
@@ -757,9 +763,47 @@ static bool detect_aio_poll() {
     return r == 1;
 }
 
+using namespace seastar::internal;
+
+static bool detect_uring() {
+
+    linux_abi::io_uring_probe probe;
+    try {
+        uring_interrupt_context ctx;
+        probe = ctx.probe();
+    } catch (std::system_error& e) {
+        return false;
+    }
+
+    std::array<uint8_t, 10> opcodes_of_interest = {
+        IORING_OP_READV,
+        IORING_OP_READ,
+        IORING_OP_READ_FIXED,
+        IORING_OP_WRITEV,
+        IORING_OP_WRITE,
+        IORING_OP_WRITE_FIXED,
+        IORING_OP_FSYNC,
+        IORING_OP_FALLOCATE,
+        IORING_OP_OPENAT,
+        IORING_OP_CLOSE,
+    };
+
+    for (auto& op : opcodes_of_interest) {
+        if (probe.last_op < op) {
+            return false;
+        }
+        if (~probe.ops[op].flags & 1) {
+            return false;
+        }
+    }
+    return true;
+}
 
 std::unique_ptr<reactor_backend> reactor_backend_selector::create(reactor* r) {
-    if (_name == "linux-aio") {
+    if (_name == "linux-uring") {
+        io_uring_preempt = true;
+        return std::make_unique<reactor_backend_uring>(r);
+    } else if (_name == "linux-aio") {
         return std::make_unique<reactor_backend_aio>(r);
     } else if (_name == "epoll") {
         return std::make_unique<reactor_backend_epoll>(r);
@@ -773,11 +817,387 @@ reactor_backend_selector reactor_backend_selector::default_backend() {
 
 std::vector<reactor_backend_selector> reactor_backend_selector::available() {
     std::vector<reactor_backend_selector> ret;
+    if (detect_uring()) {
+        ret.push_back(reactor_backend_selector("linux-uring"));
+    }
+
     if (detect_aio_poll()) {
         ret.push_back(reactor_backend_selector("linux-aio"));
     }
     ret.push_back(reactor_backend_selector("epoll"));
     return ret;
+}
+
+
+// FIXME : make it compile without liburing
+reactor_backend_uring::uring_pollfn::uring_pollfn(reactor_backend_uring* b)
+    : _backend(b)
+{}
+
+static constexpr uint64_t io_desc_poll_type = (1ull << 63);
+static constexpr uint64_t static_eventfd_poll_type = (1ull << 62);
+static constexpr uint64_t promise_poll_type = (1ull << 61);
+
+static constexpr uint64_t type_mask = io_desc_poll_type
+                                    | static_eventfd_poll_type
+                                    | promise_poll_type;
+
+bool reactor_backend_uring::uring_pollfn::poll() {
+    _backend->_must_resubmit = false;
+    bool did_work = _backend->_irq_ctx.poll([this] (io_uring_cqe* cqe) {
+                return _backend->process_one_cqe(cqe);
+            }) |
+           _backend->_poll_ctx.poll([this] (io_uring_cqe* cqe) {
+                return _backend->process_one_cqe(cqe);
+            });
+
+    if (_backend->_must_resubmit) {
+        _backend->_must_resubmit = false;
+        _backend->_irq_ctx.flush();
+    }
+    // We need to not only read the current values, but issue new polls
+    // so we can read completions again.
+    did_work |= _backend->service_preempting_io();
+    _backend->reset_preemption_monitor();
+    return did_work;
+}
+
+void reactor_backend_uring::process_one_cqe(io_uring_cqe* cqe) {
+    uint64_t type = cqe->user_data & type_mask;
+    uint64_t addr = cqe->user_data & ~type_mask;
+    fmt::print("ADdr {:x}, type: {:x}, cqe {:x}, result {}\n", addr, type, uint64_t(cqe), cqe->res);
+    if (type == io_desc_poll_type) {
+        io_desc* desc = reinterpret_cast<io_desc*>(addr);
+        try {
+            _r->handle_io_result(cqe->res);
+            desc->set_value(size_t(cqe->res));
+        } catch (...) {
+            desc->set_exception(std::current_exception());
+        }
+    } else if (type == static_eventfd_poll_type) {
+        _must_resubmit = true;
+        if (int(addr) == _steady_clock_timer.get()) {
+            process_timerfd();
+        }
+        if (int(addr) == _r->_notify_eventfd.get()) {
+            // My idea for re-registering here is that we always should have a poller for this,
+            // but just one. We don't poll before going to sleep, so just re-set here.
+            process_smp_wakeup();
+            register_poll(_r->_notify_eventfd.get());
+        }
+#if 0
+        if (int(addr) == _r->_task_quota_timer.get()) {
+            process_task_quota_timer();
+        }
+#endif
+    } else if (type == promise_poll_type) {
+        if (addr) {
+            promise<>* pr = reinterpret_cast<promise<>*>(addr);
+            pr->set_value();
+        }
+    } else {
+        std::abort();
+    }
+}
+
+void reactor_backend_uring::register_poll(int fd) {
+    auto new_sqe = _irq_ctx.get_sqe();
+    io_uring_prep_poll_add(new_sqe, fd, POLLIN);
+    uint64_t data = fd;
+    data |= static_eventfd_poll_type;
+    io_uring_sqe_set_data(new_sqe, reinterpret_cast<void*>(data));
+}
+
+void reactor_backend_uring::unregister_poll(int fd) {
+    auto sqe = _irq_ctx.get_sqe();
+    io_uring_prep_poll_remove(sqe, reinterpret_cast<void*>(fd));
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_eventfd_poll_type));
+}
+
+bool reactor_backend_uring::uring_pollfn::pure_poll() {
+    return _backend->_poll_ctx.nr_pending() > 0;
+}
+bool reactor_backend_uring::uring_pollfn::try_enter_interrupt_mode() {
+    return _backend->_poll_ctx.nr_pending() == 0;
+}
+
+void reactor_backend_uring::uring_pollfn::exit_interrupt_mode() {
+}
+
+reactor_backend_uring::reactor_backend_uring(reactor* r)
+    : _r(r)
+{
+//    fmt::print("Created uring backend, notify fd {:x}\n", _r->_notify_eventfd.get());
+//    replenish(_steady_clock_timer.get());
+    register_poll(_r->_notify_eventfd.get());
+
+    setup_aio_context(2, &_io_context);
+    _task_quota_timer_iocb = make_poll_iocb(_r->_task_quota_timer.get(), POLLIN);
+    _timerfd_iocb = make_poll_iocb(_steady_clock_timer.get(), POLLIN);
+//    replenish(_r->_task_quota_timer.get());
+
+    // Protect against spurious wakeups - if we get notified that the timer has
+    // expired when it really hasn't, we don't want to block in read(tfd, ...).
+    auto tfd = _r->_task_quota_timer.get();
+    ::fcntl(tfd, F_SETFL, ::fcntl(tfd, F_GETFL) | O_NONBLOCK);
+
+    sigset_t mask = make_sigset_mask(hrtimer_signal());
+    auto e = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    assert(e == 0);
+}
+
+void reactor_backend_uring::process_timerfd() {
+    uint64_t expirations = 0;
+    _steady_clock_timer.read(&expirations, 8);
+    if (expirations) {
+        _r->service_highres_timer();
+    }
+}
+
+void reactor_backend_uring::process_smp_wakeup() {
+    uint64_t ignore = 0;
+    _r->_notify_eventfd.read(&ignore, 8);
+}
+
+void reactor_backend_uring::process_task_quota_timer() {
+    uint64_t v;
+    (void)_r->_task_quota_timer.read(&v, 8);
+}
+
+file_desc reactor_backend_uring::make_timerfd() {
+    return file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK);
+}
+
+void reactor_backend_uring::signal_received(int signo, siginfo_t* siginfo, void* ignore) {
+    engine()._signals.action(signo, siginfo, ignore);
+}
+
+bool reactor_backend_uring::wait_and_process(int timeout, const sigset_t* active_sigmask) {
+    bool did_work = service_preempting_io();
+    if (did_work) {
+        timeout = 0;
+    }
+
+    // FIXME: confirm: because this is just a go-to-sleep routine for io_uring, we know that the
+    // pollers were called already and there is no need to call any io_uring_submit before we wait -
+    // also make sure that maybe sync_wait is doing that already anyway.
+    timespec ts {};
+    if (timeout) {
+       ts = posix::to_timespec(timeout * 1ms);
+    }
+
+    register_poll(_steady_clock_timer.get());
+    // tell the kernel we're now waiting for the timer eventfd in our
+    // interface
+    _irq_ctx.flush();
+
+    // FIXME: we probably have to wait for the timer here, because otherwise we'd have to wait
+    // synchronously on two things
+//    io_uring_cqe *cqe = _irq_ctx.sync_wait(timeout > 0 ? &ts : nullptr, active_sigmask);
+    _irq_ctx.sync_wait(timeout > 0 ? &ts : nullptr, active_sigmask);
+    // FIXME: cqe can be null here, understand why and also if we really can rely on just the next
+    // poll
+//    assert(cqe);
+    // may benefit from further cleanup, need to understand this a bit better
+    // FIXME: may not be needed if we don't call peek cqe;
+    _irq_ctx.poll([this] (io_uring_cqe* cqe) {
+        return process_one_cqe(cqe);
+    });
+//    fmt::print("poll returned\n");
+    _poll_ctx.poll([this] (io_uring_cqe* cqe) {
+       return process_one_cqe(cqe);
+    });
+
+    // since we're awake, the timer is once more the responsibility of the
+    // getevents interface
+    unregister_poll(_steady_clock_timer.get());
+    reset_preemption_monitor(); // clear task quota timer
+//    fmt::print("irq returned\n");
+    return true;
+}
+
+future<> reactor_backend_uring::poll(pollable_fd_state& fd, promise<> pollable_fd_state::*promise_field, int events) {
+    try {
+        if (events & fd.events_known) {
+            fd.events_known &= ~events;
+            return make_ready_future<>();
+        }
+
+        auto sqe = _irq_ctx.get_sqe();
+        io_uring_prep_poll_add(sqe, fd.fd.get(), events);
+        fd.events_rw = events == (POLLIN|POLLOUT);
+
+        auto pr = &(fd.*promise_field);
+        *pr = promise<>();
+
+        auto data = reinterpret_cast<uint64_t>(pr) | promise_poll_type;
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(data));
+        return pr->get_future();
+    } catch (...) {
+        return make_exception_future<>(std::current_exception());
+    }
+}
+
+future<> reactor_backend_uring::readable(pollable_fd_state& fd) {
+    return poll(fd, &pollable_fd_state::pollin, POLLIN);
+}
+
+future<> reactor_backend_uring::writeable(pollable_fd_state& fd) {
+    return poll(fd, &pollable_fd_state::pollout, POLLOUT);
+}
+
+future<> reactor_backend_uring::readable_or_writeable(pollable_fd_state& fd) {
+    return poll(fd, &pollable_fd_state::pollin, POLLIN|POLLOUT);
+}
+
+void reactor_backend_uring::forget(pollable_fd_state& fd) {
+    auto sqe = _irq_ctx.get_sqe();
+    io_uring_prep_poll_remove(sqe, reinterpret_cast<void*>(fd.fd.get()));
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(promise_poll_type));
+}
+
+void reactor_backend_uring::start_tick() {
+    // see aio implementation for details
+    g_need_preempt = reinterpret_cast<const preemption_monitor*>(_io_context + 8);
+}
+
+void reactor_backend_uring::stop_tick() {
+    g_need_preempt = &_r->_preemption_monitor;
+}
+
+void reactor_backend_uring::arm_highres_timer(const ::itimerspec& its) {
+    _steady_clock_timer.timerfd_settime(TFD_TIMER_ABSTIME, its);
+}
+
+// FIXME: find a way to share this code
+bool reactor_backend_uring::service_preempting_io() {
+    linux_abi::io_event a[2];
+    auto r = io_getevents(_io_context, 0, 2, a, 0);
+    assert(r != -1);
+    bool did_work = false;
+    for (unsigned i = 0; i != unsigned(r); ++i) {
+        if (get_iocb(a[i]) == &_task_quota_timer_iocb) {
+            //fmt::print("got a task quota\n");
+            _task_quota_timer_in_preempting_io = false;
+            process_task_quota_timer();
+        } else if (get_iocb(a[i]) == &_timerfd_iocb) {
+            //fmt::print("got a timerfd\n");
+            _timerfd_in_preempting_io = false;
+            process_timerfd();
+            did_work = true;
+        }
+    }
+    return did_work;
+}
+
+void reactor_backend_uring::reset_preemption_monitor() {
+    service_preempting_io();
+    iocb* submit_queue[2];
+    int nr = 0;
+//    fmt::print("preempting reseting\n");
+    if (!_timerfd_in_preempting_io) {
+//        fmt::print("first\n");
+        _timerfd_in_preempting_io = true;
+        submit_queue[nr++] = &_timerfd_iocb;
+    }
+
+    if (!_task_quota_timer_in_preempting_io) {
+  //      fmt::print("second\n");
+        _task_quota_timer_in_preempting_io = true;
+        submit_queue[nr++] = &_task_quota_timer_iocb;
+    }
+
+    if (nr) {
+        //fmt::print("io submit on {}\n", nr);
+        // FIXME: check return
+        io_submit(_io_context, nr, submit_queue);
+    }
+}
+
+void reactor_backend_uring::request_preemption() {
+    // FIXME: ioring NOP ? Will that go to the kernel ?
+    // Maybe we should indeed read everything in a 64-bit integer, and
+    // then request preemption just changes the addr of g_need_preempt to
+    // some variable of ours
+    // FIXME: tomorrow I will do this with a syscall, just to get the whole
+    // thing working. Then send a patch to adjust need_preempt
+    //fmt::print("request preempt: ignored\n");
+    // FIXME: share the code below somehow
+
+    ::itimerspec expired = {};
+    expired.it_value.tv_nsec = 1;
+    arm_highres_timer(expired); // will trigger immediately, triggering the preemption monitor
+
+    // This might have been called from poll_once. If that is the case, we cannot assume that timerfd is being
+    // monitored.
+    if (!_timerfd_in_preempting_io) {
+        iocb* submit_queue[1];
+        _task_quota_timer_in_preempting_io = true;
+        // FIXME: check return
+        io_submit(_io_context, 1, submit_queue);
+    }
+
+    // The kernel is not obliged to deliver the completion immediately, so wait for it
+    while (!need_preempt()) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+}
+
+void reactor_backend_uring::start_handling_signal() {
+    // The uring backend only uses SIGHUP/SIGTERM/SIGINT (same as aio). We don't need to handle them right away and our
+    // implementation of request_preemption is not signal safe, so do nothing.
+}
+
+std::unique_ptr<pollfn> reactor_backend_uring::create_backend_poller() {
+    return std::make_unique<uring_pollfn>(this);
+}
+
+void prepare_sqe(io_request& req, io_uring_sqe& sqe) {
+    switch (req.opcode()) {
+    case io_request::operation::write:
+        io_uring_prep_write(&sqe, req.fd(), req.address(), req.size(), req.pos());
+        break;
+    case io_request::operation::writev:
+        io_uring_prep_writev(&sqe, req.fd(), reinterpret_cast<const iovec*>(req.address()), req.size(), req.pos());
+        break;
+    case io_request::operation::read:
+        io_uring_prep_read(&sqe, req.fd(), req.address(), req.size(), req.pos());
+        break;
+    case io_request::operation::readv:
+        io_uring_prep_readv(&sqe, req.fd(), reinterpret_cast<const iovec*>(req.address()), req.size(), req.pos());
+        break;
+    case io_request::operation::fdatasync:
+        io_uring_prep_fsync(&sqe, req.fd(), IORING_FSYNC_DATASYNC);
+        break;
+    }
+}
+
+void reactor_backend_uring::submit_io(io_desc* desc, internal::io_request req) {
+    io_uring_sqe *sqe;
+
+    // FIXME: may need a semaphore here protecting the sqe list.
+    // Axboe:
+    // n. Normally an application would ask for a ring of a given size, and the
+    // assumption may be that this size corresponds directly to how many requests the application can have pending in the
+    // kernel. However, since the sqe lifetime is only that of the actual submission of it, it's possible for the application to
+    // drive a higher pending request count than the SQ ring size would indicate. The application must take care not to do so,
+    // or it could risk overflowing the CQ ring. By default, the CQ ring is twice the size of the SQ ring. This allows the
+    // application some amount of flexibility in managing this aspect, but it doesn't completely remove the need to do so. If
+    // the application does violate this restriction, it will be tracked as an overflow condition in the CQ ring. More details on
+    // that later.
+    //
+    // Summary: there is no need to make sure there is room in the sqe queue if we submit often
+    // enough, but must make sure the cqe ring won't overflow.
+    if (req.device_supports_iopoll() && (req.is_read() || req.is_write())) {
+        sqe = _poll_ctx.get_sqe();
+    } else {
+        sqe = _irq_ctx.get_sqe();
+    }
+
+    prepare_sqe(req, *sqe);
+    auto data = reinterpret_cast<uint64_t>(desc) | io_desc_poll_type;
+    fmt::print("Submitting I/O {:x}\n", data);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(data));
 }
 
 }

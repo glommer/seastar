@@ -21,6 +21,7 @@
 
 #pragma once
 #include <atomic>
+#include <seastar/core/internal/liburing.hh>
 
 namespace seastar {
 
@@ -34,6 +35,7 @@ struct preemption_monitor {
     std::atomic<uint32_t> tail;
 };
 
+extern bool io_uring_preempt;
 }
 
 extern __thread const internal::preemption_monitor* g_need_preempt;

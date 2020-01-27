@@ -182,6 +182,7 @@ private:
     friend class internal::reactor_stall_sampler;
     friend class reactor_backend_epoll;
     friend class reactor_backend_aio;
+    friend class reactor_backend_uring;
     friend class aio_storage_context;
 public:
     class poller {

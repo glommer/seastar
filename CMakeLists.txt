@@ -203,6 +203,10 @@ option (Seastar_HWLOC
   "Enable hwloc support."
   ON)
 
+option (Seastar_URING
+  "Enable liburing support."
+  ON)
+
 set (Seastar_JENKINS
   ""
   CACHE
@@ -830,6 +834,17 @@ if (Seastar_HWLOC)
     PRIVATE hwloc::hwloc)
 endif ()
 
+if (Seastar_URING)
+  if (NOT uring_FOUND)
+    message (FATAL_ERROR "`uring` support is enabled but it is not available!")
+  endif ()
+
+  list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_URING)
+
+  target_link_libraries (seastar
+    PRIVATE uring::uring)
+endif ()
+
 if (Seastar_LD_FLAGS)
   # In newer versions of CMake, there is `target_link_options`.
   target_link_libraries (seastar
@@ -1111,6 +1126,7 @@ if (Seastar_INSTALL)
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findcryptopp.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Finddpdk.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findhwloc.cmake
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Finduring.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findlksctp-tools.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findlz4.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findnumactl.cmake

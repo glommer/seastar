@@ -25,6 +25,7 @@
 #include <seastar/core/posix.hh>
 #include <seastar/core/internal/pollable_fd.hh>
 #include <seastar/core/internal/poll.hh>
+#include <seastar/core/internal/liburing.hh>
 #include <seastar/core/linux-aio.hh>
 #include <seastar/core/cacheline.hh>
 #include <seastar/core/semaphore.hh>
@@ -145,6 +146,60 @@ public:
     virtual void start_tick() override;
     virtual void stop_tick() override;
     virtual void arm_highres_timer(const ::itimerspec& ts) override;
+    virtual void reset_preemption_monitor() override;
+    virtual void request_preemption() override;
+    virtual void start_handling_signal() override;
+
+    virtual std::unique_ptr<pollfn> create_backend_poller() override;
+    virtual void submit_io(io_desc* desc, internal::io_request req) override;
+};
+
+class reactor_backend_uring : public reactor_backend {
+    reactor* _r;
+    internal::uring_polling_context _poll_ctx;
+    internal::uring_interrupt_context _irq_ctx;
+    internal::linux_abi::aio_context_t _io_context{}; // for timers.
+
+    file_desc _steady_clock_timer = make_timerfd();
+    internal::linux_abi::iocb _task_quota_timer_iocb;
+    internal::linux_abi::iocb _timerfd_iocb;
+    bool _task_quota_timer_in_preempting_io = false;
+    bool _timerfd_in_preempting_io = false;
+    bool service_preempting_io();
+
+    class uring_pollfn: public seastar::pollfn {
+        reactor_backend_uring* _backend;
+    public:
+        explicit uring_pollfn(reactor_backend_uring* b);
+        virtual bool poll() override;
+        virtual bool pure_poll() override;
+        virtual bool try_enter_interrupt_mode() override;
+        virtual void exit_interrupt_mode() override;
+    };
+
+    static file_desc make_timerfd();
+    void process_timerfd();
+    void process_smp_wakeup();
+    void process_task_quota_timer();
+
+    void process_one_cqe(io_uring_cqe* cqe);
+    bool _must_resubmit = false;
+
+    io_uring_sqe* _timerfd_sqe = nullptr;
+    void register_poll(int fd);
+    void unregister_poll(int fd);
+public:
+    explicit reactor_backend_uring(reactor* r);
+    virtual bool wait_and_process(int timeout, const sigset_t* active_sigmask) override;
+    future<> poll(pollable_fd_state& fd, promise<> pollable_fd_state::*promise_field, int events);
+    virtual future<> readable(pollable_fd_state& fd) override;
+    virtual future<> writeable(pollable_fd_state& fd) override;
+    virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+    virtual void forget(pollable_fd_state& fd) override;
+    virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
+    virtual void start_tick() override;
+    virtual void stop_tick() override;
+    virtual void arm_highres_timer(const ::itimerspec& its) override;
     virtual void reset_preemption_monitor() override;
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;

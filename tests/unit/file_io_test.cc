@@ -80,6 +80,66 @@ SEASTAR_TEST_CASE(file_access_test) {
     });
 }
 
+SEASTAR_THREAD_TEST_CASE(testv) {
+    auto f = open_file_dma("testfile.tmp", open_flags::rw | open_flags::create).get0();
+//    auto f = open_file_dma("/var/lib/scylla2/testfile.tmp", open_flags::rw | open_flags::create).get0();
+    std::vector<iovec> iovecs;
+    std::vector<iovec> riovecs;
+
+    auto wbuf = allocate_aligned_buffer<unsigned char>(4096, 4096);
+    std::fill(wbuf.get(), wbuf.get() + 4096, 1);
+    auto wb = wbuf.get();
+
+    iovec v;
+    v.iov_base = wb;
+    v.iov_len = 4096;
+    iovecs.push_back(std::move(v));
+    
+    auto size = f.dma_write(0, std::move(iovecs)).get0();
+    fmt::print("WSize {}\n", size);
+
+    f.flush().get();
+
+    auto rbuf = allocate_aligned_buffer<unsigned char>(4096, 4096);
+    auto rb = rbuf.get();
+
+    iovec rv;
+    rv.iov_base = rb;
+    rv.iov_len = 1024;
+    iovecs.push_back(std::move(rv));
+
+    size = f.dma_read(0, std::move(riovecs)).get0();
+    fmt::print("RSize {}\n", size);
+    fmt::print("first element:{}\n", uint64_t(rb[0]));
+    f.close().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(testx) {
+    auto f = open_file_dma("testfile.tmp", open_flags::rw | open_flags::create).get0();
+//    auto f = open_file_dma("/var/lib/scylla2/testfile.tmp", open_flags::rw | open_flags::create).get0();
+
+    auto wbuf = allocate_aligned_buffer<unsigned char>(4096, 4096);
+    std::fill(wbuf.get(), wbuf.get() + 4096, 1);
+    auto wb = wbuf.get();
+
+   
+    auto size = f.dma_write(0, wb, 4096).get0();
+    fmt::print("W2Size {}\n", size);
+
+    f.flush().get();
+
+    auto rbuf = allocate_aligned_buffer<unsigned char>(4096, 4096);
+    auto rb = rbuf.get();
+
+
+    size = f.dma_read(0, rb, 4096).get0();
+    fmt::print("R2Size {}\n", size);
+    fmt::print("first element:{}\n", uint64_t(rb[0]));
+    f.close().get();
+}
+
+
+#if 0
 struct file_test {
     file_test(file&& f) : f(std::move(f)) {}
     file f;
@@ -87,10 +147,11 @@ struct file_test {
     semaphore par = { 1000 };
 };
 
+
 SEASTAR_TEST_CASE(test1) {
     // Note: this tests generates a file "testfile.tmp" with size 4096 * max (= 40 MB).
     static constexpr auto max = 10000;
-    return open_file_dma("testfile.tmp", open_flags::rw | open_flags::create).then([] (file f) {
+    return open_file_dma("/var/lib/scylla2/testfile.tmp", open_flags::rw | open_flags::create).then([] (file f) {
         auto ft = new file_test{std::move(f)};
         for (size_t i = 0; i < max; ++i) {
             // Don't wait for future, use semaphore to signal when done instead.
@@ -98,13 +159,17 @@ SEASTAR_TEST_CASE(test1) {
                 auto wbuf = allocate_aligned_buffer<unsigned char>(4096, 4096);
                 std::fill(wbuf.get(), wbuf.get() + 4096, i);
                 auto wb = wbuf.get();
+                fmt::print("dma write for one\n");
                 (void)ft->f.dma_write(i * 4096, wb, 4096).then(
                         [ft, i, wbuf = std::move(wbuf)] (size_t ret) mutable {
+
+                    fmt::print("now read  for one\n");
                     BOOST_REQUIRE(ret == 4096);
                     auto rbuf = allocate_aligned_buffer<unsigned char>(4096, 4096);
                     auto rb = rbuf.get();
                     (void)ft->f.dma_read(i * 4096, rb, 4096).then(
                             [ft, rbuf = std::move(rbuf), wbuf = std::move(wbuf)] (size_t ret) mutable {
+                        fmt::print("done the read\n");
                         BOOST_REQUIRE(ret == 4096);
                         BOOST_REQUIRE(std::equal(rbuf.get(), rbuf.get() + 4096, wbuf.get()));
                         ft->sem.signal(1);
@@ -114,8 +179,10 @@ SEASTAR_TEST_CASE(test1) {
             });
         }
         return ft->sem.wait(max).then([ft] () mutable {
+            std::cout << "try flush\n";
             return ft->f.flush();
         }).then([ft] {
+            std::cout << "try close\n";
             return ft->f.close();
         }).then([ft] () mutable {
             std::cout << "done\n";
@@ -123,7 +190,9 @@ SEASTAR_TEST_CASE(test1) {
         });
     });
 }
+#endif
 
+#if 0
 SEASTAR_TEST_CASE(parallel_write_fsync) {
     return internal::report_reactor_stalls([] {
         return async([] {
@@ -451,3 +520,4 @@ SEASTAR_THREAD_TEST_CASE(test_recursive_touch_directory_permissions) {
 
     umask(orig_umask);
 }
+#endif

@@ -1485,13 +1485,22 @@ reactor::open_file_dma(sstring name, open_flags flags, file_open_options options
         // Because open() with O_DIRECT will fail, we open it without O_DIRECT, try
         // to update it to O_DIRECT with fcntl(), and if that fails, see if we
         // can forgive it.
-        auto is_tmpfs = [] (int fd) {
+        enum class filesystems { tmpfs, xfs, other };
+
+        auto probe_fs = [] (int fd) {
             struct ::statfs buf;
             auto r = ::fstatfs(fd, &buf);
             if (r == -1) {
-                return false;
+                return filesystems::other;
             }
-            return buf.f_type == 0x01021994; // TMPFS_MAGIC
+            switch (buf.f_type) {
+            case 0x01021994:
+                return filesystems::tmpfs;
+            case 0x58465342:
+                return filesystems::xfs;
+            default:
+                return filesystems::other;
+            }
         };
         auto open_flags = O_CLOEXEC | static_cast<int>(flags);
         auto mode = static_cast<mode_t>(options.create_permissions);
@@ -1499,9 +1508,11 @@ reactor::open_file_dma(sstring name, open_flags flags, file_open_options options
         if (fd == -1) {
             return wrap_syscall<int>(fd);
         }
+        auto fs = probe_fs(fd);
+
         int r = ::fcntl(fd, F_SETFL, open_flags | O_DIRECT);
         auto maybe_ret = wrap_syscall<int>(r);  // capture errno (should be EINVAL)
-        if (r == -1  && strict_o_direct && !is_tmpfs(fd)) {
+        if (r == -1  && strict_o_direct && !(fs == filesystems::tmpfs)) {
             ::close(fd);
             return maybe_ret;
         }

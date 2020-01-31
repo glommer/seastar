@@ -1511,7 +1511,6 @@ reactor::handle_aio_error(linux_abi::iocb* iocb, int ec) {
             } catch (...) {
                 desc->set_exception(std::current_exception());
             }
-            delete desc;
             // if EBADF, it means that the first request has a bad fd, so
             // we will only remove it from _pending_aio and try again.
             return 1;
@@ -1610,13 +1609,7 @@ bool reactor::process_io()
         }
         _iocb_pool.put_one(iocb);
         auto desc = reinterpret_cast<io_desc*>(ev[i].data);
-        try {
-            this->handle_io_result(ev[i].res);
-            desc->set_value(size_t(ev[i].res));
-        } catch (...) {
-            desc->set_exception(std::current_exception());
-        }
-        delete desc;
+        desc->set_value(size_t(ev[i].res));
     }
     return n;
 }

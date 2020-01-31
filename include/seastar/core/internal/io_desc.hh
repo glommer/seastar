@@ -26,10 +26,16 @@
 
 namespace seastar {
 
-class io_desc {
-    promise<size_t> _pr;
+class kernel_completion {
 protected:
-    ~io_desc() = default;
+    ~kernel_completion() = default;
+public:
+    virtual void set_exception(std::exception_ptr eptr) = 0;
+    virtual void set_value(size_t res) = 0;
+};
+
+class promise_io_desc : public kernel_completion {
+    promise<size_t> _pr;
 public:
     virtual void set_exception(std::exception_ptr eptr) {
         _pr.set_exception(std::move(eptr));

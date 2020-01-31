@@ -1480,7 +1480,7 @@ sstring io_request::opname() const {
 }
 
 void
-reactor::submit_io(io_desc* desc, io_request req) {
+reactor::submit_io(kernel_completion* desc, io_request req) {
   // We can ignore the future returned here, because the submitted aio will be polled
   // for and completed in process_io().
   (void)_iocb_pool.get_one().then([this, desc, req = std::move(req)] (linux_abi::iocb* iocb) mutable {
@@ -1504,7 +1504,7 @@ reactor::handle_aio_error(linux_abi::iocb* iocb, int ec) {
         case EAGAIN:
             return 0;
         case EBADF: {
-            auto desc = reinterpret_cast<io_desc*>(get_user_data(*iocb));
+            auto desc = reinterpret_cast<kernel_completion*>(get_user_data(*iocb));
             _iocb_pool.put_one(iocb);
             try {
                 throw std::system_error(EBADF, std::system_category());
@@ -1608,7 +1608,7 @@ bool reactor::process_io()
             continue;
         }
         _iocb_pool.put_one(iocb);
-        auto desc = reinterpret_cast<io_desc*>(ev[i].data);
+        auto desc = reinterpret_cast<kernel_completion*>(ev[i].data);
         desc->set_value(size_t(ev[i].res));
     }
     return n;
@@ -1914,7 +1914,7 @@ reactor::fdatasync(int fd) {
     }
     if (_have_aio_fsync) {
         try {
-            auto desc = std::make_unique<io_desc>();
+            auto desc = std::make_unique<promise_io_desc>();
             auto fut = desc->get_future();
 
             auto req = io_request::make_fdatasync(fd);

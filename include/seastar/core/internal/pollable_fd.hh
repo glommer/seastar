@@ -25,6 +25,7 @@
 #include <seastar/core/posix.hh>
 #include <vector>
 #include <tuple>
+#include <seastar/core/internal/io_desc.hh>
 
 namespace seastar {
 
@@ -58,8 +59,10 @@ public:
     int events_requested = 0; // wanted by pollin/pollout promises
     int events_epoll = 0;     // installed in epoll
     int events_known = 0;     // returned from epoll
-    promise<> pollin;
-    promise<> pollout;
+
+    promise_io_desc pollin;
+    promise_io_desc pollout;
+
     friend class reactor;
     friend class pollable_fd;
 

@@ -38,6 +38,9 @@ public:
         _pr.set_value(res);
     }
 
+    virtual void destroy() {
+    }
+
     future<size_t> get_future() {
         return _pr.get_future();
     }

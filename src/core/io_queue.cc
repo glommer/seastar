@@ -62,8 +62,17 @@ public:
     }
 
     void set_value(size_t ret) {
-        notify_requests_finished();
-        io_desc::set_value(ret);
+        try {
+            engine().handle_io_result(long(ret));
+            notify_requests_finished();
+            io_desc::set_value(ret);
+        } catch (...) {
+            set_exception(std::current_exception());
+        }
+    }
+
+    void destroy() override {
+        delete this;
     }
 };
 

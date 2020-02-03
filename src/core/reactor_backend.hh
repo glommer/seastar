@@ -48,12 +48,14 @@ class reactor;
 class reactor_backend {
 public:
     virtual ~reactor_backend() {};
-    // wait_and_process() waits for some events to become available, and
+    // wait_and_process_fd_notifications() waits for some events to become available, and
     // processes one or more of them. If block==false, it doesn't wait,
     // and just processes events that have already happened, if any.
     // After the optional wait, just before processing the events, the
     // pre_process() function is called.
-    virtual bool wait_and_process(int timeout = -1, const sigset_t* active_sigmask = nullptr) = 0;
+    virtual bool wait_and_process_fd_notifications() = 0;
+    virtual void sleep_interruptible(const sigset_t* active_sigmask = nullptr) = 0;
+
     // Methods that allow polling on file descriptors. This will only work on
     // reactor_backend_epoll. Other reactor_backend will probably abort if
     // they are called (which is fine if no file descriptors are waited on):
@@ -84,10 +86,12 @@ private:
             pollable_fd_state_completion* desc, int event);
     void complete_epoll_event(pollable_fd_state& fd,
             pollable_fd_state_completion* desc, int events, int event);
+    bool wait_and_process(int timeout, const sigset_t* active_sigmask);
 public:
     explicit reactor_backend_epoll(reactor* r);
     virtual ~reactor_backend_epoll() override;
-    virtual bool wait_and_process(int timeout, const sigset_t* active_sigmask) override;
+    virtual bool wait_and_process_fd_notifications() override;
+    virtual void sleep_interruptible(const sigset_t* active_sigmask) override;
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
@@ -136,19 +140,10 @@ private:
     void process_smp_wakeup();
     bool service_preempting_io();
     bool await_events(int timeout, const sigset_t* active_sigmask);
-private:
-    class io_poll_poller : public seastar::pollfn {
-        reactor_backend_aio* _backend;
-    public:
-        explicit io_poll_poller(reactor_backend_aio* b);
-        virtual bool poll() override;
-        virtual bool pure_poll() override;
-        virtual bool try_enter_interrupt_mode() override;
-        virtual void exit_interrupt_mode() override;
-    };
 public:
     explicit reactor_backend_aio(reactor* r);
-    virtual bool wait_and_process(int timeout, const sigset_t* active_sigmask) override;
+    virtual bool wait_and_process_fd_notifications() override;
+    virtual void sleep_interruptible(const sigset_t* active_sigmask) override;
     future<> poll(pollable_fd_state& fd, pollable_fd_state_completion* desc, int events);
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
@@ -176,7 +171,8 @@ private:
 public:
     reactor_backend_osv();
     virtual ~reactor_backend_osv() override { }
-    virtual bool wait_and_process() override;
+    virtual bool wait_and_process_fd_notifications() override;
+    virtual void sleep_interruptible(const sigset_t* active_sigmask) override;
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual void forget(pollable_fd_state& fd) override;

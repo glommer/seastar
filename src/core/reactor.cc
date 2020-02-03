@@ -939,10 +939,6 @@ reactor::~reactor() {
     }
 }
 
-bool reactor::wait_and_process(int timeout, const sigset_t* active_sigmask) {
-    return _backend->wait_and_process(timeout, active_sigmask);
-}
-
 future<> reactor::readable(pollable_fd_state& fd) {
     return _backend->readable(fd);
 }
@@ -1527,7 +1523,10 @@ reactor::flush_pending_aio() {
     for (auto& ioq : my_io_queues) {
         ioq->poll_io_queue();
     }
+    return false;
+}
 
+bool reactor::kernel_events_submit() {
     bool did_work = false;
     while (!_pending_aio.empty()) {
         auto nr = _pending_aio.size();
@@ -1589,7 +1588,7 @@ reactor::submit_io_write(io_queue* ioq, const io_priority_class& pc, size_t len,
     return ioq->queue_request(pc, len, std::move(req));
 }
 
-bool reactor::process_io()
+bool reactor::gather_kernel_events_completions()
 {
     io_event ev[max_aio];
     struct timespec timeout = {0, 0};
@@ -1612,6 +1611,15 @@ bool reactor::process_io()
         desc->set_value(ev[i].res);
     }
     return n;
+}
+
+bool reactor::kernel_events_can_sleep() const {
+    // Because aio depends on polling, it cannot generate events to wake us up, Therefore, sleep
+    // is only possible if there are no in-flight aios. If there are, we need to keep polling.
+    //
+    // Alternatively, if we enabled _aio_eventfd, we can always enter
+    unsigned executing = _iocb_pool.outstanding();
+    return executing == 0 || _aio_eventfd;
 }
 
 namespace internal {
@@ -2273,23 +2281,18 @@ reactor::do_check_lowres_timers() const {
 
 #ifndef HAVE_OSV
 
-class reactor::io_pollfn final : public reactor::pollfn {
+class reactor::kernel_events_submission_pollfn final : public reactor::pollfn {
     reactor& _r;
 public:
-    io_pollfn(reactor& r) : _r(r) {}
+    kernel_events_submission_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() override final {
-        return _r.process_io();
+        return _r.kernel_events_submit();
     }
     virtual bool pure_poll() override final {
         return poll(); // actually performs work, but triggers no user continuations, so okay
     }
     virtual bool try_enter_interrupt_mode() override {
-        // Because aio depends on polling, it cannot generate events to wake us up, Therefore, sleep
-        // is only possible if there are no in-flight aios. If there are, we need to keep polling.
-        //
-        // Alternatively, if we enabled _aio_eventfd, we can always enter
-        unsigned executing = _r._iocb_pool.outstanding();
-        return executing == 0 || _r._aio_eventfd;
+        return true;
     }
     virtual void exit_interrupt_mode() override {
         // nothing to do
@@ -2346,10 +2349,27 @@ public:
     }
 };
 
-class reactor::aio_batch_submit_pollfn final : public reactor::pollfn {
+class reactor::kernel_events_completion_pollfn final : public reactor::pollfn {
     reactor& _r;
 public:
-    aio_batch_submit_pollfn(reactor& r) : _r(r) {}
+    kernel_events_completion_pollfn(reactor& r) : _r(r) {}
+    virtual bool poll() final override {
+        return _r.gather_kernel_events_completions();
+    }
+    virtual bool pure_poll() override final {
+        return poll(); // actually performs work, but triggers no user continuations, so okay
+    }
+    virtual bool try_enter_interrupt_mode() override {
+        return _r.kernel_events_can_sleep();
+    }
+    virtual void exit_interrupt_mode() override final {
+    }
+};
+
+class reactor::io_queue_submission_pollfn final : public reactor::pollfn {
+    reactor& _r;
+public:
+    io_queue_submission_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() final override {
         return _r.flush_pending_aio();
     }
@@ -2506,7 +2526,7 @@ class reactor::epoll_pollfn final : public reactor::pollfn {
 public:
     epoll_pollfn(reactor& r) : _r(r) {}
     virtual bool poll() final override {
-        return _r.wait_and_process();
+        return _r._backend->wait_and_process_fd_notifications();
     }
     virtual bool pure_poll() override final {
         return poll(); // actually performs work, but triggers no user continuations, so okay
@@ -2666,16 +2686,29 @@ int reactor::run() {
     compat::optional<poller> io_poller = {};
     compat::optional<poller> smp_poller = {};
 
-    // I/O Performance greatly increases if the smp poller runs before the I/O poller. This is
-    // because requests that were just added can be polled and processed by the I/O poller right
-    // away.
+    // The order in which we execute the pollers is very important for performance.
+    //
+    // This is because events that are generated in one poller may feed work into others. If
+    // they were reversed, we'd only be able to do that work in the next task quota.
+    //
+    // One example is the relationship between the smp poller and the I/O submission poller:
+    // If the smp poller runs first, requests from remote I/O queues can be dispatched right away
+    //
+    // We will run the pollers in the following order:
+    //
+    // 1. SMP: any remote event arrives before anything else
+    // 2. file notifications: a file descriptor becoming ready may allow us to do I/O
+    // 3. kernel events completion: completing kernel events may allow us to submit more.
+    // 4. I/O queue: if some of the events that completed are I/O, we will be able to submit more
+    // 5. kernel submission: if the I/O queue generated submissions, now is the time to send them
     if (smp::count > 1) {
         smp_poller = poller(std::make_unique<smp_pollfn>(*this));
     }
-#ifndef HAVE_OSV
-    io_poller = poller(std::make_unique<io_pollfn>(*this));
-#endif
-    poller aio_poller(std::make_unique<aio_batch_submit_pollfn>(*this));
+
+    poller file_notifications_poller(std::make_unique<epoll_pollfn>(*this));
+    poller kernel_events_completion_poller(std::make_unique<kernel_events_completion_pollfn>(*this));
+    poller io_queue_submission_poller(std::make_unique<io_queue_submission_pollfn>(*this));
+    poller kernel_events_submission_poller(std::make_unique<kernel_events_submission_pollfn>(*this));
 
     poller batch_flush_poller(std::make_unique<batch_flush_pollfn>(*this));
     poller execution_stage_poller(std::make_unique<execution_stage_pollfn>());
@@ -2834,16 +2867,11 @@ reactor::sleep() {
             return;
         }
     }
-    wait_and_process(-1, &_active_sigmask);
+
+    _backend->sleep_interruptible(&_active_sigmask);
+
     for (auto i = _pollers.rbegin(); i != _pollers.rend(); ++i) {
         (*i)->exit_interrupt_mode();
-    }
-}
-
-void
-reactor::start_epoll() {
-    if (!_epoll_poller) {
-        _epoll_poller = poller(std::make_unique<epoll_pollfn>(*this));
     }
 }
 

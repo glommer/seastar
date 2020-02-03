@@ -63,24 +63,6 @@ void reactor_backend_aio::context::flush() {
     }
 }
 
-reactor_backend_aio::io_poll_poller::io_poll_poller(reactor_backend_aio* b) : _backend(b) {
-}
-
-bool reactor_backend_aio::io_poll_poller::poll() {
-    return _backend->wait_and_process(0, nullptr);
-}
-
-bool reactor_backend_aio::io_poll_poller::pure_poll() {
-    return _backend->wait_and_process(0, nullptr);
-}
-
-bool reactor_backend_aio::io_poll_poller::try_enter_interrupt_mode() {
-    return true;
-}
-
-void reactor_backend_aio::io_poll_poller::exit_interrupt_mode() {
-}
-
 linux_abi::iocb* reactor_backend_aio::new_iocb() {
     if (_iocb_pool.empty()) {
         return new linux_abi::iocb;
@@ -198,7 +180,12 @@ reactor_backend_aio::reactor_backend_aio(reactor* r) : _r(r) {
     assert(e == 0);
 }
 
-bool reactor_backend_aio::wait_and_process(int timeout, const sigset_t* active_sigmask) {
+bool reactor_backend_aio::wait_and_process_fd_notifications() {
+    return await_events(0, nullptr);
+}
+
+void reactor_backend_aio::sleep_interruptible(const sigset_t* active_sigmask) {
+    int timeout = -1;
     bool did_work = service_preempting_io();
     if (did_work) {
         timeout = 0;
@@ -206,15 +193,11 @@ bool reactor_backend_aio::wait_and_process(int timeout, const sigset_t* active_s
     _polling_io.replenish(&_timerfd_iocb, _timerfd_in_polling_io);
     _polling_io.replenish(&_smp_wakeup_iocb, _smp_wakeup_in_polling_io);
     _polling_io.flush();
-    did_work |= await_events(timeout, active_sigmask);
-    did_work |= service_preempting_io(); // clear task quota timer
-    return did_work;
+    await_events(timeout, active_sigmask);
+    service_preempting_io(); // clear task quota timer
 }
 
 future<> reactor_backend_aio::poll(pollable_fd_state& fd, pollable_fd_state_completion* desc, int events) {
-    if (!_r->_epoll_poller) {
-        _r->_epoll_poller = reactor::poller(std::make_unique<io_poll_poller>(this));
-    }
     try {
         if (events & fd.events_known) {
             fd.events_known &= ~events;
@@ -382,6 +365,14 @@ reactor_backend_epoll::wait_and_process(int timeout, const sigset_t* active_sigm
     return nr;
 }
 
+bool reactor_backend_epoll::wait_and_process_fd_notifications() {
+    return wait_and_process(0, nullptr);
+}
+
+void reactor_backend_epoll::sleep_interruptible(const sigset_t* active_sigmask) {
+    wait_and_process(-1 , active_sigmask);
+}
+
 void reactor_backend_epoll::complete_epoll_event(pollable_fd_state& pfd,
         pollable_fd_state_completion* desc,
         int events, int event) {
@@ -416,7 +407,6 @@ future<> reactor_backend_epoll::get_epoll_future(pollable_fd_state& pfd,
         eevt.data.ptr = &pfd;
         int r = ::epoll_ctl(_epollfd.get(), ctl, pfd.fd.get(), &eevt);
         assert(r == 0);
-        engine().start_epoll();
     }
 
     *desc = pollable_fd_state_completion{};
@@ -461,7 +451,7 @@ reactor_backend_osv::reactor_backend_osv() {
 }
 
 bool
-reactor_backend_osv::wait_and_process() {
+reactor_backend_osv::wait_and_process_fd_notifications() {
     _poller.process();
     // osv::poller::process runs pollable's callbacks, but does not currently
     // have a timer expiration callback - instead if gives us an expired()
@@ -471,6 +461,11 @@ reactor_backend_osv::wait_and_process() {
         _timer_promise = promise<>();
     }
     return true;
+}
+
+void
+reactor_backend_osv::sleep_interruptible(const sigset_t* sigset) {
+    return wait_and_process_fd_notifications();
 }
 
 future<>

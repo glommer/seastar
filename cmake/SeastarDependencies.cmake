@@ -70,6 +70,7 @@ macro (seastar_find_dependencies)
     StdAtomic
     StdFilesystem
     hwloc
+    uring
     lksctp-tools # No version information published.
     numactl # No version information published.
     rt
@@ -98,6 +99,7 @@ macro (seastar_find_dependencies)
   set (_seastar_dep_args_Protobuf 2.5.0 REQUIRED)
   set (_seastar_dep_args_StdAtomic REQUIRED)
   set (_seastar_dep_args_StdFilesystem REQUIRED)
+  set (_seastar_dep_args_uring 0.4.0)
   set (_seastar_dep_args_hwloc 1.11.2)
   set (_seastar_dep_args_lksctp-tools REQUIRED)
   set (_seastar_dep_args_rt REQUIRED)

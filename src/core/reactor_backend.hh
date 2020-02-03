@@ -26,12 +26,16 @@
 #include <seastar/core/internal/pollable_fd.hh>
 #include <seastar/core/internal/poll.hh>
 #include <seastar/core/linux-aio.hh>
+#include <seastar/core/cacheline.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/internal/io_request.hh>
 #include <sys/time.h>
 #include <signal.h>
 #include <thread>
 #include <stack>
 #include <boost/any.hpp>
 #include <boost/program_options.hpp>
+#include <boost/container/static_vector.hpp>
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
@@ -40,6 +44,35 @@
 namespace seastar {
 
 class reactor;
+class kernel_completion;
+
+class aio_storage_context {
+public:
+    static constexpr unsigned max_aio = 1024;
+    explicit aio_storage_context(reactor *r);
+    ~aio_storage_context();
+
+    void submit_io(kernel_completion* desc, internal::io_request req);
+    bool gather_completions();
+    bool flush_pending();
+    bool can_sleep() const;
+private:
+    reactor* _r;
+    internal::linux_abi::aio_context_t _io_context;
+
+    size_t handle_aio_error(internal::linux_abi::iocb* iocb, int ec);
+
+    alignas(cache_line_size) std::array<internal::linux_abi::iocb, max_aio> _iocb_pool;
+    semaphore _sem{0};
+    std::stack<internal::linux_abi::iocb*, boost::container::static_vector<internal::linux_abi::iocb*, max_aio>> _free_iocbs;
+
+    future<internal::linux_abi::iocb*> get_one();
+    void put_one(internal::linux_abi::iocb* io);
+    unsigned outstanding() const;
+
+    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio;
+    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio_retry;
+};
 
 // The "reactor_backend" interface provides a method of waiting for various
 // basic events on one thread. We have one implementation based on epoll and
@@ -70,6 +103,13 @@ public:
     virtual void reset_preemption_monitor() = 0;
     virtual void request_preemption() = 0;
     virtual void start_handling_signal() = 0;
+
+    virtual bool kernel_events_submit() = 0;
+    virtual bool gather_kernel_events_completions() = 0;
+    // wether or not we are able to wake up in case of kernel events pending, or need to keep
+    // polling
+    virtual bool kernel_events_can_sleep() const = 0;
+    virtual void submit_io(kernel_completion* desc, internal::io_request req) = 0;
 };
 
 // reactor backend using file-descriptor & epoll, suitable for running on
@@ -82,6 +122,7 @@ class reactor_backend_epoll : public reactor_backend {
     timer_t _steady_clock_timer = {};
 private:
     file_desc _epollfd;
+    aio_storage_context _aio_storage_context;
     future<> get_epoll_future(pollable_fd_state& fd,
             pollable_fd_state_completion* desc, int event);
     void complete_epoll_event(pollable_fd_state& fd,
@@ -103,11 +144,18 @@ public:
     virtual void reset_preemption_monitor() override;
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;
+
+    virtual bool kernel_events_submit() override;
+    virtual bool gather_kernel_events_completions() override;
+
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void submit_io(kernel_completion* desc, internal::io_request req) override;
 };
 
 class reactor_backend_aio : public reactor_backend {
     static constexpr size_t max_polls = 10000;
     reactor* _r;
+    aio_storage_context _aio_storage_context;
     // We use two aio contexts, one for preempting events (the timer tick and
     // signals), the other for non-preempting events (fd poll).
     struct context {
@@ -156,6 +204,12 @@ public:
     virtual void reset_preemption_monitor() override;
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;
+
+    virtual bool kernel_events_submit() override;
+    virtual bool gather_kernel_events_completions() override;
+
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void submit_io(kernel_completion* desc, internal::io_request req) override;
 };
 
 #ifdef HAVE_OSV
@@ -177,6 +231,9 @@ public:
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual void forget(pollable_fd_state& fd) override;
     void enable_timer(steady_clock_type::time_point when);
+
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void submit_io(kernel_completion* desc, internal::io_request req) override;
 };
 #endif /* HAVE_OSV */
 

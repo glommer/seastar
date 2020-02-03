@@ -19,8 +19,11 @@
  * Copyright 2019 ScyllaDB
  */
 #include "core/reactor_backend.hh"
+#include "core/thread_pool.hh"
+#include "core/syscall_result.hh"
 #include <seastar/core/print.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/internal/io_desc.hh>
 #include <seastar/util/defer.hh>
 #include <chrono>
 #include <sys/poll.h>
@@ -35,6 +38,188 @@ namespace seastar {
 using namespace std::chrono_literals;
 using namespace internal;
 using namespace internal::linux_abi;
+
+aio_storage_context::aio_storage_context(reactor *r)
+    : _r(r)
+    , _io_context(0)
+{
+    static_assert(max_aio >= reactor::max_queues * reactor::max_queues,
+                  "Mismatch between maximum allowed io and what the IO queues can produce");
+
+    for (unsigned i = 0; i != max_aio; ++i) {
+        _free_iocbs.push(&_iocb_pool[i]);
+    }
+
+    setup_aio_context(max_aio, &_io_context);
+    _sem.signal(max_aio);
+}
+
+aio_storage_context::~aio_storage_context() {
+    io_destroy(_io_context);
+}
+
+future<internal::linux_abi::iocb*>
+aio_storage_context::get_one() {
+    return _sem.wait(1).then([this] {
+        auto r = _free_iocbs.size();
+        assert(r > 0);
+        auto io = _free_iocbs.top();
+        _free_iocbs.pop();
+        return io;
+    });
+}
+
+void
+aio_storage_context::put_one(internal::linux_abi::iocb* io) {
+    _free_iocbs.push(io);
+    _sem.signal(1);
+}
+
+unsigned
+aio_storage_context::outstanding() const {
+    return max_aio - _free_iocbs.size();
+}
+
+extern bool aio_nowait_supported;
+
+void prepare_iocb(io_request& req, iocb& iocb) {
+    switch (req.opcode()) {
+    case io_request::operation::fdatasync:
+        iocb = make_fdsync_iocb(req.fd());
+        break;
+    case io_request::operation::write:
+        iocb = make_write_iocb(req.fd(), req.pos(), req.address(), req.size());
+        break;
+    case io_request::operation::writev:
+        iocb = make_writev_iocb(req.fd(), req.pos(), reinterpret_cast<const iovec*>(req.address()), req.size());
+        break;
+    case io_request::operation::read:
+        iocb = make_read_iocb(req.fd(), req.pos(), req.address(), req.size());
+        break;
+    case io_request::operation::readv:
+        iocb = make_readv_iocb(req.fd(), req.pos(), reinterpret_cast<const iovec*>(req.address()), req.size());
+        break;
+    }
+}
+
+void
+aio_storage_context::submit_io(kernel_completion* desc, internal::io_request req) {
+    // We can ignore the future returned here, because the submitted aio will be polled
+    // for and completed in process_io().
+    (void)get_one().then([this, desc, req = std::move(req)] (linux_abi::iocb* iocb) mutable {
+        auto& io = *iocb;
+        prepare_iocb(req, io);
+        if (_r->_aio_eventfd) {
+            set_eventfd_notification(io, _r->_aio_eventfd->get_fd());
+        }
+        if (aio_nowait_supported) {
+            set_nowait(io, true);
+        }
+        set_user_data(io, desc);
+        _pending_aio.push_back(&io);
+    });
+}
+
+bool aio_storage_context::gather_completions()
+{
+    io_event ev[max_aio];
+    struct timespec timeout = {0, 0};
+    auto n = io_getevents(_io_context, 1, max_aio, ev, &timeout, _r->_force_io_getevents_syscall);
+    if (n == -1 && errno == EINTR) {
+        n = 0;
+    }
+
+    assert(n >= 0);
+    unsigned nr_retry = 0;
+    for (size_t i = 0; i < size_t(n); ++i) {
+        auto iocb = get_iocb(ev[i]);
+        if (ev[i].res == -EAGAIN) {
+            ++nr_retry;
+            set_nowait(*iocb, false);
+            _pending_aio_retry.push_back(iocb);
+            continue;
+        }
+        put_one(iocb);
+        auto desc = reinterpret_cast<kernel_completion*>(ev[i].data);
+        desc->set_value(ev[i].res);
+    }
+    return n;
+}
+
+// Returns: number of iocbs consumed (0 or 1)
+size_t
+aio_storage_context::handle_aio_error(linux_abi::iocb* iocb, int ec) {
+    switch (ec) {
+        case EAGAIN:
+            return 0;
+        case EBADF: {
+            auto desc = reinterpret_cast<kernel_completion*>(get_user_data(*iocb));
+            put_one(iocb);
+            try {
+                throw std::system_error(EBADF, std::system_category());
+            } catch (...) {
+                desc->set_exception(std::current_exception());
+            }
+            // if EBADF, it means that the first request has a bad fd, so
+            // we will only remove it from _pending_aio and try again.
+            return 1;
+        }
+        default:
+            ++_r->_io_stats.aio_errors;
+            throw_system_error_on(true, "io_submit");
+            abort();
+    }
+}
+
+bool aio_storage_context::flush_pending() {
+    bool did_work = false;
+    while (!_pending_aio.empty()) {
+        auto nr = _pending_aio.size();
+        auto iocbs = _pending_aio.data();
+        auto r = io_submit(_io_context, nr, iocbs);
+        size_t nr_consumed;
+        if (r == -1) {
+            nr_consumed = handle_aio_error(iocbs[0], errno);
+        } else {
+            nr_consumed = size_t(r);
+        }
+
+        did_work = true;
+        if (nr_consumed == nr) {
+            _pending_aio.clear();
+        } else {
+            _pending_aio.erase(_pending_aio.begin(), _pending_aio.begin() + nr_consumed);
+        }
+    }
+    if (!_pending_aio_retry.empty()) {
+        auto retries = std::exchange(_pending_aio_retry, {});
+        // FIXME: future is discarded
+        (void)engine()._thread_pool->submit<syscall_result<int>>([this, retries] () mutable {
+            auto r = io_submit(_io_context, retries.size(), retries.data());
+            return wrap_syscall<int>(r);
+        }).then([this, retries] (syscall_result<int> result) {
+            auto iocbs = retries.data();
+            size_t nr_consumed = 0;
+            if (result.result == -1) {
+                nr_consumed = handle_aio_error(iocbs[0], result.error);
+            } else {
+                nr_consumed = result.result;
+            }
+            std::copy(retries.begin() + nr_consumed, retries.end(), std::back_inserter(_pending_aio_retry));
+        });
+        did_work = true;
+    }
+    return did_work;
+}
+
+bool aio_storage_context::can_sleep() const {
+    // Because aio depends on polling, it cannot generate events to wake us up, Therefore, sleep
+    // is only possible if there are no in-flight aios. If there are, we need to keep polling.
+    //
+    // Alternatively, if we enabled _aio_eventfd, we can always enter
+    unsigned executing = outstanding();
+    return executing == 0 || _r->_aio_eventfd;
+}
 
 reactor_backend_aio::context::context(size_t nr) : iocbs(new iocb*[nr]) {
     setup_aio_context(nr, &io_context);
@@ -166,7 +351,10 @@ void reactor_backend_aio::signal_received(int signo, siginfo_t* siginfo, void* i
     engine()._signals.action(signo, siginfo, ignore);
 }
 
-reactor_backend_aio::reactor_backend_aio(reactor* r) : _r(r) {
+reactor_backend_aio::reactor_backend_aio(reactor* r)
+    : _r(r)
+    , _aio_storage_context(_r)
+{
     _task_quota_timer_iocb = make_poll_iocb(_r->_task_quota_timer.get(), POLLIN);
     _timerfd_iocb = make_poll_iocb(_steady_clock_timer.get(), POLLIN);
     _smp_wakeup_iocb = make_poll_iocb(_r->_notify_eventfd.get(), POLLIN);
@@ -275,8 +463,27 @@ void reactor_backend_aio::start_handling_signal() {
     // implementation of request_preemption is not signal safe, so do nothing.
 }
 
+void reactor_backend_aio::submit_io(kernel_completion* desc, internal::io_request req) {
+    return _aio_storage_context.submit_io(desc, std::move(req));
+}
+
+bool reactor_backend_aio::kernel_events_submit() {
+    return _aio_storage_context.flush_pending();
+}
+
+bool reactor_backend_aio::gather_kernel_events_completions() {
+    return _aio_storage_context.gather_completions();
+}
+
+bool reactor_backend_aio::kernel_events_can_sleep() const {
+    return _aio_storage_context.can_sleep();
+}
+
 reactor_backend_epoll::reactor_backend_epoll(reactor* r)
-        : _r(r), _epollfd(file_desc::epoll_create(EPOLL_CLOEXEC)) {
+        : _r(r)
+        , _epollfd(file_desc::epoll_create(EPOLL_CLOEXEC))
+        , _aio_storage_context(_r)
+{
     ::epoll_event event;
     event.events = EPOLLIN;
     event.data.ptr = nullptr;
@@ -446,6 +653,22 @@ void reactor_backend_epoll::reset_preemption_monitor() {
     _r->_preemption_monitor.head.store(0, std::memory_order_relaxed);
 }
 
+void reactor_backend_epoll::submit_io(kernel_completion* desc, internal::io_request req) {
+    return _aio_storage_context.submit_io(desc, std::move(req));
+}
+
+bool reactor_backend_epoll::kernel_events_submit() {
+    return _aio_storage_context.flush_pending();
+}
+
+bool reactor_backend_epoll::gather_kernel_events_completions() {
+    return _aio_storage_context.gather_completions();
+}
+
+bool reactor_backend_epoll::kernel_events_can_sleep() const {
+    return _aio_storage_context.can_sleep();
+}
+
 #ifdef HAVE_OSV
 reactor_backend_osv::reactor_backend_osv() {
 }
@@ -491,6 +714,22 @@ reactor_backend_osv::enable_timer(steady_clock_type::time_point when) {
     _poller.set_timer(when);
 }
 
+void reactor_backend_osv::submit_io(kernel_completion* desc, internal::io_request req) {
+    std::cerr << "reactor_backend_osv does not support file descriptors - submit_io() shouldn't have been called!\n";
+    abort();
+}
+
+bool reactor_backend_osv::kernel_events_submit() {
+    return false;
+}
+
+bool reactor_backend_osv::gather_kernel_events_completions() {
+    return false;
+}
+
+bool reactor_backend_epoll::kernel_events_can_sleep() const {
+    return true;
+}
 #endif
 
 static bool detect_aio_poll() {

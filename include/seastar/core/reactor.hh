@@ -186,6 +186,7 @@ private:
     friend class internal::reactor_stall_sampler;
     friend class reactor_backend_epoll;
     friend class reactor_backend_aio;
+    friend class aio_storage_context;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;
@@ -246,20 +247,7 @@ private:
 
     static constexpr unsigned max_aio_per_queue = 128;
     static constexpr unsigned max_queues = 8;
-    static constexpr unsigned max_aio = max_aio_per_queue * max_queues;
     friend disk_config_params;
-
-
-    class iocb_pool {
-        alignas(cache_line_size) std::array<internal::linux_abi::iocb, max_aio> _iocb_pool;
-        semaphore _sem{0};
-        std::stack<internal::linux_abi::iocb*, boost::container::static_vector<internal::linux_abi::iocb*, max_aio>> _free_iocbs;
-    public:
-        iocb_pool();
-        future<internal::linux_abi::iocb*> get_one();
-        void put_one(internal::linux_abi::iocb* io);
-        unsigned outstanding() const;
-    };
 
     // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
     // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
@@ -291,10 +279,6 @@ private:
     timer_set<timer<lowres_clock>, &timer<lowres_clock>::_link>::timer_list_t _expired_lowres_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link> _manual_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link>::timer_list_t _expired_manual_timers;
-    internal::linux_abi::aio_context_t _io_context;
-    iocb_pool _iocb_pool;
-    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio;
-    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio_retry;
     io_stats _io_stats;
     uint64_t _fsyncs = 0;
     uint64_t _cxx_exceptions = 0;
@@ -367,7 +351,6 @@ private:
     static std::chrono::nanoseconds calculate_poll_time();
     static void block_notifier(int);
     void wakeup();
-    size_t handle_aio_error(internal::linux_abi::iocb* iocb, int ec);
     bool flush_pending_aio();
     bool flush_tcp_batches();
     bool do_expire_lowres_timers();
@@ -638,10 +621,6 @@ private:
     void replace_poller(pollfn* old, pollfn* neww);
     void register_metrics();
     future<> write_all_part(pollable_fd_state& fd, const void* buffer, size_t size, size_t completed);
-
-    bool kernel_events_can_sleep() const;
-    bool gather_kernel_events_completions();
-    bool kernel_events_submit();
 
     future<> fdatasync(int fd);
 

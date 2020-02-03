@@ -55,30 +55,14 @@ void reactor_backend_aio::context::queue(linux_abi::iocb* iocb) {
     *last++ = iocb;
 }
 
-void reactor_backend_aio::context::flush() {
+size_t reactor_backend_aio::context::flush() {
     if (last != iocbs.get()) {
         auto nr = last - iocbs.get();
         last = iocbs.get();
         io_submit(io_context, nr, iocbs.get());
+        return nr;
     }
-}
-
-reactor_backend_aio::io_poll_poller::io_poll_poller(reactor_backend_aio* b) : _backend(b) {
-}
-
-bool reactor_backend_aio::io_poll_poller::poll() {
-    return _backend->wait_and_process(0, nullptr);
-}
-
-bool reactor_backend_aio::io_poll_poller::pure_poll() {
-    return _backend->wait_and_process(0, nullptr);
-}
-
-bool reactor_backend_aio::io_poll_poller::try_enter_interrupt_mode() {
-    return true;
-}
-
-void reactor_backend_aio::io_poll_poller::exit_interrupt_mode() {
+    return 0;
 }
 
 linux_abi::iocb* reactor_backend_aio::new_iocb() {
@@ -198,7 +182,19 @@ reactor_backend_aio::reactor_backend_aio(reactor* r) : _r(r) {
     assert(e == 0);
 }
 
-bool reactor_backend_aio::wait_and_process(int timeout, const sigset_t* active_sigmask) {
+bool reactor_backend_aio::reap_kernel_events_completions() {
+    if (_need_epoll_events) {
+        return await_events(0, nullptr);
+    }
+    return false;
+}
+
+bool reactor_backend_aio::kernel_events_submit() {
+    return _polling_io.flush();
+}
+
+void reactor_backend_aio::wait_and_process_events(const sigset_t* active_sigmask) {
+    int timeout = -1;
     bool did_work = service_preempting_io();
     if (did_work) {
         timeout = 0;
@@ -206,15 +202,12 @@ bool reactor_backend_aio::wait_and_process(int timeout, const sigset_t* active_s
     _polling_io.replenish(&_timerfd_iocb, _timerfd_in_polling_io);
     _polling_io.replenish(&_smp_wakeup_iocb, _smp_wakeup_in_polling_io);
     _polling_io.flush();
-    did_work |= await_events(timeout, active_sigmask);
-    did_work |= service_preempting_io(); // clear task quota timer
-    return did_work;
+    await_events(timeout, active_sigmask);
+    service_preempting_io(); // clear task quota timer
 }
 
 future<> reactor_backend_aio::poll(pollable_fd_state& fd, pollable_fd_state_completion* desc, int events) {
-    if (!_r->_epoll_poller) {
-        _r->_epoll_poller = reactor::poller(std::make_unique<io_poll_poller>(this));
-    }
+    _need_epoll_events = true;
     try {
         if (events & fd.events_known) {
             fd.events_known &= ~events;
@@ -382,6 +375,29 @@ reactor_backend_epoll::wait_and_process(int timeout, const sigset_t* active_sigm
     return nr;
 }
 
+bool reactor_backend_epoll::reap_kernel_events_completions() {
+    // epoll does not have a separate submission stage, and just
+    // calls epoll_ctl everytime it needs, so this method and
+    // kernel_events_submit are essentially the same. Ordering also
+    // doesn't matter much. wait_and_process is actually completing,
+    // but we prefer to call it in kernel_events_submit because the
+    // reactor register two pollers for completions and one for submission,
+    // since completion is cheaper for other backends like aio. This avoids
+    // calling epoll_wait twice.
+    return false;
+}
+
+bool reactor_backend_epoll::kernel_events_submit() {
+    if (_need_epoll_events) {
+        return wait_and_process(0, nullptr);
+    }
+    return false;
+}
+
+void reactor_backend_epoll::wait_and_process_events(const sigset_t* active_sigmask) {
+    wait_and_process(-1 , active_sigmask);
+}
+
 void reactor_backend_epoll::complete_epoll_event(pollable_fd_state& pfd,
         pollable_fd_state_completion* desc,
         int events, int event) {
@@ -416,7 +432,7 @@ future<> reactor_backend_epoll::get_epoll_future(pollable_fd_state& pfd,
         eevt.data.ptr = &pfd;
         int r = ::epoll_ctl(_epollfd.get(), ctl, pfd.fd.get(), &eevt);
         assert(r == 0);
-        engine().start_epoll();
+        _need_epoll_events = true;
     }
 
     *desc = pollable_fd_state_completion{};
@@ -461,7 +477,7 @@ reactor_backend_osv::reactor_backend_osv() {
 }
 
 bool
-reactor_backend_osv::wait_and_process() {
+reactor_backend_osv::reap_kernel_events_completions() {
     _poller.process();
     // osv::poller::process runs pollable's callbacks, but does not currently
     // have a timer expiration callback - instead if gives us an expired()
@@ -471,6 +487,14 @@ reactor_backend_osv::wait_and_process() {
         _timer_promise = promise<>();
     }
     return true;
+}
+
+reactor_backend_osv::kernel_events_submit() {
+}
+
+void
+reactor_backend_osv::wait_and_process_events(const sigset_t* sigset) {
+    return process_events_nowait();
 }
 
 future<>

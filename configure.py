@@ -87,6 +87,11 @@ add_tristate(
     help = 'hwloc support')
 add_tristate(
     arg_parser,
+    name = 'uring',
+    dest = 'uring',
+    help = 'io_uring support')
+add_tristate(
+    arg_parser,
     name = 'gcc6-concepts',
     dest = 'gcc6_concepts',
     help = 'experimental support for C++ Concepts as implemented in GCC 6')
@@ -191,7 +196,8 @@ def configure_mode(mode):
         tr(args.cpp_dialect, 'CXX_DIALECT'),
         tr(args.dpdk, 'DPDK'),
         tr(infer_dpdk_machine(args.user_cflags), 'DPDK_MACHINE'),
-        tr(args.hwloc, 'HWLOC', value_when_none='yes'),
+        tr(args.hwloc, 'HWLOC'),
+        tr(args.uring, 'URING', value_when_none='yes'),
         tr(args.gcc6_concepts, 'GCC6_CONCEPTS'),
         tr(args.alloc_failure_injection, 'ALLOC_FAILURE_INJECTION'),
         tr(args.alloc_page_size, 'ALLOC_PAGE_SIZE'),

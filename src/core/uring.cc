@@ -70,6 +70,7 @@ void uring_context::push_prio_sqe(internal::io_request req) {
         force_flush();
         sqe = ::io_uring_get_sqe(&_ring);
     }
+    _pending_submission++;
     prepare_sqe(req, *sqe);
 }
 
@@ -97,7 +98,8 @@ void uring_context::force_flush() {
         }
     } while (ret == -EBUSY);
     assert(ret >= 0);
-
+    _pending_submission -= ret;
+    assert(_pending_submission >= 0);
     _forced_flushes++;
 }
 
@@ -152,6 +154,13 @@ void uring_context::prepare_sqe(const internal::io_request& req, io_uring_sqe& s
 
 unsigned uring_context::flush() {
     _flushes++;
+
+    // Saves a kernel round trip if there is nothing waiting in
+    // the sqe list.
+    if (!_pending_submission) {
+        return 0;
+    }
+
     auto ret = io_uring_submit(&_ring);
     if (ret == -EBUSY) {
         // Busy now. In the next poller, we will try again.
@@ -159,6 +168,8 @@ unsigned uring_context::flush() {
     }
     assert(ret >= 0);
     _submitted += ret;
+    _pending_submission -= ret;
+    assert(_pending_submission >= 0);
     return ret;
 }
 

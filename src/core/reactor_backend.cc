@@ -25,9 +25,12 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/read_first_line.hh>
+#include <seastar/core/internal/liburing.hh>
+#include <seastar/core/metrics.hh>
 #include <chrono>
 #include <sys/poll.h>
 #include <sys/syscall.h>
+#include <boost/intrusive/parent_from_member.hpp>
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
@@ -304,6 +307,23 @@ smp_wakeup_aio_completion::complete_with(ssize_t ret) {
     completion_with_iocb::completed();
 }
 
+void
+hrtimer_uring_completion::complete_with(ssize_t ret) {
+    uint64_t expirations = 0;
+    (void)_fd.read(&expirations, 8);
+    if (expirations) {
+        _r->service_highres_timer();
+    }
+    set_registered(false);
+}
+
+void
+smp_wakeup_uring_completion::complete_with(ssize_t ret) {
+    uint64_t ignore = 0;
+    (void)_fd.read(&ignore, 8);
+    set_registered(false);
+}
+
 preempt_io_context::preempt_io_context(reactor* r, file_desc& task_quota, file_desc& hrtimer)
     : _r(r)
     , _task_quota_aio_completion(r, task_quota)
@@ -450,16 +470,16 @@ void reactor_backend_aio::wait_and_process_events(const sigset_t* active_sigmask
 
 class aio_pollable_fd_state : public pollable_fd_state {
     internal::linux_abi::iocb _iocb_pollin;
-    pollable_fd_state_completion _completion_pollin;
+    pollable_fd_state_completion _pollin_add;
 
     internal::linux_abi::iocb _iocb_pollout;
-    pollable_fd_state_completion _completion_pollout;
+    pollable_fd_state_completion _pollout_add;
 public:
     pollable_fd_state_completion* get_desc(int events) {
         if (events & POLLIN) {
-            return &_completion_pollin;
+            return &_pollin_add;
         }
-        return &_completion_pollout;
+        return &_pollout_add;
     }
     internal::linux_abi::iocb* get_iocb(int events) {
         if (events & POLLIN) {
@@ -963,8 +983,14 @@ bool reactor_backend_selector::has_enough_aio_nr() {
     return true;
 }
 
+using namespace seastar::internal;
+
+static bool detect_uring();
+
 std::unique_ptr<reactor_backend> reactor_backend_selector::create(reactor* r) {
-    if (_name == "linux-aio") {
+    if (_name == "uring") {
+        return std::make_unique<reactor_backend_uring>(r);
+    } else if (_name == "linux-aio") {
         return std::make_unique<reactor_backend_aio>(r);
     } else if (_name == "epoll") {
         return std::make_unique<reactor_backend_epoll>(r);
@@ -978,11 +1004,767 @@ reactor_backend_selector reactor_backend_selector::default_backend() {
 
 std::vector<reactor_backend_selector> reactor_backend_selector::available() {
     std::vector<reactor_backend_selector> ret;
+    if (detect_uring()) {
+        ret.push_back(reactor_backend_selector("uring"));
+    }
+
     if (detect_aio_poll() && has_enough_aio_nr()) {
         ret.push_back(reactor_backend_selector("linux-aio"));
     }
     ret.push_back(reactor_backend_selector("epoll"));
     return ret;
 }
+#ifndef SEASTAR_HAVE_URING
+static bool detect_uring() {
+    return false;
+}
+#else
+static bool detect_uring() {
+    try {
+        std::vector<int> opcodes_of_interest = {
+            IORING_OP_READV,
+            IORING_OP_READ,
+            IORING_OP_RECV,
+            IORING_OP_RECVMSG,
+            IORING_OP_WRITEV,
+            IORING_OP_WRITE,
+            IORING_OP_SEND,
+            IORING_OP_SENDMSG,
+            IORING_OP_CONNECT,
+            IORING_OP_ACCEPT,
+            IORING_OP_ASYNC_CANCEL,
+            IORING_OP_FSYNC,
+            IORING_OP_POLL_ADD,
+            IORING_OP_POLL_REMOVE,
+        };
+
+        uring_context ctx = uring_context::make_irq_ring([] (auto* dummy) {});
+        return ctx.ring_features_supported(IORING_FEAT_NODROP) &&
+               ctx.ring_opcodes_supported(std::move(opcodes_of_interest));
+     } catch (std::system_error& e) {
+         return false;
+     }
+}
+
+class uring_pollable_fd_state;
+
+// We will use this class to do reference counting for the pollable_fd_state.  We
+// could in theory just make the uring_pollable_fd_state class a shared pointer,
+// but objects inside it would have to hold references to it and that quickly
+// becomes a mess. This is very explicit and harder to miss.
+//
+// uring_pollable_fd_state holds a lw_shared_ptr to this class. Its member
+// operations do too. When an operation starts we acquire a reference by copying
+// uring_pollable_fd_state's refcnt to the operation and when the operation ends,
+// we destroy it.
+//
+// Reference counting is needed because deletion can only happen after everything
+// that is submitted in relationship to this uring_pollable_fd_state completes.
+// Events do not necessarily appear in the completion queue in the order they were
+// submitted, but in the order they were completed. Completion order is then,
+// unpredictable and deletion could happen first.
+class uring_pollable_fd_refcnt : public enable_lw_shared_from_this<uring_pollable_fd_refcnt> {
+    uring_pollable_fd_state* _pfd;
+public:
+    lw_shared_ptr<uring_pollable_fd_refcnt> acquire() {
+        return shared_from_this();
+    }
+    static void release(lw_shared_ptr<uring_pollable_fd_refcnt>&& ref) {
+        lw_shared_ptr<uring_pollable_fd_refcnt> drop = {};
+        std::swap(drop, ref);
+    }
+    uring_pollable_fd_refcnt(uring_pollable_fd_state *pfd) : _pfd(pfd) {}
+    ~uring_pollable_fd_refcnt();
+};
+
+class uring_network_completion final : public kernel_completion {
+private:
+    promise<size_t> _pr;
+    ::msghdr _msghdr = {};
+    int _speculate_event = 0;
+    size_t _expected_size = 0;
+
+    lw_shared_ptr<uring_pollable_fd_refcnt> _refcnt = {};
+    friend class uring_pollable_fd_state;
+
+    static void maybe_speculate(uring_pollable_fd_state* fd, size_t size, size_t expected, int event);
+public:
+    uring_network_completion() {}
+    uring_network_completion(int event, size_t expected)
+        : _speculate_event(event)
+        , _expected_size(expected)
+    {}
+
+    static future<size_t> complete_with(uring_pollable_fd_state* fd, ssize_t res, size_t expected, int event);
+    virtual void complete_with(ssize_t res) override;
+
+    future<size_t> get_future() {
+        return _pr.get_future();
+    }
+
+    ::msghdr& msg() {
+        return _msghdr;
+    }
+};
+
+class uring_connect_completion : public kernel_completion {
+private:
+    promise<> _pr;
+    lw_shared_ptr<uring_pollable_fd_refcnt> _refcnt = {};
+    friend class uring_pollable_fd_state;
+    // sa is passed as a reference to engine().connect(), but historically
+    // there were no strict rules about its lifetime. The callers won't deal
+    // with it, which is natural since the pre-uring implementation of connect
+    // issued a synchronous call.
+    // We will just keep a copy instead of burdening all callers
+    socket_address _sa;
+public:
+    uring_connect_completion() {}
+    uring_connect_completion(const socket_address& sa) : _sa(sa) {}
+
+    socket_address& sockaddr() {
+        return _sa;
+    }
+
+    virtual void complete_with(ssize_t res) override;
+    future<> get_future() {
+        return _pr.get_future();
+    }
+};
+
+class uring_accept_completion : public kernel_completion {
+private:
+    promise<std::tuple<pollable_fd, socket_address>> _pr;
+    socket_address _sa = {};
+
+    lw_shared_ptr<uring_pollable_fd_refcnt> _refcnt = {};
+    friend class uring_pollable_fd_state;
+public:
+    sockaddr* sa() {
+        return &_sa.as_posix_sockaddr();
+    }
+
+    socklen_t* sl() {
+        // Using a separate variable for _sl like do_accept(), uring doesn't
+        // work. According to the syscall manpage, the behavior we see here is
+        // the right one. How does this ever work?
+        return &_sa.addr_length;
+    }
+
+    static future<std::tuple<pollable_fd, socket_address>>
+    complete_with(uring_pollable_fd_state *fd, file_desc, socket_address sa);
+    virtual void complete_with(ssize_t res) override;
+
+    future<std::tuple<pollable_fd, socket_address>> get_future() {
+        return _pr.get_future();
+    }
+};
+
+class uring_poll_remove_completion final : public kernel_completion {
+    lw_shared_ptr<uring_pollable_fd_refcnt> _refcnt = {};
+    friend class uring_pollable_fd_state;
+public:
+    uring_pollable_fd_state* ptr = nullptr;
+    virtual void complete_with(ssize_t res) override;
+};
+
+class uring_poll_add_completion final : public kernel_completion {
+    lw_shared_ptr<uring_pollable_fd_refcnt> _refcnt = {};
+    friend class uring_pollable_fd_state;
+    promise<> _pr;
+public:
+    virtual void complete_with(ssize_t res) override {
+        _pr.set_value();
+        uring_pollable_fd_refcnt::release(std::move(_refcnt));
+    }
+    future<> get_future() {
+        return _pr.get_future();
+    }
+};
+
+class uring_pollable_fd_state : public pollable_fd_state {
+    uring_poll_add_completion _pollin_add;
+    uring_poll_add_completion _pollout_add;
+    uring_network_completion _network_read;
+    uring_network_completion _network_write;
+
+    uring_connect_completion _connect;
+    uring_accept_completion _accept;
+
+    uring_poll_remove_completion _pollin_remove;
+    uring_poll_remove_completion _pollout_remove;
+
+    friend uring_accept_completion;
+    friend uring_network_completion;
+    friend uring_poll_remove_completion;
+    lw_shared_ptr<uring_pollable_fd_refcnt> _refcnt = {};
+
+    // The two methods below will be used when we initiate a new operation.
+    // We need to refresh the existing completion object, because it is a
+    // new operation, and bump the reference count.
+    //
+    // The first version does that for a specific completion, the second is
+    // a helper for completions that have a read/write type.
+    template <typename T, typename... Args>
+    T* get_completion(T* ptr, Args... args) {
+        T* desc = ptr;
+        *desc = T(std::forward<Args>(args)...);
+        desc->_refcnt = _refcnt->acquire();
+        return desc;
+    }
+
+    template <typename T, typename... Args>
+    T* get_in_out_completion(int events, T* pollin, T* pollout, Args... args) {
+        return events & POLLIN ? get_completion(pollin, std::forward<Args>(args)...)
+                               : get_completion(pollout, std::forward<Args>(args)...);
+    }
+
+public:
+    void forget() {
+        uring_pollable_fd_refcnt::release(std::move(_refcnt));
+    }
+    void maybe_no_more_recv() {
+        pollable_fd_state::maybe_no_more_recv();
+    }
+    void maybe_no_more_send() {
+        pollable_fd_state::maybe_no_more_send();
+    }
+
+    uring_connect_completion* get_connect_desc(const socket_address& sa) {
+        return get_completion(&_connect, sa);
+    }
+
+    uring_accept_completion* get_accept_desc() {
+        return get_completion(&_accept);
+    }
+
+    uring_poll_remove_completion* get_poll_remove_desc(int events) {
+        return get_in_out_completion(events, &_pollin_remove, &_pollout_remove);
+    }
+
+    uring_poll_add_completion* get_poll_add_desc(int events) {
+        return get_in_out_completion(events, &_pollin_add, &_pollout_add);
+    }
+
+    uring_network_completion* get_network_desc(int events, size_t len) {
+        return get_in_out_completion(events, &_network_read, &_network_write, events, len);
+    }
+
+    // The methods below will be used when we just want to peek at the address of a completion,
+    // without initiating a new operation. For example, if we are cancelling an existing operation.
+    uring_connect_completion* connect_desc_addr() {
+        return &_connect;
+    }
+
+    uring_accept_completion* accept_desc_addr() {
+        return &_accept;
+    }
+
+    uring_poll_remove_completion* poll_remove_desc_addr(int events) {
+        return events & POLLIN ? &_pollin_remove : &_pollout_remove;
+    }
+
+    uring_poll_add_completion* poll_add_addr(int events) {
+        return events & POLLIN ? &_pollin_add : &_pollout_add;
+    }
+
+    uring_network_completion* network_desc_addr(int events) {
+        return events & POLLIN ? &_network_read : &_network_write;
+    }
+
+    explicit uring_pollable_fd_state(file_desc fd, speculation speculate)
+        : pollable_fd_state(std::move(fd), std::move(speculate))
+        , _refcnt(make_lw_shared<uring_pollable_fd_refcnt>(this))
+    {}
+    uring_pollable_fd_state(uring_pollable_fd_state&&) = delete;
+    uring_pollable_fd_state(const uring_pollable_fd_state&) = delete;
+
+    uring_pollable_fd_state& operator=(uring_pollable_fd_state&&) = delete;
+    uring_pollable_fd_state& operator=(const uring_pollable_fd_state&) = delete;
+};
+
+uring_pollable_fd_refcnt::~uring_pollable_fd_refcnt() {
+    delete _pfd;
+}
+
+void uring_network_completion::maybe_speculate(uring_pollable_fd_state* pfd, size_t size, size_t expected_size, int speculate_event) {
+    if (size == expected_size) {
+        pfd->speculate_epoll(speculate_event);
+    }
+}
+
+void uring_accept_completion::complete_with(ssize_t res) {
+    try {
+        throw_kernel_error(res);
+        auto fd = file_desc::from_fd(res);
+        auto listen_pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_accept);
+        complete_with(listen_pfd, std::move(fd), std::move(_sa)).forward_to(std::move(_pr));
+    } catch (...) {
+        _pr.set_exception(std::current_exception());
+    }
+    uring_pollable_fd_refcnt::release(std::move(_refcnt));
+}
+
+void uring_connect_completion::complete_with(ssize_t res) {
+    try {
+        throw_kernel_error(res);
+        _pr.set_value();
+    } catch (...) {
+        _pr.set_exception(std::current_exception());
+    }
+    uring_pollable_fd_refcnt::release(std::move(_refcnt));
+}
+
+void uring_poll_remove_completion::complete_with(ssize_t res) {
+    uring_pollable_fd_refcnt::release(std::move(_refcnt));
+}
+
+void uring_network_completion::complete_with(ssize_t res) {
+    // We don't expect any errors, since our reads are blocking
+    // and EAGAIN is not a thing. Anything that returns a negative
+    // value means something went wrong
+    uring_pollable_fd_state *pfd;
+
+    if (_speculate_event == POLLIN) {
+        pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_read);
+    } else {
+        pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_write);
+    }
+    complete_with(pfd, res, _expected_size, _speculate_event).forward_to(std::move(_pr));
+    uring_pollable_fd_refcnt::release(std::move(_refcnt));
+}
+
+future<std::tuple<pollable_fd, socket_address>>
+uring_accept_completion::complete_with(uring_pollable_fd_state* listenfd, file_desc fd, socket_address sa) {
+    listenfd->speculate_epoll(POLLIN);
+    pollable_fd pfd(std::move(fd), pollable_fd::speculation(POLLOUT));
+    return make_ready_future<std::tuple<pollable_fd, socket_address>>(std::make_tuple(std::move(pfd), std::move(sa)));
+}
+
+future<size_t>
+uring_network_completion::complete_with(uring_pollable_fd_state* pfd, ssize_t res, size_t expected, int event) {
+    try {
+        throw_kernel_error(res);
+        size_t size = size_t(res);
+        maybe_speculate(pfd, size, expected, event);
+        return make_ready_future<size_t>(size);
+    } catch (...) {
+        return make_exception_future<size_t>(std::current_exception());
+    }
+}
+
+bool reactor_backend_uring::kernel_events_can_sleep() const {
+    return true;
+}
+
+bool reactor_backend_uring::kernel_submit_work() {
+    // Move our SQE list to the kernel. We want this here,
+    // and not inside flush(), because in the future we may choose
+    // which ring to push to (poll vs irq).
+    while (!_r->_pending_io.empty()) {
+        if (!_irq_ctx.maybe_submit_request(_r->_pending_io)) {
+            break;
+        }
+        _r->_pending_io.pop_front();
+    }
+    _irq_ctx.flush();
+    _timer_aio_context.reset_preemption_monitor();
+    // The work that we do here never generate new tasks. Only when we
+    // reap completions. We could return true to signal to the reaper that
+    // there might be work to do, but our reaper always runs after submit,
+    // and in the future we may even combine them in a single poller.
+    return false;
+}
+
+bool reactor_backend_uring::reap_kernel_completions() {
+    bool did_work = _irq_ctx.poll();
+    did_work |= _timer_aio_context.service_preempting_io();
+    return did_work;
+}
+
+void reactor_backend_uring::process_one_cqe(io_uring_cqe* cqe) {
+    kernel_completion* desc = reinterpret_cast<kernel_completion*>(cqe->user_data);
+    desc->complete_with(size_t(cqe->res));
+}
+
+bool reactor_backend_uring::register_uring_listener(uring_listener_completion* desc) {
+    if (!desc->is_registered()) {
+        auto req = io_request::make_poll_add(desc->fd().get(), POLLIN);
+        req.attach_kernel_completion(desc);
+        _irq_ctx.push_prio_sqe(std::move(req));
+        desc->set_registered(true);
+        return true;
+    }
+    return false;
+}
+
+bool reactor_backend_uring::unregister_uring_listener(uring_listener_completion* desc) {
+    if (desc->is_registered()) {
+        auto req = io_request::make_poll_remove(desc->fd().get(), desc);
+        req.attach_kernel_completion(&_empty_completion);
+        _irq_ctx.push_prio_sqe(std::move(req));
+        desc->set_registered(false);
+        return true;
+    }
+    return false;
+}
+
+static constexpr unsigned cq_ring_size = 256;
+
+reactor_backend_uring::reactor_backend_uring(reactor* r)
+    : _r(r)
+    , _hrtimer_timerfd(file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK))
+    , _hrtimer_completion(_r, _hrtimer_timerfd)
+    , _smp_wakeup_completion(_r, _r->_notify_eventfd)
+    , _irq_ctx(uring_context::make_irq_ring([this] (io_uring_cqe* cqe) { return process_one_cqe(cqe); }, cq_ring_size))
+    , _timer_aio_context(_r, _r->_task_quota_timer, _hrtimer_timerfd)
+{
+    register_uring_listener(&_smp_wakeup_completion);
+    _irq_ctx.force_flush();
+    // Protect against spurious wakeups - if we get notified that the timer has
+    // expired when it really hasn't, we don't want to block in read(tfd, ...).
+    auto tfd = _r->_task_quota_timer.get();
+    ::fcntl(tfd, F_SETFL, ::fcntl(tfd, F_GETFL) | O_NONBLOCK);
+
+    sigset_t mask = make_sigset_mask(hrtimer_signal());
+    auto e = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    assert(e == 0);
+
+    namespace sm = seastar::metrics;
+
+    auto ring_group = sm::label("ring");
+    auto main_irq_ring = ring_group("main-irq");
+
+    _metrics.add_group("reactor_backend_uring", {
+        sm::make_derive("total_flushes", [this] {
+                return _irq_ctx.total_flushes();
+            }, sm::description("Total number of times the ring was flushed"), {main_irq_ring}),
+        sm::make_derive("flush_time_ms", [this] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(_irq_ctx.total_flush_time()).count();
+            }, sm::description("Total amount of time in ms spent flushing the ring"), {main_irq_ring}),
+        sm::make_derive("total_forced_flushes", [this] {
+                return _irq_ctx.total_forced_flushes();
+            }, sm::description("Total number of times the ring was force-flushed"), {main_irq_ring}),
+        sm::make_derive("forced_flush_time_ms", [this] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(_irq_ctx.total_forced_flush_time()).count();
+            }, sm::description("Total amount of time in ms spent force-flushing the ring"), {main_irq_ring}),
+    });
+}
+
+void reactor_backend_uring::signal_received(int signo, siginfo_t* siginfo, void* ignore) {
+    engine()._signals.action(signo, siginfo, ignore);
+}
+
+void reactor_backend_uring::arm_highres_timer(const ::itimerspec& its) {
+    _hrtimer_timerfd.timerfd_settime(TFD_TIMER_ABSTIME, its);
+}
+
+void reactor_backend_uring::wait_and_process_events(const sigset_t* active_sigmask) {
+    auto exit = defer([this] {
+        bool need_flush = false;
+        // since we're awake, the timer is once more the responsibility of the
+        // getevents interface
+        need_flush |= unregister_uring_listener(&_hrtimer_completion);
+        // If true, means at some point we processed a wakeup. Re-register
+        need_flush |=  register_uring_listener(&_smp_wakeup_completion);
+        if (need_flush) {
+            _irq_ctx.force_flush();
+        }
+        _timer_aio_context.reset_preemption_monitor();
+        // Before we wake up, consume any events that may have been generated
+        // so we have plenty to do in the next task quota.
+        _irq_ctx.poll();
+    });
+
+    bool did_work = _timer_aio_context.service_preempting_io();
+    if (did_work) {
+        return;
+    }
+    auto need_flush = register_uring_listener(&_hrtimer_completion);
+    // If we don't need flush here that means that the hrtimer completion
+    // was already in the ring and something is very seriously wrong.
+    assert(need_flush);
+    _irq_ctx.force_flush();
+    if (!_smp_wakeup_completion.is_registered()) {
+        return;
+    }
+    _irq_ctx.sync_wait_forever(active_sigmask);
+}
+
+future<> reactor_backend_uring::poll(pollable_fd_state& fd, int events) {
+    try {
+        if (try_speculate_poll(fd, events)) {
+            return make_ready_future<>();
+        }
+
+        fd.events_rw = events == (POLLIN|POLLOUT);
+        auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+        auto* desc = pfd->get_poll_add_desc(events);
+        auto req = io_request::make_poll_add(fd.fd.get(), events);
+        _r->submit_io(desc, std::move(req));
+        return desc->get_future();
+    } catch (...) {
+        return make_exception_future<>(std::current_exception());
+    }
+}
+
+future<> reactor_backend_uring::readable(pollable_fd_state& fd) {
+    return poll(fd, POLLIN);
+}
+
+future<> reactor_backend_uring::writeable(pollable_fd_state& fd) {
+    return poll(fd, POLLOUT);
+}
+
+future<> reactor_backend_uring::readable_or_writeable(pollable_fd_state& fd) {
+    return poll(fd, POLLIN|POLLOUT);
+}
+
+void reactor_backend_uring::forget(pollable_fd_state& fd) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    // This pfd was never successfully opened
+    if (fd.fd.get() != -1) {
+        auto ops = { POLLIN, POLLOUT };
+        for (auto& op : ops) {
+            auto* op_desc = pfd->poll_add_addr(op);
+            auto req = io_request::make_poll_remove(pfd->fd.get(), op_desc);
+            auto* desc = pfd->get_poll_remove_desc(op);
+            desc->ptr = pfd;
+            _r->submit_io(desc, std::move(req));
+        }
+    }
+    // POLL_REMOVE doesn't depend on the file being open. It only uses the
+    // information in the original's POLL_ADD sqe to find it and remove it from
+    // the list. So we can rely on io_uring to do it in the pollers later, and we
+    // can close the file now.
+    //
+    // It's important that we do: this is called from destructors, and if we don't
+    // close the file now, we can end up trying to open a file that is not closed
+    // yet, but the application believe it is. The file is closed from forget(),
+    // which also decrements the reference count
+    pfd->forget();
+}
+
+bool
+reactor_backend_uring::try_speculate_poll(pollable_fd_state& fd, int events) {
+    if (events & fd.events_known) {
+        fd.events_known &= ~events;
+        return true;
+    }
+    return false;
+}
+
+future<std::tuple<pollable_fd, socket_address>>
+reactor_backend_uring::accept(pollable_fd_state& listenfd) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&listenfd);
+    auto flags = ::fcntl(pfd->fd.get(), F_GETFL);
+    try {
+        if (try_speculate_poll(listenfd, POLLIN|POLLOUT)) {
+            pfd->maybe_no_more_recv();
+            socket_address sa;
+            socklen_t& sl = sa.addr_length;
+            // SOCK_NONBLOCK is absent:
+            // blocking reads or writes, so we don't have to poll. io_uring
+            // magically makes it asynchronous
+            if (!(flags & O_NONBLOCK)) {
+                auto r = ::fcntl(pfd->fd.get(), F_SETFL, flags | O_NONBLOCK);
+                assert(r == 0);
+            }
+
+            auto maybe_fd = listenfd.fd.try_accept(sa, sl, SOCK_CLOEXEC);
+            if (maybe_fd) {
+                return uring_accept_completion::complete_with(pfd, std::move(*maybe_fd), std::move(sa));
+            }
+        }
+
+        // This is the most frustrating part of working with uring:
+        // accept/connect don't take flags. If we dispatch the request
+        // to the ring, it has to be blocking or it will return -EAGAIN
+        // and we are no better than if we poll. But we can't keep the
+        // socket always blocking because of speculation. So we play
+        // those silly fcntl games.
+        //
+        // This is not conditional because speculation likely happened
+        // and made us non-blocking
+        auto r = ::fcntl(pfd->fd.get(), F_SETFL, flags & ~O_NONBLOCK);
+        assert(r == 0);
+
+        auto* desc = pfd->get_accept_desc();
+        auto req = internal::io_request::make_accept(listenfd.fd.get(), desc->sa(), desc->sl(), SOCK_CLOEXEC);
+        _r->submit_io(desc, std::move(req));
+        return desc->get_future();
+    } catch (...) {
+        return make_exception_future<std::tuple<pollable_fd, socket_address>>(std::current_exception());
+    }
+}
+
+future<> reactor_backend_uring::connect(pollable_fd_state& fd, socket_address& sa) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    auto* desc = pfd->get_connect_desc(sa);
+    auto req = internal::io_request::make_connect(fd.fd.get(), &desc->sockaddr().as_posix_sockaddr(), sa.length());
+    _r->submit_io(desc, std::move(req));
+    return desc->get_future();
+}
+
+void reactor_backend_uring::shutdown(pollable_fd_state& fd, int how) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    auto* connect_desc = pfd->connect_desc_addr();
+    auto connect_req = internal::io_request::make_cancel(fd.fd.get(), connect_desc);
+    _r->submit_io(&_empty_completion, std::move(connect_req));
+
+    auto* accept_desc = pfd->accept_desc_addr();
+    auto accept_req = internal::io_request::make_cancel(fd.fd.get(), accept_desc);
+    _r->submit_io(&_empty_completion, std::move(accept_req));
+
+    fd.fd.shutdown(how);
+}
+
+future<size_t>
+reactor_backend_uring::read_some(pollable_fd_state& fd, void* buffer, size_t len) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    try {
+        if (try_speculate_poll(fd, EPOLLIN)) {
+            auto r = fd.fd.recv(buffer, len, MSG_DONTWAIT);
+            if (r) {
+                return uring_network_completion::complete_with(pfd, *r, len, POLLIN);
+            }
+        }
+
+        // speculation failed, try blocking read
+        auto* desc = pfd->get_network_desc(POLLIN, len);
+        auto fut = desc->get_future();
+        auto req = io_request::make_recv(fd.fd.get(), buffer, len, 0);
+        _r->submit_io(desc, std::move(req));
+        return fut;
+    } catch (...) {
+        return make_exception_future<size_t>(std::current_exception());
+    }
+}
+
+future<size_t>
+reactor_backend_uring::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    try {
+        ::msghdr mh;
+        mh.msg_iov = const_cast<iovec*>(&iov[0]);
+        mh.msg_iovlen = iov.size();
+
+        if (try_speculate_poll(fd, EPOLLIN)) {
+            auto r = fd.fd.recvmsg(&mh, MSG_DONTWAIT);
+            if (r) {
+                return uring_network_completion::complete_with(pfd, *r, iovec_len(iov), POLLIN);
+            }
+        }
+
+        auto* desc = pfd->get_network_desc(POLLIN, iovec_len(iov));
+        mh = desc->msg();
+        mh.msg_iov = const_cast<iovec*>(&iov[0]);
+        mh.msg_iovlen = iov.size();
+        auto fut = desc->get_future();
+        auto req = io_request::make_recvmsg(fd.fd.get(), &mh, 0);
+        _r->submit_io(desc, std::move(req));
+        return fut;
+    } catch (...) {
+        return make_exception_future<size_t>(std::current_exception());
+    }
+}
+
+future<size_t>
+reactor_backend_uring::write_some(pollable_fd_state& fd, const void* buffer, size_t len) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    try {
+        if (try_speculate_poll(fd, EPOLLOUT)) {
+            auto r = fd.fd.send(buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (r) {
+                return uring_network_completion::complete_with(pfd, *r, len, POLLOUT);
+            }
+        }
+
+        // speculation failed, try blocking read from the read
+        auto* desc = pfd->get_network_desc(POLLOUT, len);
+        auto fut = desc->get_future();
+        auto req = io_request::make_send(fd.fd.get(), buffer, len, MSG_NOSIGNAL);
+        _r->submit_io(desc, std::move(req));
+        return fut;
+    } catch (...) {
+        return make_exception_future<size_t>(std::current_exception());
+    }
+}
+
+future<size_t>
+reactor_backend_uring::write_some(pollable_fd_state& fd, net::packet& p) {
+    auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
+    try {
+        ::msghdr mh = {};
+        mh.msg_iov = reinterpret_cast<iovec*>(p.fragment_array());
+        mh.msg_iovlen = std::min<size_t>(p.nr_frags(), IOV_MAX);
+
+        if (try_speculate_poll(fd, EPOLLOUT)) {
+            auto r = fd.fd.sendmsg(&mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (r) {
+                return uring_network_completion::complete_with(pfd, *r, p.len(), POLLOUT);
+            }
+        }
+
+        auto* desc = pfd->get_network_desc(POLLOUT, p.len());
+        auto fut = desc->get_future();
+        mh = desc->msg();
+        mh.msg_iov = reinterpret_cast<iovec*>(p.fragment_array());
+        mh.msg_iovlen = std::min<size_t>(p.nr_frags(), IOV_MAX);
+        // speculation failed, try blocking operation
+        auto req = io_request::make_sendmsg(fd.fd.get(), &mh, MSG_NOSIGNAL);
+        _r->submit_io(desc, std::move(req));
+        return fut;
+    } catch (...) {
+        return make_exception_future<size_t>(std::current_exception());
+    }
+}
+
+void reactor_backend_uring::start_tick() {
+    _timer_aio_context.start_tick();
+}
+
+void reactor_backend_uring::stop_tick() {
+    _timer_aio_context.stop_tick();
+    g_need_preempt = &_r->_preemption_monitor;
+}
+
+void reactor_backend_uring::reset_preemption_monitor() {
+    _timer_aio_context.reset_preemption_monitor();
+}
+
+void reactor_backend_uring::request_preemption() {
+    _timer_aio_context.request_preemption();
+}
+
+void reactor_backend_uring::start_handling_signal() {
+    // The uring backend only uses SIGHUP/SIGTERM/SIGINT (same as aio). We don't need to handle them right away and our
+    // implementation of request_preemption is not signal safe, so do nothing.
+}
+
+pollable_fd_state*
+reactor_backend_uring::make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) {
+    // FIXME: we use recvmsg for reading udp sockets, and both sendmsg and sendto for writing.
+    // Unfortunately when using recvmsg we set the cmsg fields in the msghdr structure, and
+    // io_uring doesn't like that - see Linux commit d69e07793f891524c6bbf1e75b9ae69db4450953.
+    // Because we mark sockets as blocking, we need to do that only if we are not dealing with
+    // udp sockets, otherwise we will block in the aio implementation.
+    //
+    // I am attaching this as a FIXME because I have hope that at some point Linux will change
+    // its behavior here - or we will change seastar not to use cmsg. At that point we can
+    // remove this and implement all the other UDP network functions within uring.
+    struct stat statbuf;
+    fstat(fd.get(), &statbuf);
+    int type = 0;
+    if (S_ISSOCK(statbuf.st_mode)) {
+        type = fd.getsockopt<int>(SOL_SOCKET, SO_TYPE);
+    }
+    if (S_ISSOCK(statbuf.st_mode) && (type != SOCK_DGRAM)) {
+        // Uring will work with unblocking operations
+        ::fcntl(fd.get(), F_SETFL, ::fcntl(fd.get(), F_GETFL) & ~O_NONBLOCK);
+    }
+    return new uring_pollable_fd_state(std::move(fd), std::move(speculate));
+}
+#endif
 
 }

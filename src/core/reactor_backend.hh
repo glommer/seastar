@@ -46,6 +46,18 @@ namespace seastar {
 class reactor;
 class kernel_completion;
 
+// FIXME: merge it with storage context below. At this point the
+// main thing to do is unify the iocb list
+struct aio_general_context {
+    explicit aio_general_context(size_t nr);
+    ~aio_general_context();
+    internal::linux_abi::aio_context_t io_context{};
+    std::unique_ptr<internal::linux_abi::iocb*[]> iocbs;
+    internal::linux_abi::iocb** last = iocbs.get();
+    void queue(internal::linux_abi::iocb* iocb);
+    void flush();
+};
+
 class aio_storage_context {
 public:
     static constexpr unsigned max_aio = 1024;
@@ -72,6 +84,69 @@ private:
 
     boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio;
     boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio_retry;
+};
+
+class completion_with_iocb {
+    bool _in_context = false;
+    internal::linux_abi::iocb _iocb;
+protected:
+    completion_with_iocb(int fd, int events, void* user_data);
+    void completed() {
+        _in_context = false;
+    }
+public:
+    void maybe_queue(aio_general_context& context);
+};
+
+class fd_kernel_completion : public kernel_completion {
+protected:
+    reactor* _r;
+    file_desc& _fd;
+    fd_kernel_completion(reactor* r, file_desc& fd) : _r(r), _fd(fd) {}
+    void set_exception(std::exception_ptr ptr) { throw ptr; }
+public:
+    file_desc& fd() {
+        return _fd;
+    }
+};
+
+struct hrtimer_aio_completion : public fd_kernel_completion,
+                                public completion_with_iocb {
+    hrtimer_aio_completion(reactor* r, file_desc& fd);
+    void set_value(ssize_t value);
+};
+
+struct task_quota_aio_completion : public fd_kernel_completion,
+                                   public completion_with_iocb {
+    task_quota_aio_completion(reactor* r, file_desc& fd);
+    void set_value(ssize_t value);
+};
+
+struct smp_wakeup_aio_completion : public fd_kernel_completion,
+                                   public completion_with_iocb {
+    smp_wakeup_aio_completion(reactor* r, file_desc& fd);
+    void set_value(ssize_t value);
+};
+
+// Common aio-based Implementation of the task quota and hrtimer.
+class preempt_io_context {
+    reactor* _r;
+    aio_general_context _context{2};
+
+    task_quota_aio_completion _task_quota_aio_completion;
+    hrtimer_aio_completion _hrtimer_aio_completion;
+public:
+    preempt_io_context(reactor* r, file_desc& task_quota, file_desc& hrtimer);
+    bool service_preempting_io();
+
+    void flush() {
+        return _context.flush();
+    }
+
+    void reset_preemption_monitor();
+    void request_preemption();
+    void start_tick();
+    void stop_tick();
 };
 
 // The "reactor_backend" interface provides a method of waiting for various
@@ -155,38 +230,18 @@ public:
 class reactor_backend_aio : public reactor_backend {
     static constexpr size_t max_polls = 10000;
     reactor* _r;
+    file_desc _hrtimer_timerfd;
     aio_storage_context _aio_storage_context;
     // We use two aio contexts, one for preempting events (the timer tick and
     // signals), the other for non-preempting events (fd poll).
-    struct context {
-        explicit context(size_t nr);
-        ~context();
-        internal::linux_abi::aio_context_t io_context{};
-        std::unique_ptr<internal::linux_abi::iocb*[]> iocbs;
-        internal::linux_abi::iocb** last = iocbs.get();
-        void replenish(internal::linux_abi::iocb* iocb, bool& flag);
-        void queue(internal::linux_abi::iocb* iocb);
-        void flush();
-    };
-    context _preempting_io{2}; // Used for the timer tick and the high resolution timer
-    context _polling_io{max_polls}; // FIXME: unify with disk aio_context
-    file_desc _steady_clock_timer = make_timerfd();
-    internal::linux_abi::iocb _task_quota_timer_iocb;
-    internal::linux_abi::iocb _timerfd_iocb;
-    internal::linux_abi::iocb _smp_wakeup_iocb;
-    bool _task_quota_timer_in_preempting_io = false;
-    bool _timerfd_in_preempting_io = false;
-    bool _timerfd_in_polling_io = false;
-    bool _smp_wakeup_in_polling_io = false;
-    std::stack<std::unique_ptr<internal::linux_abi::iocb>> _iocb_pool;
+    preempt_io_context _preempting_io; // Used for the timer tick and the high resolution timer
+    aio_general_context _polling_io{max_polls}; // FIXME: unify with disk aio_context
+    hrtimer_aio_completion _hrtimer_poll_completion;
+    smp_wakeup_aio_completion _smp_wakeup_aio_completion;
+
 private:
-    internal::linux_abi::iocb* new_iocb();
-    void free_iocb(internal::linux_abi::iocb* iocb);
     static file_desc make_timerfd();
-    void process_task_quota_timer();
-    void process_timerfd();
     void process_smp_wakeup();
-    bool service_preempting_io();
     bool await_events(int timeout, const sigset_t* active_sigmask);
 public:
     explicit reactor_backend_aio(reactor* r);

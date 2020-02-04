@@ -26,6 +26,7 @@
 #include <vector>
 #include <tuple>
 #include <seastar/core/internal/io_desc.hh>
+#include <seastar/core/linux-aio.hh>
 
 namespace seastar {
 
@@ -42,15 +43,24 @@ class packet;
 
 class pollable_fd_state_completion : public kernel_completion {
     promise<> _pr;
+    internal::linux_abi::iocb _iocb;
 public:
+    pollable_fd_state_completion() {}
+    pollable_fd_state_completion(internal::linux_abi::iocb iocb) : _iocb(std::move(iocb)) {}
+
     void set_exception(std::exception_ptr ptr) {
         _pr.set_exception(std::move(ptr));
     }
     void set_value(ssize_t res) {
         _pr.set_value();
     }
+
     future<> get_future() {
         return _pr.get_future();
+    }
+
+    internal::linux_abi::iocb& iocb() {
+        return _iocb;
     }
 };
 

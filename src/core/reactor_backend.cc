@@ -221,84 +221,136 @@ bool aio_storage_context::can_sleep() const {
     return executing == 0 || _r->_aio_eventfd;
 }
 
-reactor_backend_aio::context::context(size_t nr) : iocbs(new iocb*[nr]) {
+aio_general_context::aio_general_context(size_t nr) : iocbs(new iocb*[nr]) {
     setup_aio_context(nr, &io_context);
 }
 
-reactor_backend_aio::context::~context() {
+aio_general_context::~aio_general_context() {
     io_destroy(io_context);
 }
 
-void reactor_backend_aio::context::replenish(linux_abi::iocb* iocb, bool& flag) {
-    if (!flag) {
-        flag = true;
-        queue(iocb);
-    }
-}
-
-void reactor_backend_aio::context::queue(linux_abi::iocb* iocb) {
+void aio_general_context::queue(linux_abi::iocb* iocb) {
     *last++ = iocb;
 }
 
-void reactor_backend_aio::context::flush() {
+void aio_general_context::flush() {
     if (last != iocbs.get()) {
         auto nr = last - iocbs.get();
         last = iocbs.get();
-        io_submit(io_context, nr, iocbs.get());
+        auto r = io_submit(io_context, nr, iocbs.get());
+        assert(r >= 0);
     }
 }
 
-linux_abi::iocb* reactor_backend_aio::new_iocb() {
-    if (_iocb_pool.empty()) {
-        return new linux_abi::iocb;
-    }
-    auto ret = _iocb_pool.top().release();
-    _iocb_pool.pop();
-    return ret;
+completion_with_iocb::completion_with_iocb(int fd, int events, void* user_data)
+    : _iocb(make_poll_iocb(fd, events)) {
+    set_user_data(_iocb, user_data);
 }
 
-void reactor_backend_aio::free_iocb(linux_abi::iocb* iocb) {
-    _iocb_pool.push(std::unique_ptr<linux_abi::iocb>(iocb));
+void completion_with_iocb::maybe_queue(aio_general_context& context) {
+    if (!_in_context) {
+        _in_context = true;
+        context.queue(&_iocb);
+    }
+}
+
+hrtimer_aio_completion::hrtimer_aio_completion(reactor* r, file_desc& fd)
+    : fd_kernel_completion(r, fd)
+    , completion_with_iocb(fd.get(), POLLIN, this) {}
+
+task_quota_aio_completion::task_quota_aio_completion(reactor* r, file_desc& fd)
+    : fd_kernel_completion(r, fd)
+    , completion_with_iocb(fd.get(), POLLIN, this) {}
+
+smp_wakeup_aio_completion::smp_wakeup_aio_completion(reactor* r, file_desc& fd)
+        : fd_kernel_completion(r, fd)
+        , completion_with_iocb(fd.get(), POLLIN, this) {}
+
+void
+hrtimer_aio_completion::set_value(ssize_t ret) {
+    uint64_t expirations = 0;
+    (void)_fd.read(&expirations, 8);
+    if (expirations) {
+        _r->service_highres_timer();
+    }
+    completion_with_iocb::completed();
+}
+
+void
+task_quota_aio_completion::set_value(ssize_t ret) {
+    uint64_t v;
+    (void)_fd.read(&v, 8);
+    completion_with_iocb::completed();
+}
+
+void
+smp_wakeup_aio_completion::set_value(ssize_t ret) {
+    uint64_t ignore = 0;
+    (void)_fd.read(&ignore, 8);
+    completion_with_iocb::completed();
+}
+
+preempt_io_context::preempt_io_context(reactor* r, file_desc& task_quota, file_desc& hrtimer)
+    : _r(r)
+    , _task_quota_aio_completion(r, task_quota)
+    , _hrtimer_aio_completion(r, hrtimer)
+{}
+
+
+void preempt_io_context::start_tick() {
+    // Preempt whenever an event (timer tick or signal) is available on the
+    // _preempting_io ring
+    g_need_preempt = reinterpret_cast<const preemption_monitor*>(_context.io_context + 8);
+    // preempt_io_context::request_preemption() will write to reactor::_preemption_monitor, which is now ignored
+}
+
+void preempt_io_context::stop_tick() {
+    g_need_preempt = &_r->_preemption_monitor;
+}
+
+void preempt_io_context::request_preemption() {
+    ::itimerspec expired = {};
+    expired.it_value.tv_nsec = 1;
+    // will trigger immediately, triggering the preemption monitor
+    _hrtimer_aio_completion.fd().timerfd_settime(TFD_TIMER_ABSTIME, expired);
+
+    // This might have been called from poll_once. If that is the case, we cannot assume that timerfd is being
+    // monitored.
+    _hrtimer_aio_completion.maybe_queue(_context);
+    _context.flush();
+
+    // The kernel is not obliged to deliver the completion immediately, so wait for it
+    while (!need_preempt()) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+}
+
+void preempt_io_context::reset_preemption_monitor() {
+    service_preempting_io();
+    _hrtimer_aio_completion.maybe_queue(_context);
+    _task_quota_aio_completion.maybe_queue(_context);
+    flush();
+}
+
+bool preempt_io_context::service_preempting_io() {
+    linux_abi::io_event a[2];
+    auto r = io_getevents(_context.io_context, 0, 2, a, 0);
+    assert(r != -1);
+    bool did_work = r > 0;
+    for (unsigned i = 0; i != unsigned(r); ++i) {
+        auto desc = reinterpret_cast<kernel_completion*>(a[i].data);
+        desc->set_value(size_t(a[i].res));
+    }
+    return did_work;
 }
 
 file_desc reactor_backend_aio::make_timerfd() {
     return file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK);
 }
 
-void reactor_backend_aio::process_task_quota_timer() {
-    uint64_t v;
-    (void)_r->_task_quota_timer.read(&v, 8);
-}
-
-void reactor_backend_aio::process_timerfd() {
-    uint64_t expirations = 0;
-    _steady_clock_timer.read(&expirations, 8);
-    if (expirations) {
-        _r->service_highres_timer();
-    }
-}
-
 void reactor_backend_aio::process_smp_wakeup() {
     uint64_t ignore = 0;
     _r->_notify_eventfd.read(&ignore, 8);
-}
-
-bool reactor_backend_aio::service_preempting_io() {
-    linux_abi::io_event a[2];
-    auto r = io_getevents(_preempting_io.io_context, 0, 2, a, 0);
-    assert(r != -1);
-    bool did_work = false;
-    for (unsigned i = 0; i != unsigned(r); ++i) {
-        if (get_iocb(a[i]) == &_task_quota_timer_iocb) {
-            _task_quota_timer_in_preempting_io = false;
-            process_task_quota_timer();
-        } else if (get_iocb(a[i]) == &_timerfd_iocb) {
-            _timerfd_in_preempting_io = false;
-            process_timerfd();
-            did_work = true;
-        }
-    }
-    return did_work;
 }
 
 bool reactor_backend_aio::await_events(int timeout, const sigset_t* active_sigmask) {
@@ -326,19 +378,8 @@ bool reactor_backend_aio::await_events(int timeout, const sigset_t* active_sigma
         for (unsigned i = 0; i != unsigned(r); ++i) {
             did_work = true;
             auto& event = batch[i];
-            auto iocb = get_iocb(event);
-            if (iocb == &_timerfd_iocb) {
-                _timerfd_in_polling_io = false;
-                process_timerfd();
-                continue;
-            } else if (iocb == &_smp_wakeup_iocb) {
-                _smp_wakeup_in_polling_io = false;
-                process_smp_wakeup();
-                continue;
-            }
             auto* desc = reinterpret_cast<kernel_completion*>(uintptr_t(event.data));
             desc->set_value(event.res);
-            free_iocb(iocb);
         }
         // For the next iteration, don't use a timeout, since we may have waited already
         ts = {};
@@ -353,11 +394,12 @@ void reactor_backend_aio::signal_received(int signo, siginfo_t* siginfo, void* i
 
 reactor_backend_aio::reactor_backend_aio(reactor* r)
     : _r(r)
+    , _hrtimer_timerfd(make_timerfd())
     , _aio_storage_context(_r)
+    , _preempting_io(_r, _r->_task_quota_timer, _hrtimer_timerfd)
+    , _hrtimer_poll_completion(_r, _hrtimer_timerfd)
+    , _smp_wakeup_aio_completion(_r, _r->_notify_eventfd)
 {
-    _task_quota_timer_iocb = make_poll_iocb(_r->_task_quota_timer.get(), POLLIN);
-    _timerfd_iocb = make_poll_iocb(_steady_clock_timer.get(), POLLIN);
-    _smp_wakeup_iocb = make_poll_iocb(_r->_notify_eventfd.get(), POLLIN);
     // Protect against spurious wakeups - if we get notified that the timer has
     // expired when it really hasn't, we don't want to block in read(tfd, ...).
     auto tfd = _r->_task_quota_timer.get();
@@ -374,15 +416,16 @@ bool reactor_backend_aio::wait_and_process_fd_notifications() {
 
 void reactor_backend_aio::sleep_interruptible(const sigset_t* active_sigmask) {
     int timeout = -1;
-    bool did_work = service_preempting_io();
+    bool did_work = _preempting_io.service_preempting_io();
     if (did_work) {
         timeout = 0;
     }
-    _polling_io.replenish(&_timerfd_iocb, _timerfd_in_polling_io);
-    _polling_io.replenish(&_smp_wakeup_iocb, _smp_wakeup_in_polling_io);
+
+    _hrtimer_poll_completion.maybe_queue(_polling_io);
+    _smp_wakeup_aio_completion.maybe_queue(_polling_io);
     _polling_io.flush();
     await_events(timeout, active_sigmask);
-    service_preempting_io(); // clear task quota timer
+    _preempting_io.service_preempting_io(); // clear task quota timer
 }
 
 future<> reactor_backend_aio::poll(pollable_fd_state& fd, pollable_fd_state_completion* desc, int events) {
@@ -391,13 +434,12 @@ future<> reactor_backend_aio::poll(pollable_fd_state& fd, pollable_fd_state_comp
             fd.events_known &= ~events;
             return make_ready_future<>();
         }
-        auto iocb = new_iocb(); // FIXME: merge with pollable_fd_state
-        *iocb = make_poll_iocb(fd.fd.get(), events);
         fd.events_rw = events == (POLLIN|POLLOUT);
 
-        *desc = pollable_fd_state_completion{};
-        set_user_data(*iocb, desc);
-        _polling_io.queue(iocb);
+        *desc = pollable_fd_state_completion(make_poll_iocb(fd.fd.get(), events));
+        auto& iocb = desc->iocb();
+        set_user_data(iocb, desc);
+        _polling_io.queue(&iocb);
         return desc->get_future();
     } catch (...) {
         return make_exception_future<>(std::current_exception());
@@ -421,41 +463,23 @@ void reactor_backend_aio::forget(pollable_fd_state& fd) {
 }
 
 void reactor_backend_aio::start_tick() {
-    // Preempt whenever an event (timer tick or signal) is available on the
-    // _preempting_io ring
-    g_need_preempt = reinterpret_cast<const preemption_monitor*>(_preempting_io.io_context + 8);
-    // reactor::request_preemption() will write to reactor::_preemption_monitor, which is now ignored
+    _preempting_io.start_tick();
 }
 
 void reactor_backend_aio::stop_tick() {
-    g_need_preempt = &_r->_preemption_monitor;
+    _preempting_io.stop_tick();
 }
 
 void reactor_backend_aio::arm_highres_timer(const ::itimerspec& its) {
-    _steady_clock_timer.timerfd_settime(TFD_TIMER_ABSTIME, its);
+    _hrtimer_timerfd.timerfd_settime(TFD_TIMER_ABSTIME, its);
 }
 
 void reactor_backend_aio::reset_preemption_monitor() {
-    service_preempting_io();
-    _preempting_io.replenish(&_timerfd_iocb, _timerfd_in_preempting_io);
-    _preempting_io.replenish(&_task_quota_timer_iocb, _task_quota_timer_in_preempting_io);
-    _preempting_io.flush();
+    _preempting_io.reset_preemption_monitor();
 }
 
 void reactor_backend_aio::request_preemption() {
-    ::itimerspec expired = {};
-    expired.it_value.tv_nsec = 1;
-    arm_highres_timer(expired); // will trigger immediately, triggering the preemption monitor
-
-    // This might have been called from poll_once. If that is the case, we cannot assume that timerfd is being
-    // monitored.
-    _preempting_io.replenish(&_timerfd_iocb, _timerfd_in_preempting_io);
-    _preempting_io.flush();
-
-    // The kernel is not obliged to deliver the completion immediately, so wait for it
-    while (!need_preempt()) {
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-    }
+    _preempting_io.request_preemption();
 }
 
 void reactor_backend_aio::start_handling_signal() {

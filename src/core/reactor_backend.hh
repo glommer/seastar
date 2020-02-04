@@ -25,6 +25,7 @@
 #include <seastar/core/posix.hh>
 #include <seastar/core/internal/pollable_fd.hh>
 #include <seastar/core/internal/poll.hh>
+#include <seastar/core/internal/liburing.hh>
 #include <seastar/core/linux-aio.hh>
 #include <seastar/core/cacheline.hh>
 #include <sys/time.h>
@@ -34,6 +35,7 @@
 #include <boost/any.hpp>
 #include <boost/program_options.hpp>
 #include <boost/container/static_vector.hpp>
+#include <seastar/core/metrics_registration.hh>
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
@@ -122,6 +124,37 @@ struct task_quota_aio_completion : public fd_kernel_completion,
 struct smp_wakeup_aio_completion : public fd_kernel_completion,
                                    public completion_with_iocb {
     smp_wakeup_aio_completion(reactor* r, file_desc& fd);
+    virtual void complete_with(ssize_t value) override;
+};
+
+// Only used for the internal management fds like the smp_wakeup and
+// hrtimer. We have to keep track of whether or not it is register
+// before we go to sleep. Other completions don't pay the price of
+// tracking that flag.
+class uring_listener_completion : public fd_kernel_completion {
+    bool _currently_registered = false;
+public:
+    bool is_registered() const {
+        return _currently_registered;
+    }
+    void set_registered(bool flag) {
+        _currently_registered = flag;
+    }
+    uring_listener_completion(reactor* r, file_desc& fd)
+        : fd_kernel_completion(r, fd) {}
+};
+
+class smp_wakeup_uring_completion final : public uring_listener_completion {
+public:
+    smp_wakeup_uring_completion(reactor* r, file_desc& fd)
+        : uring_listener_completion(r, fd) {}
+    virtual void complete_with(ssize_t value) override;
+};
+
+class hrtimer_uring_completion : public uring_listener_completion {
+public:
+    hrtimer_uring_completion(reactor* r, file_desc& fd)
+        : uring_listener_completion(r, fd) {}
     virtual void complete_with(ssize_t value) override;
 };
 
@@ -326,6 +359,103 @@ public:
     make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
 };
 #endif /* HAVE_OSV */
+
+#ifdef SEASTAR_HAVE_URING
+class reactor_backend_uring : public reactor_backend {
+    reactor* _r;
+    file_desc _hrtimer_timerfd;
+    hrtimer_uring_completion _hrtimer_completion;
+    smp_wakeup_uring_completion _smp_wakeup_completion;
+
+    // The empty completion is meant to be used with opcodes that do not need
+    // to take any action. Examples of such opcodes are poll_remove and cancel.
+    // Since the object doesn't do anything anyway, there is no need to reference
+    // count, nor is there a need to have more than one instance. Therefore we keep
+    // the instance here in the main class and all in need can use it
+    class empty_completion : public kernel_completion {
+    public:
+        virtual void complete_with(ssize_t ret) override {}
+    } _empty_completion;
+
+    internal::uring_context _irq_ctx;
+    // You are reading this code, and I know what just popped into your mind:
+    // "Isn't this the uring implementation? What is this aio_context doing here?"
+    //
+    // We will keep using aio for the task quota and high resolution timers. It
+    // is totally possible to use uring for that and still not call into the kernel:
+    //
+    // The uring completion structure looks like this:
+    //
+    // struct io_uring_cq {
+    //    unsigned *khead;
+    //    unsigned *ktail;
+    //    ...
+    // };
+    //
+    // It is possible to find whether or not there are completions by comparing the contents
+    // of the khead and ktail pointers. However, the current implementation of need_preempt(),
+    // as of this writing, is this:
+    //
+    //    uint32_t head = np->head.load(std::memory_order_relaxed);
+    //    uint32_t tail = np->tail.load(std::memory_order_relaxed);
+    //    return __builtin_expect(head != tail, false);
+    //
+    // It assumes that a single 64-bit word will have the head and the tail,
+    // and then we can compare them. This works for the io_getevents, because
+    // this is exactly how the structure is laid out. It works as well for
+    // the epoll implementation, because the epoll implementation uses a
+    // thread that sets a 64-bit variable directly, so we set it to whatever
+    // we please.
+    //
+    // If we were to use uring for the task quota and highres timers,
+    // we would pay the price of a more complex, branched, implementation
+    // of need_preempt. And to which benefit?
+    //
+    // We obviously don't want to preempt on *any* notification in the ring,
+    // just the timers. That means we would need a different ring for those
+    // anyway. We wouldn't be able to save a syscall during pollers, and
+    // need_preempt() is suddenly more complex.
+    //
+    // Does this sound like a win to you?
+    preempt_io_context _timer_aio_context; // for timers.
+
+    seastar::metrics::metric_groups _metrics;
+    void process_one_cqe(io_uring_cqe* cqe);
+    bool register_uring_listener(uring_listener_completion* desc);
+public:
+    explicit reactor_backend_uring(reactor* r);
+
+    virtual bool reap_kernel_completions() override;
+    virtual bool kernel_submit_work() override;
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void wait_and_process_events(const sigset_t* active_sigmask) override;
+    future<> poll(pollable_fd_state& fd, int events);
+    virtual future<> readable(pollable_fd_state& fd) override;
+    virtual future<> writeable(pollable_fd_state& fd) override;
+    virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+    virtual void forget(pollable_fd_state& fd) noexcept override;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
+    virtual void cancel_ongoing_operations(pollable_fd_state& fd) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t len) override;
+
+    virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
+    virtual void start_tick() override;
+    virtual void stop_tick() override;
+    virtual void arm_highres_timer(const ::itimerspec& its) override;
+    virtual void reset_preemption_monitor() override;
+    virtual void request_preemption() override;
+    virtual void start_handling_signal() override;
+
+    virtual pollable_fd_state_ptr
+    make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
+};
+#endif
 
 class reactor_backend_selector {
     std::string _name;

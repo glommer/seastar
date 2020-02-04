@@ -688,7 +688,7 @@ public:
     posix_udp_channel(const socket_address& bind_address)
             : _closed(false) {
         auto sa = bind_address.is_unspecified() ? socket_address(inet_address(inet_address::family::INET)) : bind_address;
-        file_desc fd = file_desc::socket(sa.u.sa.sa_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        file_desc fd = file_desc::socket(sa.u.sa.sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         fd.setsockopt(SOL_IP, IP_PKTINFO, true);
         if (engine().posix_reuseport_available()) {
             fd.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1);

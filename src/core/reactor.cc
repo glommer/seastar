@@ -223,7 +223,7 @@ reactor::accept(pollable_fd_state& listenfd) {
         socket_address sa;
         socklen_t sl = sa.length();
         listenfd.maybe_no_more_recv();
-        auto maybe_fd = listenfd.fd.try_accept(sa, sl, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        auto maybe_fd = listenfd.fd.try_accept(sa, sl, SOCK_CLOEXEC);
         if (!maybe_fd) {
             // We speculated that we will have an another connection, but got a false
             // positive. Try again without speculation.
@@ -242,7 +242,7 @@ reactor::accept(pollable_fd_state& listenfd) {
 future<size_t>
 reactor::read_some(pollable_fd_state& fd, void* buffer, size_t len) {
     return readable(fd).then([this, &fd, buffer, len] () mutable {
-        auto r = fd.fd.read(buffer, len);
+        auto r = fd.fd.recv(buffer, len, MSG_DONTWAIT);
         if (!r) {
             return read_some(fd, buffer, len);
         }
@@ -259,7 +259,7 @@ reactor::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
         ::msghdr mh = {};
         mh.msg_iov = &iov[0];
         mh.msg_iovlen = iov.size();
-        auto r = fd.fd.recvmsg(&mh, 0);
+        auto r = fd.fd.recvmsg(&mh, MSG_DONTWAIT);
         if (!r) {
             return read_some(fd, iov);
         }
@@ -273,7 +273,7 @@ reactor::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
 future<size_t>
 reactor::write_some(pollable_fd_state& fd, const void* buffer, size_t len) {
     return writeable(fd).then([this, &fd, buffer, len] () mutable {
-        auto r = fd.fd.send(buffer, len, MSG_NOSIGNAL);
+        auto r = fd.fd.send(buffer, len, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (!r) {
             return write_some(fd, buffer, len);
         }
@@ -337,7 +337,7 @@ future<size_t> pollable_fd_state::write_some(net::packet& p) {
         msghdr mh = {};
         mh.msg_iov = iov;
         mh.msg_iovlen = std::min<size_t>(p.nr_frags(), IOV_MAX);
-        auto r = fd.sendmsg(&mh, MSG_NOSIGNAL);
+        auto r = fd.sendmsg(&mh, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (!r) {
             return write_some(p);
         }
@@ -387,7 +387,7 @@ future<std::tuple<pollable_fd, socket_address>> pollable_fd_state::accept() {
 future<size_t> pollable_fd_state::recvmsg(struct msghdr *msg) {
     maybe_no_more_recv();
     return engine().readable(*this).then([this, msg] {
-        auto r = fd.recvmsg(msg, 0);
+        auto r = fd.recvmsg(msg, MSG_DONTWAIT);
         if (!r) {
             return recvmsg(msg);
         }
@@ -406,7 +406,7 @@ future<size_t> pollable_fd_state::recvmsg(struct msghdr *msg) {
 future<size_t> pollable_fd_state::sendmsg(struct msghdr* msg) {
     maybe_no_more_send();
     return engine().writeable(*this).then([this, msg] () mutable {
-        auto r = fd.sendmsg(msg, 0);
+        auto r = fd.sendmsg(msg, MSG_DONTWAIT);
         if (!r) {
             return sendmsg(msg);
         }
@@ -423,7 +423,7 @@ future<size_t> pollable_fd_state::sendmsg(struct msghdr* msg) {
 future<size_t> pollable_fd_state::sendto(socket_address addr, const void* buf, size_t len) {
     maybe_no_more_send();
     return engine().writeable(*this).then([this, buf, len, addr] () mutable {
-        auto r = fd.sendto(addr, buf, len, 0);
+        auto r = fd.sendto(addr, buf, len, MSG_DONTWAIT);
         if (!r) {
             return sendto(std::move(addr), buf, len);
         }
@@ -1356,7 +1356,7 @@ void pollable_fd_state::maybe_no_more_send() {
 
 lw_shared_ptr<pollable_fd>
 reactor::make_pollable_fd(socket_address sa, int proto) {
-    file_desc fd = file_desc::socket(sa.u.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, proto);
+    file_desc fd = file_desc::socket(sa.u.sa.sa_family, SOCK_STREAM | SOCK_CLOEXEC, proto);
     return make_lw_shared<pollable_fd>(pollable_fd(std::move(fd)));
 }
 

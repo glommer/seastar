@@ -39,6 +39,111 @@ using namespace std::chrono_literals;
 using namespace internal;
 using namespace internal::linux_abi;
 
+struct reactor_backend_common_helpers {
+    static future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd);
+
+    static future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len);
+    static future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov);
+    static future<size_t> write_some(pollable_fd_state& fd, net::packet& p);
+    static future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t len);
+};
+
+future<std::tuple<pollable_fd, socket_address>>
+reactor_backend_common_helpers::accept(pollable_fd_state& listenfd) {
+    return engine().readable_or_writeable(listenfd).then([&listenfd] () mutable {
+        socket_address sa;
+        socklen_t sl = sa.length();
+        listenfd.maybe_no_more_recv();
+        auto maybe_fd = listenfd.fd.try_accept(sa, sl, SOCK_CLOEXEC);
+        if (!maybe_fd) {
+            // We speculated that we will have an another connection, but got a false
+            // positive. Try again without speculation.
+            return accept(listenfd);
+        }
+        // Speculate that there is another connection on this listening socket, to avoid
+        // a task-quota delay. Usually this will fail, but accept is a rare-enough operation
+        // that it is worth the false positive in order to withstand a connection storm
+        // without having to accept at a rate of 1 per task quota.
+        listenfd.speculate_epoll(EPOLLIN);
+        pollable_fd pfd(std::move(*maybe_fd), pollable_fd::speculation(EPOLLOUT));
+        return make_ready_future<std::tuple<pollable_fd, socket_address>>(std::make_tuple(std::move(pfd), std::move(sa)));
+    });
+}
+
+future<size_t>
+reactor_backend_common_helpers::read_some(pollable_fd_state& fd, void* buffer, size_t len) {
+    return engine().readable(fd).then([&fd, buffer, len] () mutable {
+        auto r = fd.fd.recv(buffer, len, MSG_DONTWAIT);
+        if (!r) {
+            return read_some(fd, buffer, len);
+        }
+        if (size_t(*r) == len) {
+            fd.speculate_epoll(EPOLLIN);
+        }
+        return make_ready_future<size_t>(*r);
+    });
+}
+
+future<size_t>
+reactor_backend_common_helpers::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
+    return engine().readable(fd).then([&fd, iov = iov] () mutable {
+        ::msghdr mh = {};
+        mh.msg_iov = &iov[0];
+        mh.msg_iovlen = iov.size();
+        auto r = fd.fd.recvmsg(&mh, MSG_DONTWAIT);
+        if (!r) {
+            return read_some(fd, iov);
+        }
+        if (size_t(*r) == iovec_len(iov)) {
+            fd.speculate_epoll(EPOLLIN);
+        }
+        return make_ready_future<size_t>(*r);
+    });
+}
+
+future<size_t>
+reactor_backend_common_helpers::write_some(pollable_fd_state& fd, const void* buffer, size_t len) {
+    return engine().writeable(fd).then([&fd, buffer, len] () mutable {
+        auto r = fd.fd.send(buffer, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (!r) {
+            return write_some(fd, buffer, len);
+        }
+        if (size_t(*r) == len) {
+            fd.speculate_epoll(EPOLLOUT);
+        }
+        return make_ready_future<size_t>(*r);
+    });
+}
+
+
+future<size_t>
+reactor_backend_common_helpers::write_some(pollable_fd_state& fd, net::packet& p) {
+    return engine().writeable(fd).then([&fd, &p] () mutable {
+        static_assert(offsetof(iovec, iov_base) == offsetof(net::fragment, base) &&
+            sizeof(iovec::iov_base) == sizeof(net::fragment::base) &&
+            offsetof(iovec, iov_len) == offsetof(net::fragment, size) &&
+            sizeof(iovec::iov_len) == sizeof(net::fragment::size) &&
+            alignof(iovec) == alignof(net::fragment) &&
+            sizeof(iovec) == sizeof(net::fragment)
+            , "net::fragment and iovec should be equivalent");
+
+        iovec* iov = reinterpret_cast<iovec*>(p.fragment_array());
+        msghdr mh = {};
+        mh.msg_iov = iov;
+        mh.msg_iovlen = std::min<size_t>(p.nr_frags(), IOV_MAX);
+        auto r = fd.fd.sendmsg(&mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (!r) {
+            return write_some(fd, p);
+        }
+        if (size_t(*r) == p.len()) {
+            fd.speculate_epoll(EPOLLOUT);
+        }
+        return make_ready_future<size_t>(*r);
+    });
+}
+
+
 aio_storage_context::aio_storage_context(reactor *r)
     : _r(r)
     , _io_context(0)
@@ -462,6 +567,31 @@ void reactor_backend_aio::forget(pollable_fd_state& fd) {
     // ?
 }
 
+future<std::tuple<pollable_fd, socket_address>>
+reactor_backend_aio::accept(pollable_fd_state& listenfd) {
+    return reactor_backend_common_helpers::accept(listenfd);
+}
+
+future<size_t>
+reactor_backend_aio::read_some(pollable_fd_state& fd, void* buffer, size_t len) {
+    return reactor_backend_common_helpers::read_some(fd, buffer, len);
+}
+
+future<size_t>
+reactor_backend_aio::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
+    return reactor_backend_common_helpers::read_some(fd, iov);
+}
+
+future<size_t>
+reactor_backend_aio::write_some(pollable_fd_state& fd, const void* buffer, size_t len) {
+    return reactor_backend_common_helpers::write_some(fd, buffer, len);
+}
+
+future<size_t>
+reactor_backend_aio::write_some(pollable_fd_state& fd, net::packet& p) {
+    return reactor_backend_common_helpers::write_some(fd, p);
+}
+
 void reactor_backend_aio::start_tick() {
     _preempting_io.start_tick();
 }
@@ -660,6 +790,31 @@ void reactor_backend_epoll::forget(pollable_fd_state& fd) {
     if (fd.events_epoll) {
         ::epoll_ctl(_epollfd.get(), EPOLL_CTL_DEL, fd.fd.get(), nullptr);
     }
+}
+
+future<std::tuple<pollable_fd, socket_address>>
+reactor_backend_epoll::accept(pollable_fd_state& listenfd) {
+    return reactor_backend_common_helpers::accept(listenfd);
+}
+
+future<size_t>
+reactor_backend_epoll::read_some(pollable_fd_state& fd, void* buffer, size_t len) {
+    return reactor_backend_common_helpers::read_some(fd, buffer, len);
+}
+
+future<size_t>
+reactor_backend_epoll::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
+    return reactor_backend_common_helpers::read_some(fd, iov);
+}
+
+future<size_t>
+reactor_backend_epoll::write_some(pollable_fd_state& fd, const void* buffer, size_t len) {
+    return reactor_backend_common_helpers::write_some(fd, buffer, len);
+}
+
+future<size_t>
+reactor_backend_epoll::write_some(pollable_fd_state& fd, net::packet& p) {
+    return reactor_backend_common_helpers::write_some(fd, p);
 }
 
 void

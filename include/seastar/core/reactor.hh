@@ -493,6 +493,7 @@ public:
     future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov);
 
     future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t size);
+    future<size_t> write_some(pollable_fd_state& fd, net::packet& p);
 
     future<> write_all(pollable_fd_state& fd, const void* buffer, size_t size);
 

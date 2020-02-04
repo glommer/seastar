@@ -88,6 +88,7 @@ public:
     pollable_fd_state_completion pollout;
 
     friend class reactor;
+    friend class reactor_backend_common_helpers;
     friend class pollable_fd;
 
     future<size_t> read_some(char* buffer, size_t size);

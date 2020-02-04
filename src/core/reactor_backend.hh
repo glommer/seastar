@@ -170,6 +170,13 @@ public:
     virtual future<> readable(pollable_fd_state& fd) = 0;
     virtual future<> writeable(pollable_fd_state& fd) = 0;
     virtual future<> readable_or_writeable(pollable_fd_state& fd) = 0;
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) = 0;
+    virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) = 0;
+    virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) = 0;
+    virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) = 0;
+    virtual future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t len) = 0;
+
     virtual void forget(pollable_fd_state& fd) = 0;
     virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) = 0;
     virtual void start_tick() = 0;
@@ -211,6 +218,14 @@ public:
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t len) override;
+
     virtual void forget(pollable_fd_state& fd) override;
     virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
     virtual void start_tick() override;
@@ -251,6 +266,13 @@ public:
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t len) override;
+
     virtual void forget(pollable_fd_state& fd) override;
     virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
     virtual void start_tick() override;
@@ -285,6 +307,14 @@ public:
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual void forget(pollable_fd_state& fd) override;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<size_t> write_some(net::packet& p) override;
+    virtual future<size_t> write_some(pollable_fd_state& fd, const void* buffer, size_t len) override;
+
     void enable_timer(steady_clock_type::time_point when);
 
     virtual bool kernel_events_can_sleep() const override;

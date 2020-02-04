@@ -64,6 +64,37 @@ public:
     }
 };
 
+class io_uring_network_completion final : public kernel_completion {
+private:
+    promise<size_t> _pr;
+    pollable_fd_state* _fd = nullptr;
+    ::msghdr _msghdr = {};
+    int _speculate_event = 0;
+    size_t _expected_size = 0;
+
+    void maybe_speculate(size_t size);
+public:
+    io_uring_network_completion() {}
+    io_uring_network_completion(pollable_fd_state& fd, int event, size_t expected)
+        : _fd(&fd)
+        , _speculate_event(event)
+        , _expected_size(expected)
+    {}
+    void set_exception(std::exception_ptr ptr) {
+        _pr.set_exception(ptr);
+    }
+
+    void set_value(ssize_t res);
+
+    future<size_t> get_future() {
+        return _pr.get_future();
+    }
+
+    ::msghdr& msg() {
+        return _msghdr;
+    }
+};
+
 class pollable_fd_state {
 public:
     struct speculation {
@@ -84,6 +115,8 @@ public:
     int events_epoll = 0;     // installed in epoll
     int events_known = 0;     // returned from epoll
 
+    io_uring_network_completion uring_read_completion;
+    io_uring_network_completion uring_write_completion;
     pollable_fd_state_completion pollin;
     pollable_fd_state_completion pollout;
 

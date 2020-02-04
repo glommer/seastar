@@ -25,6 +25,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/internal/io_desc.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/core/internal/liburing.hh>
 #include <chrono>
 #include <sys/poll.h>
 #include <sys/syscall.h>
@@ -393,6 +394,22 @@ smp_wakeup_aio_completion::set_value(ssize_t ret) {
     uint64_t ignore = 0;
     (void)_fd.read(&ignore, 8);
     completion_with_iocb::completed();
+}
+
+void
+hrtimer_uring_completion::set_value(ssize_t ret) {
+    uint64_t expirations = 0;
+    (void)_fd.read(&expirations, 8);
+    if (expirations) {
+        _r->service_highres_timer();
+    }
+}
+
+void
+smp_wakeup_uring_completion::set_value(ssize_t ret) {
+    uint64_t ignore = 0;
+    (void)_fd.read(&ignore, 8);
+    _currently_registered = false;
 }
 
 preempt_io_context::preempt_io_context(reactor* r, file_desc& task_quota, file_desc& hrtimer)
@@ -935,9 +952,14 @@ static bool detect_aio_poll() {
     return r == 1;
 }
 
+using namespace seastar::internal;
+
+static bool detect_uring();
 
 std::unique_ptr<reactor_backend> reactor_backend_selector::create(reactor* r) {
-    if (_name == "linux-aio") {
+    if (_name == "uring") {
+        return std::make_unique<reactor_backend_uring>(r);
+    } else if (_name == "linux-aio") {
         return std::make_unique<reactor_backend_aio>(r);
     } else if (_name == "epoll") {
         return std::make_unique<reactor_backend_epoll>(r);
@@ -951,11 +973,365 @@ reactor_backend_selector reactor_backend_selector::default_backend() {
 
 std::vector<reactor_backend_selector> reactor_backend_selector::available() {
     std::vector<reactor_backend_selector> ret;
+    if (detect_uring()) {
+        ret.push_back(reactor_backend_selector("uring"));
+    }
+
     if (detect_aio_poll()) {
         ret.push_back(reactor_backend_selector("linux-aio"));
     }
     ret.push_back(reactor_backend_selector("epoll"));
     return ret;
 }
+#ifndef SEASTAR_HAVE_URING
+static bool detect_uring() {
+    return false;
+}
+#else
+static bool detect_uring() {
+    try {
+        std::vector<int> opcodes_of_interest = {
+            IORING_OP_READV,
+            IORING_OP_READ,
+            IORING_OP_WRITEV,
+            IORING_OP_WRITE,
+            IORING_OP_SEND,
+            IORING_OP_SENDMSG,
+            IORING_OP_RECVMSG,
+            IORING_OP_FSYNC,
+            IORING_OP_POLL_ADD,
+            IORING_OP_POLL_REMOVE,
+        };
+
+        uring_context ctx = uring_context::make_irq_ring([] (auto* dummy) {});
+        return ctx.ring_features_supported(IORING_FEAT_NODROP) &&
+               ctx.ring_opcodes_supported(std::move(opcodes_of_interest));
+     } catch (std::system_error& e) {
+         return false;
+     }
+}
+
+bool reactor_backend_uring::kernel_events_can_sleep() const {
+    return true;
+}
+
+bool reactor_backend_uring::kernel_events_submit() {
+    auto did_work = _irq_ctx.flush();
+    _timer_aio_context.reset_preemption_monitor();
+    return did_work;
+}
+
+bool reactor_backend_uring::gather_kernel_events_completions() {
+    bool did_work = _irq_ctx.poll();
+    did_work |= _timer_aio_context.service_preempting_io();
+    return did_work;
+}
+
+void reactor_backend_uring::process_one_cqe(io_uring_cqe* cqe) {
+    kernel_completion* desc = reinterpret_cast<kernel_completion*>(cqe->user_data);
+    desc->set_value(size_t(cqe->res));
+}
+
+void reactor_backend_uring::register_uring_listener(fd_kernel_completion* desc) {
+    _irq_ctx.push_prio_sqe([this, desc] (io_uring_sqe& sqe) {
+        io_uring_prep_poll_add(&sqe, desc->fd().get(), POLLIN);
+        io_uring_sqe_set_data(&sqe, desc);
+    });
+}
+
+void reactor_backend_uring::unregister_uring_listener(fd_kernel_completion* desc) {
+    _irq_ctx.push_prio_sqe([this, fd = desc->fd().get()] (io_uring_sqe& sqe) {
+        io_uring_prep_poll_remove(&sqe, reinterpret_cast<void*>(fd));
+        io_uring_sqe_set_data(&sqe, &_empty_completion);
+    });
+}
+
+void prepare_io_sqe(io_request& req, io_uring_sqe& sqe) {
+    switch (req.opcode()) {
+    case io_request::operation::write:
+        io_uring_prep_write(&sqe, req.fd(), req.address(), req.size(), req.pos());
+        break;
+    case io_request::operation::writev:
+        io_uring_prep_writev(&sqe, req.fd(), reinterpret_cast<const iovec*>(req.address()), req.size(), req.pos());
+        break;
+    case io_request::operation::read:
+        io_uring_prep_read(&sqe, req.fd(), req.address(), req.size(), req.pos());
+        break;
+    case io_request::operation::readv:
+        io_uring_prep_readv(&sqe, req.fd(), reinterpret_cast<const iovec*>(req.address()), req.size(), req.pos());
+        break;
+    case io_request::operation::fdatasync:
+        io_uring_prep_fsync(&sqe, req.fd(), IORING_FSYNC_DATASYNC);
+        break;
+    }
+}
+
+static constexpr unsigned cq_ring_size = 256;
+
+reactor_backend_uring::reactor_backend_uring(reactor* r)
+    : _r(r)
+    , _hrtimer_timerfd(file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK))
+    , _hrtimer_completion(_r, _hrtimer_timerfd)
+    , _smp_wakeup_completion(_r, _r->_notify_eventfd)
+    , _irq_ctx(uring_context::make_irq_ring([this] (io_uring_cqe* cqe) { return process_one_cqe(cqe); }, cq_ring_size))
+    , _timer_aio_context(_r, _r->_task_quota_timer, _hrtimer_timerfd)
+{
+    register_uring_listener(&_smp_wakeup_completion);
+    _smp_wakeup_completion.notify_registered();
+    // Protect against spurious wakeups - if we get notified that the timer has
+    // expired when it really hasn't, we don't want to block in read(tfd, ...).
+    auto tfd = _r->_task_quota_timer.get();
+    ::fcntl(tfd, F_SETFL, ::fcntl(tfd, F_GETFL) | O_NONBLOCK);
+
+    sigset_t mask = make_sigset_mask(hrtimer_signal());
+    auto e = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    assert(e == 0);
+}
+
+void reactor_backend_uring::signal_received(int signo, siginfo_t* siginfo, void* ignore) {
+    engine()._signals.action(signo, siginfo, ignore);
+}
+
+bool reactor_backend_uring::wait_and_process_fd_notifications() {
+    return false;
+}
+
+void reactor_backend_uring::arm_highres_timer(const ::itimerspec& its) {
+    _hrtimer_timerfd.timerfd_settime(TFD_TIMER_ABSTIME, its);
+}
+
+void reactor_backend_uring::sleep_interruptible(const sigset_t* active_sigmask) {
+    bool did_work = _timer_aio_context.service_preempting_io();
+    if (did_work) {
+        return;
+    }
+
+    register_uring_listener(&_hrtimer_completion);
+    // If the smp_wakeup fd is registered at the ring at this point,
+    // that means that it hasn't fired yet, or it fired but we haven't
+    // consumed it because we haven't polled the ring. sync_wait_forever
+    // will exit immediately upon seeing the event.
+    //
+    // If it isn't registered then we register now.
+    if (!_smp_wakeup_completion.is_registered()) {
+        register_uring_listener(&_smp_wakeup_completion);
+        _smp_wakeup_completion.notify_registered();
+    }
+
+    // force_flush may need to grab more completions, so the smp_wakeup
+    // may have fired by this point. We need to check again if the smp_wakeup
+    // triggered. If it did, we just bail
+    _irq_ctx.force_flush();
+    if (!_smp_wakeup_completion.is_registered()) {
+        return;
+    }
+    _irq_ctx.sync_wait_forever(active_sigmask);
+
+    // since we're awake, the timer is once more the responsibility of the
+    // getevents interface
+    unregister_uring_listener(&_hrtimer_completion);
+    _irq_ctx.force_flush();
+
+    _timer_aio_context.reset_preemption_monitor();
+
+    // Before we wake up, consume any events that may have been generated so
+    // we have plenty to do in the next task quota.
+    _irq_ctx.poll();
+    return;
+}
+
+future<> reactor_backend_uring::poll(pollable_fd_state& fd, pollable_fd_state_completion* desc, int events) {
+    try {
+        if (try_speculate_poll(fd, events)) {
+            return make_ready_future<>();
+        }
+
+        fd.events_rw = events == (POLLIN|POLLOUT);
+        *desc = pollable_fd_state_completion{};
+        _irq_ctx.push_sqe([this, fd = fd.fd.get(), desc, events] (io_uring_sqe& sqe) {
+            io_uring_prep_poll_add(&sqe, fd, events);
+            io_uring_sqe_set_data(&sqe, reinterpret_cast<void*>(desc));
+        });
+        return desc->get_future();
+    } catch (...) {
+        return make_exception_future<>(std::current_exception());
+    }
+}
+
+future<> reactor_backend_uring::readable(pollable_fd_state& fd) {
+    return poll(fd, &fd.pollin, POLLIN);
+}
+
+future<> reactor_backend_uring::writeable(pollable_fd_state& fd) {
+    return poll(fd, &fd.pollout, POLLOUT);
+}
+
+future<> reactor_backend_uring::readable_or_writeable(pollable_fd_state& fd) {
+    return poll(fd, &fd.pollin, POLLIN|POLLOUT);
+}
+
+void reactor_backend_uring::forget(pollable_fd_state& fd) {
+    _irq_ctx.push_sqe([this, fd = fd.fd.get()] (io_uring_sqe& sqe) {
+        io_uring_prep_poll_remove(&sqe, reinterpret_cast<void*>(fd));
+        io_uring_sqe_set_data(&sqe, &_empty_completion);
+    });
+}
+
+bool
+reactor_backend_uring::try_speculate_poll(pollable_fd_state& fd, int events) {
+    if (events & fd.events_known) {
+        fd.events_known &= ~events;
+        return true;
+    }
+    return false;
+}
+
+future<std::tuple<pollable_fd, socket_address>>
+reactor_backend_uring::accept(pollable_fd_state& listenfd) {
+    return reactor_backend_common_helpers::accept(listenfd);
+}
+
+void io_uring_network_completion::maybe_speculate(size_t size) {
+    if (size == _expected_size) {
+        _fd->speculate_epoll(_speculate_event);
+    }
+}
+
+void io_uring_network_completion::set_value(ssize_t res) {
+    // We don't expect any errors, since our reads are blocking
+    // and EAGAIN is not a thing. Anything that returns a negative
+    // value means something went wrong
+    try {
+        throw_kernel_error(res);
+        size_t size = size_t(res);
+        _pr.set_value(size);
+        maybe_speculate(size);
+    } catch (...) {
+        set_exception(std::current_exception());
+    }
+}
+
+future<size_t>
+reactor_backend_uring::read_some(pollable_fd_state& fd, void* buffer, size_t len) {
+    fd.uring_read_completion = io_uring_network_completion(fd, EPOLLIN, len);
+    auto* desc = &fd.uring_read_completion;
+    auto fut = desc->get_future();
+    if (try_speculate_poll(fd, EPOLLIN)) {
+        auto r = fd.fd.recv(buffer, len, MSG_DONTWAIT);
+        if (r) {
+            desc->set_value(*r);
+            return fut;
+        }
+    }
+
+    // speculation failed, try blocking read
+    _irq_ctx.push_sqe([fd = fd.fd.get(), desc, buffer, len] (io_uring_sqe& sqe) {
+        io_uring_prep_read(&sqe, fd, buffer, len, 0);
+        io_uring_sqe_set_data(&sqe, reinterpret_cast<void*>(desc));
+    });
+    return fut;
+}
+
+future<size_t>
+reactor_backend_uring::read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) {
+    fd.uring_read_completion = io_uring_network_completion(fd, EPOLLIN, iovec_len(iov));
+    auto* desc = &fd.uring_read_completion;
+    auto fut = desc->get_future();
+    auto& mh = desc->msg();
+    mh.msg_iov = const_cast<iovec*>(&iov[0]);
+    mh.msg_iovlen = iov.size();
+
+    if (try_speculate_poll(fd, EPOLLIN)) {
+
+        auto r = fd.fd.recvmsg(&mh, MSG_DONTWAIT);
+        if (r) {
+            desc->set_value(*r);
+            return fut;
+        }
+    }
+
+    _irq_ctx.push_sqe([fd = fd.fd.get(), desc] (io_uring_sqe& sqe) {
+        io_uring_prep_recvmsg(&sqe, fd, &desc->msg(), 0);
+        io_uring_sqe_set_data(&sqe, reinterpret_cast<void*>(desc));
+    });
+    return fut;
+}
+
+future<size_t>
+reactor_backend_uring::write_some(pollable_fd_state& fd, const void* buffer, size_t len) {
+    // Start by speculating
+    fd.uring_write_completion = io_uring_network_completion(fd, EPOLLOUT, len);
+    auto* desc = &fd.uring_write_completion;
+    auto fut = desc->get_future();
+    if (try_speculate_poll(fd, EPOLLOUT)) {
+        auto r = fd.fd.send(buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (r) {
+            desc->set_value(*r);
+            return fut;
+        }
+    }
+
+    // speculation failed, try blocking read from the read
+    _irq_ctx.push_sqe([fd = fd.fd.get(), desc, buffer, len] (io_uring_sqe& sqe) {
+        io_uring_prep_send(&sqe, fd, const_cast<void*>(buffer), len, MSG_NOSIGNAL);
+        io_uring_sqe_set_data(&sqe, reinterpret_cast<void*>(desc));
+    });
+    return fut;
+}
+
+future<size_t>
+reactor_backend_uring::write_some(pollable_fd_state& fd, net::packet& p) {
+    fd.uring_write_completion = io_uring_network_completion(fd, EPOLLOUT, p.len());
+    auto* desc = &fd.uring_write_completion;
+    auto& mh = desc->msg();
+    mh.msg_iov = reinterpret_cast<iovec*>(p.fragment_array());
+    mh.msg_iovlen = std::min<size_t>(p.nr_frags(), IOV_MAX);
+    auto fut = desc->get_future();
+    if (try_speculate_poll(fd, EPOLLOUT)) {
+        auto r = fd.fd.sendmsg(&mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (r) {
+            desc->set_value(*r);
+            return fut;
+        }
+    }
+
+    // speculation failed, try blocking operation
+    _irq_ctx.push_sqe([fd = fd.fd.get(), desc] (io_uring_sqe& sqe) {
+        io_uring_prep_sendmsg(&sqe, fd, &desc->msg(), MSG_NOSIGNAL);
+        io_uring_sqe_set_data(&sqe, reinterpret_cast<void*>(desc));
+    });
+    return fut;
+}
+
+void reactor_backend_uring::start_tick() {
+    _timer_aio_context.start_tick();
+}
+
+void reactor_backend_uring::stop_tick() {
+    _timer_aio_context.stop_tick();
+    g_need_preempt = &_r->_preemption_monitor;
+}
+
+void reactor_backend_uring::reset_preemption_monitor() {
+    _timer_aio_context.reset_preemption_monitor();
+}
+
+void reactor_backend_uring::request_preemption() {
+    _timer_aio_context.request_preemption();
+}
+
+void reactor_backend_uring::start_handling_signal() {
+    // The uring backend only uses SIGHUP/SIGTERM/SIGINT (same as aio). We don't need to handle them right away and our
+    // implementation of request_preemption is not signal safe, so do nothing.
+}
+
+void reactor_backend_uring::submit_io(kernel_completion* desc, internal::io_request req) {
+    auto func = [this, desc, req = std::move(req)] (io_uring_sqe& sqe) mutable {
+        prepare_io_sqe(req, sqe);
+        io_uring_sqe_set_data(&sqe, reinterpret_cast<void*>(desc));
+    };
+    _irq_ctx.push_sqe(std::move(func));
+}
+#endif
 
 }

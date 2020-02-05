@@ -81,7 +81,7 @@ int main(int argc, char** argv)
             return seastar::now();
         }).then([&alien_done_fds, &result]() {
             // check if alien has dismissed me.
-            return seastar::engine().read_some(alien_done_fds, &result, sizeof(result));
+            return alien_done_fds.read_some(reinterpret_cast<char*>(&result), sizeof(result));
         }).then([&result](size_t n) {
             if (n != sizeof(result)) {
                 throw std::runtime_error("read from eventfd failed");

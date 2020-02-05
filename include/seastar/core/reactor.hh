@@ -151,34 +151,6 @@ class kernel_completion;
 class io_queue;
 class disk_config_params;
 
-class aio_storage_context {
-public:
-    static constexpr unsigned max_aio = 1024;
-    aio_storage_context(reactor* r);
-    ~aio_storage_context();
-
-    bool reap_completions();
-    bool submit_work();
-    bool can_sleep() const;
-private:
-    class iocb_pool {
-        alignas(cache_line_size) std::array<internal::linux_abi::iocb, max_aio> _iocb_pool;
-        std::stack<internal::linux_abi::iocb*, boost::container::static_vector<internal::linux_abi::iocb*, max_aio>> _free_iocbs;
-    public:
-        iocb_pool();
-        internal::linux_abi::iocb& get_one();
-        void put_one(internal::linux_abi::iocb* io);
-        unsigned outstanding() const;
-        bool has_capacity() const;
-    };
-
-    reactor* _r;
-    internal::linux_abi::aio_context_t _io_context;
-    iocb_pool _iocb_pool;
-    size_t handle_aio_error(internal::linux_abi::iocb* iocb, int ec);
-    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio_retry;
-};
-
 class reactor {
     using sched_clock = std::chrono::steady_clock;
 private:
@@ -308,7 +280,6 @@ private:
     timer_set<timer<lowres_clock>, &timer<lowres_clock>::_link>::timer_list_t _expired_lowres_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link> _manual_timers;
     timer_set<timer<manual_clock>, &timer<manual_clock>::_link>::timer_list_t _expired_manual_timers;
-    aio_storage_context _io_context;
     boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _pending_aio_retry;
     io_stats _io_stats;
     uint64_t _fsyncs = 0;
@@ -655,10 +626,6 @@ private:
     void replace_poller(pollfn* old, pollfn* neww);
     void register_metrics();
     future<> write_all_part(pollable_fd_state& fd, const void* buffer, size_t size, size_t completed);
-
-    bool kernel_events_can_sleep() const;
-    bool reap_kernel_events_completions();
-    bool kernel_events_submit();
 
     future<> fdatasync(int fd);
 

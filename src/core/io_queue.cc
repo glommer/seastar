@@ -263,7 +263,8 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, internal::io_re
                 pclass.ops++;
                 pclass.bytes += len;
                 pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-                engine().submit_io(desc, std::move(req));
+                req.attach_kernel_completion(desc);
+                engine().submit_io(std::move(req));
             } catch (...) {
                 desc->set_exception(std::current_exception());
             }

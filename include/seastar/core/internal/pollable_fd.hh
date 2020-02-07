@@ -41,12 +41,13 @@ class packet;
 }
 
 class pollable_fd_state {
+protected:
+    ~pollable_fd_state() {}
 public:
     struct speculation {
         int events = 0;
         explicit speculation(int epoll_events_guessed = 0) : events(epoll_events_guessed) {}
     };
-    virtual ~pollable_fd_state();
     pollable_fd_state(const pollable_fd_state&) = delete;
     void operator=(const pollable_fd_state&) = delete;
     void speculate_epoll(int events) { events_known |= events; }
@@ -91,8 +92,9 @@ public:
     using speculation = pollable_fd_state::speculation;
     pollable_fd(file_desc fd, speculation speculate = speculation());
 public:
-    pollable_fd(pollable_fd&&) = default;
-    pollable_fd& operator=(pollable_fd&&) = default;
+    ~pollable_fd();
+    pollable_fd(pollable_fd&&) noexcept;
+    pollable_fd& operator=(pollable_fd&&) noexcept;
     future<size_t> read_some(char* buffer, size_t size) {
         return _s->read_some(buffer, size);
     }
@@ -143,7 +145,7 @@ public:
     }
     file_desc& get_file_desc() const { return _s->fd; }
     void shutdown(int how) { _s->fd.shutdown(how); }
-    void close() { _s.reset(); }
+    void close();
 protected:
     int get_fd() const { return _s->fd.get(); }
     void maybe_no_more_recv() { return _s->maybe_no_more_recv(); }
@@ -152,7 +154,7 @@ protected:
     friend class readable_eventfd;
     friend class writeable_eventfd;
 private:
-    std::unique_ptr<pollable_fd_state> _s;
+    pollable_fd_state* _s;
 };
 
 class writeable_eventfd;

@@ -69,7 +69,7 @@ public:
     virtual void request_preemption() = 0;
     virtual void start_handling_signal() = 0;
 
-    virtual std::unique_ptr<pollable_fd_state> make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) = 0;
+    virtual pollable_fd_state* make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) = 0;
 };
 
 // reactor backend using file-descriptor & epoll, suitable for running on
@@ -100,7 +100,7 @@ public:
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;
 
-    virtual std::unique_ptr<pollable_fd_state>
+    virtual pollable_fd_state*
     make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
 };
 
@@ -162,7 +162,7 @@ public:
     virtual void request_preemption() override;
     virtual void start_handling_signal() override;
 
-    virtual std::unique_ptr<pollable_fd_state>
+    virtual pollable_fd_state*
     make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
 };
 
@@ -184,7 +184,7 @@ public:
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual void forget(pollable_fd_state& fd) override;
     void enable_timer(steady_clock_type::time_point when);
-    virtual std::unique_ptr<pollable_fd_state>
+    virtual pollable_fd_state*
     make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
 };
 #endif /* HAVE_OSV */

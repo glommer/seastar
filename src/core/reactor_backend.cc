@@ -275,6 +275,8 @@ future<> reactor_backend_aio::readable_or_writeable(pollable_fd_state& fd) {
 }
 
 void reactor_backend_aio::forget(pollable_fd_state& fd) {
+    auto* pfd = static_cast<aio_pollable_fd_state*>(&fd);
+    delete pfd;
     // ?
 }
 
@@ -321,9 +323,9 @@ void reactor_backend_aio::start_handling_signal() {
     // implementation of request_preemption is not signal safe, so do nothing.
 }
 
-std::unique_ptr<pollable_fd_state>
+pollable_fd_state*
 reactor_backend_aio::make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) {
-    return std::make_unique<aio_pollable_fd_state>(std::move(fd), std::move(speculate));
+    return new aio_pollable_fd_state(std::move(fd), std::move(speculate));
 }
 
 reactor_backend_epoll::reactor_backend_epoll(reactor* r)
@@ -496,6 +498,8 @@ void reactor_backend_epoll::forget(pollable_fd_state& fd) {
     if (fd.events_epoll) {
         ::epoll_ctl(_epollfd.get(), EPOLL_CTL_DEL, fd.fd.get(), nullptr);
     }
+    auto* efd = static_cast<epoll_pollable_fd_state*>(&fd);
+    delete efd;
 }
 
 void
@@ -509,9 +513,9 @@ void reactor_backend_epoll::start_handling_signal() {
     request_preemption();
 }
 
-std::unique_ptr<pollable_fd_state>
+pollable_fd_state*
 reactor_backend_epoll::make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) {
-    return std::make_unique<epoll_pollable_fd_state>(std::move(fd), std::move(speculate));
+    return new epoll_pollable_fd_state(std::move(fd), std::move(speculate));
 }
 
 void reactor_backend_epoll::reset_preemption_monitor() {
@@ -549,6 +553,7 @@ reactor_backend_osv::writeable(pollable_fd_state& fd) {
 
 void
 reactor_backend_osv::forget(pollable_fd_state& fd) {
+    delete &fd;
     std::cerr << "reactor_backend_osv does not support file descriptors - forget() shouldn't have been called!\n";
     abort();
 }
@@ -558,9 +563,9 @@ reactor_backend_osv::enable_timer(steady_clock_type::time_point when) {
     _poller.set_timer(when);
 }
 
-std::unique_ptr<pollable_fd_state>
+pollable_fd_state*
 reactor_backend_osv::make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) {
-    return std::make_unique<pollable_fd_state>(std::move(fd), std::move(speculate));
+    return new pollable_fd_state(std::move(fd), std::move(speculate));
 }
 #endif
 

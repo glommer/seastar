@@ -24,36 +24,106 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/linux-aio.hh>
 #include <seastar/core/internal/io_desc.hh>
+#include <variant>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <fmt/format.h>
 
 namespace seastar {
 namespace internal {
 
 class io_request {
 public:
-    enum class operation { read, readv, write, writev, fdatasync };
+    enum class operation { read, readv, write, writev, fdatasync, recv, recvmsg, send, sendmsg, accept, connect, poll_add, poll_remove, cancel };
 private:
     operation _op;
     int _fd;
-    uint64_t _pos;
-    void* _address;
-    size_t _size;
+    uint64_t _attr;
+    // the upper layers give us void pointers, but storing void pointers here is just
+    // dangerous. The constructors seem to be happy to convert other pointers to void*,
+    // even if they are marked as explicit, and then you end up losing approximately 3 hours
+    // and 15 minutes (hypothetically, of course), trying to chase the weirdest bug.
+    // Let's store a char* for safety, and cast it back to void* in the accessor.
+    std::variant<char*, iovec*, ::msghdr*, sockaddr*> _ptr;
+    // accept wants a socklen_t*, connect wants a socklen_t
+    std::variant<size_t,socklen_t*,socklen_t> _size;
     kernel_completion* _kernel_completion;
 
-    io_request(operation op, int fd, uint64_t pos, void* address, size_t size)
+    explicit io_request(operation op, int fd, uint64_t attr, ::msghdr* msg)
         : _op(op)
         , _fd(fd)
-        , _pos(pos)
-        , _address(address)
+        , _attr(attr)
+        , _ptr(msg)
+    {}
+
+    explicit io_request(operation op, int fd, sockaddr* sa, socklen_t sl)
+        : _op(op)
+        , _fd(fd)
+        , _ptr(sa)
+        , _size(sl)
+    {}
+
+    explicit io_request(operation op, int fd, uint64_t attr, sockaddr* sa, socklen_t* sl)
+        : _op(op)
+        , _fd(fd)
+        , _attr(attr)
+        , _ptr(sa)
+        , _size(sl)
+    {}
+    explicit io_request(operation op, int fd, uint64_t attr, char* ptr, size_t size)
+        : _op(op)
+        , _fd(fd)
+        , _attr(attr)
+        , _ptr(ptr)
+        , _size(size)
+    {} 
+
+    explicit io_request(operation op, int fd, uint64_t attr, iovec* ptr, size_t size)
+        : _op(op)
+        , _fd(fd)
+        , _attr(attr)
+        , _ptr(ptr)
         , _size(size)
     {}
-    io_request(operation op, int fd) : io_request(op, fd, 0, nullptr, 0) {}
+
+    explicit io_request(operation op, int fd)
+        : _op(op)
+        , _fd(fd)
+    {}
+    explicit io_request(operation op, int fd, uint64_t attr)
+        : _op(op)
+        , _fd(fd)
+        , _attr(attr)
+    {}
+
+    explicit io_request(operation op, int fd, char *ptr)
+        : _op(op)
+        , _fd(fd)
+        , _ptr(ptr)
+    {}
 public:
     bool is_read() const {
-        return ((_op == operation::read) || (_op == operation::readv));
+        switch (_op) {
+        case operation::read:
+        case operation::readv:
+        case operation::recvmsg:
+        case operation::recv:
+            return true;
+        default:
+            return false;
+        }
     }
 
     bool is_write() const {
-        return ((_op == operation::write) || (_op == operation::writev));
+        switch (_op) {
+        case operation::write:
+        case operation::writev:
+        case operation::send:
+        case operation::sendmsg:
+            return true;
+        default:
+            return false;
+        }
     }
 
     sstring opname() const;
@@ -67,15 +137,47 @@ public:
     }
 
     uint64_t pos() const {
-        return _pos;
+        return _attr;
+    }
+
+    int flags() const {
+        return int(_attr);
+    }
+
+    int events() const {
+        return int(_attr);
     }
 
     void* address() const {
-        return _address;
+        return reinterpret_cast<void*>(std::get<char*>(_ptr));
+    }
+
+    iovec* iov() const {
+        return std::get<iovec*>(_ptr);
+    }
+
+    ::sockaddr* posix_sockaddr() const {
+        return std::get<sockaddr*>(_ptr);
+    }
+
+    ::msghdr* msghdr() const {
+        return std::get<::msghdr*>(_ptr);
     }
 
     size_t size() const {
-        return _size;
+        return std::get<size_t>(_size);
+    }
+
+    size_t iov_len() const {
+        return std::get<size_t>(_size);
+    }
+
+    socklen_t socklen() const {
+        return std::get<socklen_t>(_size);
+    }
+
+    socklen_t* socklen_ptr() const {
+        return std::get<socklen_t*>(_size);
     }
 
     void attach_kernel_completion(kernel_completion* kc) {
@@ -87,15 +189,31 @@ public:
     }
 
     static io_request make_read(int fd, uint64_t pos, void* address, size_t size) {
-        return io_request(operation::read, fd, pos, address, size);
+        return io_request(operation::read, fd, pos, reinterpret_cast<char*>(address), size);
     }
 
     static io_request make_readv(int fd, uint64_t pos, std::vector<iovec>& iov) {
         return io_request(operation::readv, fd, pos, iov.data(), iov.size());
     }
 
+    static io_request make_recv(int fd, void* address, size_t size, int flags) {
+        return io_request(operation::recv, fd, flags, reinterpret_cast<char*>(address), size);
+    }
+
+    static io_request make_recvmsg(int fd, ::msghdr* msg, int flags) {
+        return io_request(operation::recvmsg, fd, flags, msg);
+    }
+
+    static io_request make_send(int fd, const void* address, size_t size, int flags) {
+        return io_request(operation::send, fd, flags, const_cast<char*>(reinterpret_cast<const char*>(address)), size);
+    }
+
+    static io_request make_sendmsg(int fd, ::msghdr* msg, int flags) {
+        return io_request(operation::sendmsg, fd, flags, msg);
+    }
+
     static io_request make_write(int fd, uint64_t pos, const void* address, size_t size) {
-        return io_request(operation::write, fd, pos, const_cast<void*>(address), size);
+        return io_request(operation::write, fd, pos, const_cast<char*>(reinterpret_cast<const char*>(address)), size);
     }
 
     static io_request make_writev(int fd, uint64_t pos, std::vector<iovec>& iov) {
@@ -104,6 +222,25 @@ public:
 
     static io_request make_fdatasync(int fd) {
         return io_request(operation::fdatasync, fd);
+    }
+
+    static io_request make_accept(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags) {
+        return io_request(operation::accept, fd, flags, addr, addrlen);
+    }
+
+    static io_request make_connect(int fd, struct sockaddr* addr, socklen_t addrlen) {
+        return io_request(operation::connect, fd, addr, addrlen);
+    }
+
+    static io_request make_poll_add(int fd, int events) {
+        return io_request(operation::poll_add, fd, events);
+    }
+
+    static io_request make_poll_remove(int fd, void *addr) {
+        return io_request(operation::poll_remove, fd, reinterpret_cast<char*>(addr));
+    }
+    static io_request make_cancel(int fd, void *addr) {
+        return io_request(operation::cancel, fd, reinterpret_cast<char*>(addr));
     }
 };
 }

@@ -48,6 +48,7 @@ private:
     // accept wants a socklen_t*, connect wants a socklen_t
     std::variant<size_t,socklen_t*,socklen_t> _size;
     kernel_completion* _kernel_completion;
+    bool _force_async = false;
 
     explicit io_request(operation op, int fd, uint64_t attr, ::msghdr* msg)
         : _op(op)
@@ -124,6 +125,14 @@ public:
         default:
             return false;
         }
+    }
+
+    bool should_force_async() const {
+        return _force_async;
+    }
+
+    void force_async() {
+        _force_async = true;
     }
 
     sstring opname() const;

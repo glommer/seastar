@@ -257,6 +257,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, internal::io_re
         auto desc = std::make_unique<io_desc_read_write>(this, weight, size);
         auto fq_desc = desc->fq_descriptor();
         auto fut = desc->get_future();
+        req.force_async();
         _fq.queue(pclass.ptr, std::move(fq_desc), [&pclass, start, req = std::move(req), desc = desc.release(), len] () mutable noexcept {
             try {
                 pclass.nr_queued--;

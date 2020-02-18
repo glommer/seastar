@@ -85,6 +85,13 @@ public:
     future<size_t> recvmsg(struct msghdr *msg);
     future<size_t> sendto(socket_address addr, const void* buf, size_t len);
 
+    bool try_speculate_poll(int events) {
+        if (events & events_known) {
+            events_known &= ~events;
+            return true;
+        }
+        return false;
+    }
 protected:
     explicit pollable_fd_state(file_desc fd, speculation speculate = speculation())
         : fd(std::move(fd)), events_known(speculate.events) {}

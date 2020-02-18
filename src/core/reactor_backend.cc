@@ -478,8 +478,7 @@ public:
 
 future<> reactor_backend_aio::poll(pollable_fd_state& fd, int events) {
     try {
-        if (events & fd.events_known) {
-            fd.events_known &= ~events;
+        if (fd.try_speculate_poll(events)) {
             return make_ready_future<>();
         }
 
@@ -744,8 +743,7 @@ void reactor_backend_epoll::signal_received(int signo, siginfo_t* siginfo, void*
 }
 
 future<> reactor_backend_epoll::get_epoll_future(pollable_fd_state& pfd, int event) {
-    if (pfd.events_known & event) {
-        pfd.events_known &= ~event;
+    if (pfd.try_speculate_poll(event)) {
         return make_ready_future();
     }
     pfd.events_rw = event == (EPOLLIN | EPOLLOUT);

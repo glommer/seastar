@@ -120,7 +120,17 @@ private:
     {
         _ptr.addr = ptr;
     }
+
+    bool _linked_request = false;
 public:
+    void set_link(bool link) {
+        _linked_request = link;
+    }
+
+    bool should_link() const {
+        return _linked_request;
+    }
+
     bool is_read() const {
         switch (_op) {
         case operation::read:

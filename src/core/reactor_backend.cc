@@ -1045,8 +1045,6 @@ static bool detect_uring() {
      }
 }
 
-class uring_pollable_fd_state;
-
 // We will use this class to do reference counting for the pollable_fd_state.  We
 //
 // Reference counting is needed because deletion can only happen after everything
@@ -1074,25 +1072,19 @@ public:
     }
 };
 
+class uring_pollable_fd_state;
+
 class uring_network_completion : public kernel_completion {
-private:
+protected:
     promise<size_t> _pr;
     ::msghdr _msghdr = {};
-    int _speculate_event = 0;
     size_t _expected_size = 0;
 
     friend class uring_pollable_fd_state;
-
-    static void maybe_speculate(uring_pollable_fd_state* fd, size_t size, size_t expected, int event);
-public:
     uring_network_completion() {}
-    uring_network_completion(int event, size_t expected)
-        : _speculate_event(event)
-        , _expected_size(expected)
-    {}
-
-    static future<size_t> complete_with(uring_pollable_fd_state* fd, ssize_t res, size_t expected, int event);
-    virtual void complete_with(ssize_t res) override;
+    uring_network_completion(size_t expected) : _expected_size(expected) {}
+public:
+    static size_t consume_response(uring_pollable_fd_state* fd, ssize_t res, size_t expected, int event);
 
     future<size_t> get_future() {
         return _pr.get_future();
@@ -1101,6 +1093,20 @@ public:
     ::msghdr& msg() {
         return _msghdr;
     }
+};
+
+class uring_network_read_completion : public uring_network_completion {
+public:
+    virtual void complete_with(ssize_t res) override;
+    uring_network_read_completion() {}
+    uring_network_read_completion(size_t expected) : uring_network_completion(expected) {}
+};
+
+class uring_network_write_completion : public uring_network_completion {
+public:
+    virtual void complete_with(ssize_t res) override;
+    uring_network_write_completion() {}
+    uring_network_write_completion(size_t expected) : uring_network_completion(expected) {}
 };
 
 class uring_connect_completion : public kernel_completion {
@@ -1142,8 +1148,8 @@ public:
         return &_sa.addr_length;
     }
 
-    static future<std::tuple<pollable_fd, socket_address>>
-    complete_with(uring_pollable_fd_state *fd, file_desc, socket_address sa);
+    static std::tuple<pollable_fd, socket_address>
+    consume_response(uring_pollable_fd_state *fd, file_desc, socket_address sa);
     virtual void complete_with(ssize_t res) override;
 
     future<std::tuple<pollable_fd, socket_address>> get_future() {
@@ -1186,8 +1192,8 @@ public:
 class uring_pollable_fd_state : public pollable_fd_state {
     uring_pollin_add_completion _pollin_add;
     uring_pollout_add_completion _pollout_add;
-    uring_network_completion _network_read;
-    uring_network_completion _network_write;
+    uring_network_read_completion _network_read;
+    uring_network_write_completion _network_write;
 
     uring_connect_completion _connect;
     uring_accept_completion _accept;
@@ -1198,7 +1204,8 @@ class uring_pollable_fd_state : public pollable_fd_state {
     uring_pollable_fd_refcnt _refcnt;
 
     friend uring_accept_completion;
-    friend uring_network_completion;
+    friend uring_network_read_completion;
+    friend uring_network_write_completion;
     friend uring_connect_completion;
     friend uring_pollin_remove_completion;
     friend uring_pollout_remove_completion;
@@ -1252,9 +1259,9 @@ public:
 
     uring_network_completion* get_network_desc(int events, size_t len) {
         if (events & POLLIN) {
-            return get_completion(&_network_read, events, len);
+            return get_completion(&_network_read, len);
         } else {
-            return get_completion(&_network_write, events, len);
+            return get_completion(&_network_write, len);
         }
     }
 
@@ -1285,7 +1292,11 @@ public:
     }
 
     uring_network_completion* network_desc_addr(int events) {
-        return events & POLLIN ? &_network_read : &_network_write;
+        if (events & POLLIN) {
+            return &_network_read;
+        } else {
+            return &_network_write;
+        }
     }
 
     explicit uring_pollable_fd_state(file_desc fdesc, speculation speculate)
@@ -1345,13 +1356,8 @@ public:
 void
 uring_pollable_fd_refcnt::destroy_pollable_fd() {
     auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_refcnt);
+    fmt::print(" - Deleting the pollable fd {:x}, fd {}\n", uint64_t(pfd), pfd->fd.get());
     delete pfd;
-}
-
-void uring_network_completion::maybe_speculate(uring_pollable_fd_state* pfd, size_t size, size_t expected_size, int speculate_event) {
-    if (size == expected_size) {
-        pfd->speculate_epoll(speculate_event);
-    }
 }
 
 void uring_accept_completion::complete_with(ssize_t res) {
@@ -1359,7 +1365,7 @@ void uring_accept_completion::complete_with(ssize_t res) {
     try {
         throw_kernel_error(res);
         auto fd = file_desc::from_fd(res);
-        complete_with(listen_pfd, std::move(fd), std::move(_sa)).forward_to(std::move(_pr));
+        _pr.set_value(consume_response(listen_pfd, std::move(fd), std::move(_sa)));
     } catch (...) {
         _pr.set_exception(std::current_exception());
     }
@@ -1400,38 +1406,42 @@ void uring_pollout_add_completion::complete_with(ssize_t res) {
     pfd->forget();
 }
 
-void uring_network_completion::complete_with(ssize_t res) {
-    // We don't expect any errors, since our reads are blocking
-    // and EAGAIN is not a thing. Anything that returns a negative
-    // value means something went wrong
-    uring_pollable_fd_state *pfd;
-
-    if (_speculate_event == POLLIN) {
-        pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_read);
-    } else {
-        pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_write);
+void uring_network_read_completion::complete_with(ssize_t res) {
+    auto* pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_read);
+    try {
+        _pr.set_value(consume_response(pfd, res, _expected_size, POLLIN));
+    } catch (...) {
+        _pr.set_exception(std::current_exception());
     }
-    complete_with(pfd, res, _expected_size, _speculate_event).forward_to(std::move(_pr));
     pfd->forget();
 }
 
-future<std::tuple<pollable_fd, socket_address>>
-uring_accept_completion::complete_with(uring_pollable_fd_state* listenfd, file_desc fd, socket_address sa) {
-    listenfd->speculate_epoll(POLLIN);
-    pollable_fd pfd(std::move(fd), pollable_fd::speculation(POLLOUT));
-    return make_ready_future<std::tuple<pollable_fd, socket_address>>(std::make_tuple(std::move(pfd), std::move(sa)));
+void uring_network_write_completion::complete_with(ssize_t res) {
+    auto* pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_write);
+    try {
+        _pr.set_value(consume_response(pfd, res, _expected_size, POLLOUT));
+    } catch (...) {
+        _pr.set_exception(std::current_exception());
+    }
+    pfd->forget();
+
 }
 
-future<size_t>
-uring_network_completion::complete_with(uring_pollable_fd_state* pfd, ssize_t res, size_t expected, int event) {
-    try {
-        throw_kernel_error(res);
-        size_t size = size_t(res);
-        maybe_speculate(pfd, size, expected, event);
-        return make_ready_future<size_t>(size);
-    } catch (...) {
-        return make_exception_future<size_t>(std::current_exception());
+std::tuple<pollable_fd, socket_address>
+uring_accept_completion::consume_response(uring_pollable_fd_state* listenfd, file_desc fd, socket_address sa) {
+    listenfd->speculate_epoll(POLLIN);
+    pollable_fd pfd(std::move(fd), pollable_fd::speculation(POLLOUT));
+    return std::make_tuple(std::move(pfd), std::move(sa));
+}
+
+size_t
+uring_network_completion::consume_response(uring_pollable_fd_state* pfd, ssize_t res, size_t expected_size, int event) {
+    throw_kernel_error(res);
+    size_t size = size_t(res);
+    if (size == expected_size) {
+        pfd->speculate_epoll(event);
     }
+    return size;
 }
 
 bool reactor_backend_uring::kernel_events_can_sleep() const {
@@ -1595,8 +1605,7 @@ void reactor_backend_uring::forget(pollable_fd_state& fd) noexcept {
         for (auto& op : ops) {
             auto* op_desc = pfd->poll_add_addr(op);
             auto req = io_request::make_poll_remove(pfd->fd.get(), op_desc);
-            auto* desc = pfd->get_poll_remove_desc(op);
-            _r->submit_io(desc, std::move(req));
+            _r->submit_io(&_empty_completion, std::move(req));
         }
     }
     // POLL_REMOVE doesn't depend on the file being open. It only uses the
@@ -1626,7 +1635,8 @@ reactor_backend_uring::accept(pollable_fd_state& listenfd) {
             // magically makes it asynchronous
             auto maybe_fd = listenfd.fd.try_accept(sa, SOCK_CLOEXEC);
             if (maybe_fd) {
-                return uring_accept_completion::complete_with(pfd, std::move(*maybe_fd), std::move(sa));
+                auto ret = uring_accept_completion::consume_response(pfd, std::move(*maybe_fd), std::move(sa));
+                return make_ready_future<std::tuple<pollable_fd, socket_address>>(std::move(ret));
             }
         }
 
@@ -1675,16 +1685,9 @@ reactor_backend_uring::read_some(pollable_fd_state& fd, void* buffer, size_t len
         if (fd.try_speculate_poll(EPOLLIN)) {
             auto r = fd.fd.recv(buffer, len, MSG_DONTWAIT);
             if (r) {
-                return uring_network_completion::complete_with(pfd, *r, len, POLLIN);
+                return make_ready_future<size_t>(uring_network_completion::consume_response(pfd, *r, len, POLLIN));
             }
         }
-
-#if 0
-        auto* desc = pfd->get_poll_add_desc(POLLIN);
-        auto req = io_request::make_poll_add(fd.fd.get(), POLLIN);
-        req.set_link(true);
-        _r->submit_io(desc, std::move(req));
-#endif
 
         // speculation failed, try blocking read
         auto* desc = pfd->get_network_desc(POLLIN, len);
@@ -1709,7 +1712,7 @@ reactor_backend_uring::read_some(pollable_fd_state& fd, const std::vector<iovec>
         if (fd.try_speculate_poll(EPOLLIN)) {
             auto r = fd.fd.recvmsg(&mh, MSG_DONTWAIT);
             if (r) {
-                return uring_network_completion::complete_with(pfd, *r, iovec_len(iov), POLLIN);
+                return make_ready_future<size_t>(uring_network_completion::consume_response(pfd, *r, iovec_len(iov), POLLIN));
             }
         }
 
@@ -1733,7 +1736,7 @@ reactor_backend_uring::write_some(pollable_fd_state& fd, const void* buffer, siz
         if (fd.try_speculate_poll(EPOLLOUT)) {
             auto r = fd.fd.send(buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (r) {
-                return uring_network_completion::complete_with(pfd, *r, len, POLLOUT);
+                return make_ready_future<size_t>(uring_network_completion::consume_response(pfd, *r, len, POLLOUT));
             }
         }
 
@@ -1759,7 +1762,7 @@ reactor_backend_uring::write_some(pollable_fd_state& fd, net::packet& p) {
         if (fd.try_speculate_poll(EPOLLOUT)) {
             auto r = fd.fd.sendmsg(&mh, MSG_NOSIGNAL | MSG_DONTWAIT);
             if (r) {
-                return uring_network_completion::complete_with(pfd, *r, p.len(), POLLOUT);
+                return make_ready_future<size_t>(uring_network_completion::consume_response(pfd, *r, p.len(), POLLOUT));
             }
         }
 

@@ -105,11 +105,11 @@ public:
 
 class posix_data_source_impl final : public data_source_impl {
     compat::polymorphic_allocator<char>* _buffer_allocator;
-    lw_shared_ptr<pollable_fd> _fd;
+    pollable_fd _fd;
     temporary_buffer<char> _buf;
     size_t _buf_size;
 public:
-    explicit posix_data_source_impl(lw_shared_ptr<pollable_fd> fd, compat::polymorphic_allocator<char>* allocator=memory::malloc_allocator,
+    explicit posix_data_source_impl(pollable_fd fd, compat::polymorphic_allocator<char>* allocator=memory::malloc_allocator,
         size_t buf_size = 8192) : _buffer_allocator(allocator), _fd(std::move(fd)),
         _buf(make_temporary_buffer<char>(_buffer_allocator, buf_size)), _buf_size(buf_size) {}
     future<temporary_buffer<char>> get() override;
@@ -117,10 +117,10 @@ public:
 };
 
 class posix_data_sink_impl : public data_sink_impl {
-    lw_shared_ptr<pollable_fd> _fd;
+    pollable_fd _fd;
     packet _p;
 public:
-    explicit posix_data_sink_impl(lw_shared_ptr<pollable_fd> fd) : _fd(std::move(fd)) {}
+    explicit posix_data_sink_impl(pollable_fd fd) : _fd(std::move(fd)) {}
     using data_sink_impl::put;
     future<> put(packet p) override;
     future<> put(temporary_buffer<char> buf) override;

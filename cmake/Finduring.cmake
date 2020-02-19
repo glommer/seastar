@@ -22,9 +22,7 @@
 
 find_package (PkgConfig REQUIRED)
 
-pkg_search_module (uring_PC
-  QUIET
-  liburing)
+pkg_search_module (uring_PC liburing)
 
 find_library (uring_LIBRARY
   NAMES uring

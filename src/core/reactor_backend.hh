@@ -177,7 +177,7 @@ public:
     virtual future<std::tuple<pollable_fd, socket_address>>
     accept(pollable_fd_state& listenfd) = 0;
     virtual future<> connect(pollable_fd_state& fd, socket_address& sa) = 0;
-    virtual void shutdown(pollable_fd_state& fd, int how) = 0;
+    virtual void cancel_ongoing_operations(pollable_fd_state& fd) = 0;
     virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) = 0;
     virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) = 0;
     virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) = 0;
@@ -225,7 +225,7 @@ public:
     virtual future<std::tuple<pollable_fd, socket_address>>
     accept(pollable_fd_state& listenfd) override;
     virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
-    virtual void shutdown(pollable_fd_state& fd, int how) override;
+    virtual void cancel_ongoing_operations(pollable_fd_state& fd) override;
     virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
     virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
     virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) override;
@@ -272,7 +272,7 @@ public:
     virtual future<std::tuple<pollable_fd, socket_address>>
     accept(pollable_fd_state& listenfd) override;
     virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
-    virtual void shutdown(pollable_fd_state& fd, int how) override;
+    virtual void cancel_ongoing_operations(pollable_fd_state& fd) override;
     virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
     virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
     virtual future<size_t> write_some(pollable_fd_state& fd, net::packet& p) override;
@@ -315,7 +315,7 @@ public:
     virtual future<std::tuple<pollable_fd, socket_address>>
     accept(pollable_fd_state& listenfd) override;
     virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
-    virtual void shutdown(pollable_fd_state& fd, int how) override;
+    virtual void cancel_ongoing_operations(pollable_fd_state& fd) override;
     virtual future<size_t> read_some(pollable_fd_state& fd, void* buffer, size_t len) override;
     virtual future<size_t> read_some(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
     virtual future<size_t> write_some(net::packet& p) override;

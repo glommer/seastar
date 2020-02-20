@@ -165,7 +165,7 @@ public:
     }
     file_desc& get_file_desc() const { return _s->fd; }
     void shutdown(int how);
-    void close() { _s.reset(); }
+    void close();
     explicit operator bool() const noexcept {
         return bool(_s);
     }

@@ -524,8 +524,7 @@ future<> reactor_backend_aio::connect(pollable_fd_state& fd, socket_address& sa)
     return engine().do_connect(fd, sa);
 }
 
-void reactor_backend_aio::shutdown(pollable_fd_state& fd, int how) {
-    fd.fd.shutdown(how);
+void reactor_backend_aio::cancel_ongoing_operations(pollable_fd_state& fd) {
 }
 
 future<size_t>
@@ -792,8 +791,7 @@ future<> reactor_backend_epoll::connect(pollable_fd_state& fd, socket_address& s
     return engine().do_connect(fd, sa);
 }
 
-void reactor_backend_epoll::shutdown(pollable_fd_state& fd, int how) {
-    fd.fd.shutdown(how);
+void reactor_backend_epoll::cancel_ongoing_operations(pollable_fd_state& fd) {
 }
 
 future<size_t>
@@ -888,8 +886,7 @@ future<> reactor_backend_osv::connect(pollable_fd_state& fd, socket_address& sa)
     return engine().do_connect(fd, sa);
 }
 
-void reactor_backend_osv::shutdown(pollable_fd_state& fd, int how) {
-    fd.fd.shutdown(how);
+void reactor_backend_osv::cancel_ongoing_operations(pollable_fd_state& fd) {
 }
 
 future<size_t>

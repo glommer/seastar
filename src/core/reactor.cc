@@ -1383,7 +1383,13 @@ pollable_fd::pollable_fd(file_desc fd, pollable_fd::speculation speculate)
 {}
 
 void pollable_fd::shutdown(int how) {
-    engine()._backend->shutdown(*_s, how);
+    engine()._backend->cancel_ongoing_operations(*_s);
+    _s->fd.shutdown(how);
+}
+
+void pollable_fd::close() {
+    engine()._backend->cancel_ongoing_operations(*_s);
+    _s.reset();
 }
 
 pollable_fd

@@ -46,6 +46,7 @@ class pollable_fd_state;
 using pollable_fd_state_ptr = boost::intrusive_ptr<pollable_fd_state>;
 
 class pollable_fd_state {
+public:
     unsigned _refs = 0;
 public:
     virtual ~pollable_fd_state() {}

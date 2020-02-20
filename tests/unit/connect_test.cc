@@ -2,6 +2,8 @@
 #include <seastar/testing/test_runner.hh>
 #include <seastar/net/ip.hh>
 
+#include <fmt/format.h>
+
 using namespace seastar;
 using namespace net;
 
@@ -11,16 +13,18 @@ SEASTAR_TEST_CASE(test_connection_attempt_is_shutdown) {
     auto f = unconn
         .connect(make_ipv4_address(server_addr))
         .then_wrapped([] (auto&& f) {
+            fmt::print("Then?\n");
             try {
                 f.get();
                 BOOST_REQUIRE(false);
             } catch (...) {}
         });
     unconn.shutdown();
-    return f.finally([unconn = std::move(unconn)] {});
+    return f.finally([unconn = std::move(unconn)] { fmt::print("Finish first\n"); });
 }
 
 SEASTAR_TEST_CASE(test_unconnected_socket_shutsdown_established_connection) {
+    fmt::print("Second?\n");
     // Use a random port to reduce chance of conflict.
     // TODO: retry a few times on failure.
     std::default_random_engine& rnd = testing::local_random_engine;

@@ -1374,6 +1374,7 @@ void pollable_fd_state::forget() {
 
 void intrusive_ptr_release(pollable_fd_state* fd) {
     if (!--fd->_refs) {
+        fmt::print("Refs being all dropped, calling forget for {}\n", fd->fd.get());
         fd->forget();
     }
 }

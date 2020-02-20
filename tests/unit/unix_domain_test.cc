@@ -27,6 +27,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/std-compat.hh>
+#include <fmt/format.h>
 
 using namespace seastar;
 using std::string;
@@ -155,6 +156,7 @@ future<> ud_server_client::run() {
 //  client side
 
 SEASTAR_TEST_CASE(unixdomain_server) {
+    fmt::print("ffirst\n");
     system("rm -f /tmp/ry");
     ud_server_client uds("/tmp/ry", compat::nullopt, 3);
     return do_with(std::move(uds), [](auto& uds){
@@ -164,6 +166,7 @@ SEASTAR_TEST_CASE(unixdomain_server) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_abs) {
+    fmt::print("first\n");
     char sv_name[]{'\0', '1', '1', '1'};
     //ud_server_client uds(string{"\0111",4}, string{"\0112",4}, 1);
     ud_server_client uds(string{sv_name,4}, compat::nullopt, 4);
@@ -174,6 +177,7 @@ SEASTAR_TEST_CASE(unixdomain_abs) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_abs_bind) {
+    fmt::print("second\n");
     char sv_name[]{'\0', '1', '1', '1'};
     char cl_name[]{'\0', '1', '1', '2'};
     ud_server_client uds(string{sv_name,4}, string{cl_name,4}, 1);
@@ -183,6 +187,7 @@ SEASTAR_TEST_CASE(unixdomain_abs_bind) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_abs_bind_2) {
+    fmt::print("third\n");
     char sv_name[]{'\0', '1', '\0', '\12', '1'};
     char cl_name[]{'\0', '1', '\0', '\12', '2'};
     ud_server_client uds(string{sv_name,5}, string{cl_name,5}, 2);
@@ -192,6 +197,7 @@ SEASTAR_TEST_CASE(unixdomain_abs_bind_2) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_text) {
+    fmt::print("fourth\n");
     socket_address addr1{unix_domain_addr{"abc"}};
     BOOST_REQUIRE_EQUAL(format("{}", addr1), "abc");
     socket_address addr2{unix_domain_addr{""}};
@@ -202,6 +208,7 @@ SEASTAR_TEST_CASE(unixdomain_text) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_bind) {
+    fmt::print("fifth\n");
     system("rm -f 111 112");
     ud_server_client uds("111"s, "112"s, 1);
     return do_with(std::move(uds), [](auto& uds){
@@ -210,6 +217,7 @@ SEASTAR_TEST_CASE(unixdomain_bind) {
 }
 
 SEASTAR_TEST_CASE(unixdomain_short) {
+    fmt::print("fsixth \n");
     system("rm -f 3");
     ud_server_client uds("3"s, compat::nullopt, 10);
     return do_with(std::move(uds), [](auto& uds){
@@ -220,6 +228,7 @@ SEASTAR_TEST_CASE(unixdomain_short) {
 //  test our ability to abort the accept()'ing on a socket.
 //  The test covers a specific bug in the handling of abort_accept()
 SEASTAR_TEST_CASE(unixdomain_abort) {
+    fmt::print("seventh\n");
     std::string sockname{"7"s}; // note: no portable & warnings-free option
     std::ignore = ::unlink(sockname.c_str());
     ud_server_client uds(sockname, compat::nullopt, 10, 4);

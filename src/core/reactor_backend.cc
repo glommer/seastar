@@ -31,6 +31,7 @@
 #include <sys/poll.h>
 #include <sys/syscall.h>
 #include <boost/intrusive/parent_from_member.hpp>
+#include <variant>
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
@@ -1045,33 +1046,6 @@ static bool detect_uring() {
      }
 }
 
-// We will use this class to do reference counting for the pollable_fd_state.  We
-//
-// Reference counting is needed because deletion can only happen after everything
-// that is submitted in relationship to this uring_pollable_fd_state completes.
-// Events do not necessarily appear in the completion queue in the order they were
-// submitted, but in the order they were completed. Completion order is then,
-// unpredictable and deletion could happen first.
-class uring_pollable_fd_refcnt {
-    int _refcnt = 1;
-    void destroy_pollable_fd();
-public:
-    uring_pollable_fd_refcnt() {}
-    uring_pollable_fd_refcnt(const uring_pollable_fd_refcnt&) = delete;
-    uring_pollable_fd_refcnt& operator=(const uring_pollable_fd_refcnt&) = delete;
-    uring_pollable_fd_refcnt(uring_pollable_fd_refcnt&&) = default;
-    uring_pollable_fd_refcnt& operator=(uring_pollable_fd_refcnt&&) = default;
-
-    void acquire() {
-        _refcnt++;
-    }
-    void release() {
-        if (!--_refcnt) {
-            destroy_pollable_fd();
-        }
-    }
-};
-
 class uring_pollable_fd_state;
 
 class uring_network_completion : public kernel_completion {
@@ -1157,19 +1131,6 @@ public:
     }
 };
 
-class uring_poll_remove_completion : public kernel_completion {
-};
-
-class uring_pollin_remove_completion final : public uring_poll_remove_completion {
-public:
-    virtual void complete_with(ssize_t res) override;
-};
-
-class uring_pollout_remove_completion final : public uring_poll_remove_completion {
-public:
-    virtual void complete_with(ssize_t res) override;
-};
-
 class uring_poll_add_completion : public kernel_completion {
 protected:
     promise<> _pr;
@@ -1190,38 +1151,46 @@ public:
 };
 
 class uring_pollable_fd_state : public pollable_fd_state {
-    uring_pollin_add_completion _pollin_add;
-    uring_pollout_add_completion _pollout_add;
-    uring_network_read_completion _network_read;
-    uring_network_write_completion _network_write;
+    using pollin_op = std::variant<uring_pollin_add_completion, uring_network_read_completion, uring_connect_completion, uring_accept_completion>;
+    using pollout_op = std::variant<uring_pollout_add_completion, uring_network_write_completion>;
 
-    uring_connect_completion _connect;
-    uring_accept_completion _accept;
-
-    uring_pollin_remove_completion _pollin_remove;
-    uring_pollout_remove_completion _pollout_remove;
-
-    uring_pollable_fd_refcnt _refcnt;
+    pollin_op _pollin;
+    pollout_op _pollout;
+    bool _in_pollin = false;
+    bool _in_pollout = false;
 
     friend uring_accept_completion;
     friend uring_network_read_completion;
     friend uring_network_write_completion;
     friend uring_connect_completion;
-    friend uring_pollin_remove_completion;
-    friend uring_pollout_remove_completion;
     friend uring_pollin_add_completion;
     friend uring_pollout_add_completion;
-    friend uring_pollable_fd_refcnt;
 
     // The method below will be used when we initiate a new operation.
     // We need to refresh the existing completion object, because it is a
     // new operation, and bump the reference count.
+    template <typename T, typename PT>
+    T* get_addr(PT* ptr) {
+        T& desc = std::get<T>(*ptr);
+        return &desc;
+    }
+
     template <typename T, typename... Args>
-    T* get_completion(T* ptr, Args... args) {
-        T* desc = ptr;
-        *desc = T(std::forward<Args>(args)...);
-        _refcnt.acquire();
-        return desc;
+    T* get_pollin_completion(Args... args) {
+        fmt::print("Getting a pollin of {} with refcnt: {}\n", fd.get(), _refs);
+        _pollin = T(std::forward<Args>(args)...);
+        intrusive_ptr_add_ref(this);
+        _in_pollin = true;
+        return &(std::get<T>(_pollin));
+    }
+
+    template <typename T, typename... Args>
+    T* get_pollout_completion(Args... args) {
+        fmt::print("Getting a pollout of {} with refcnt: {}\n", fd.get(), _refs);
+        _pollout = T(std::forward<Args>(args)...);
+        intrusive_ptr_add_ref(this);
+        _in_pollout = true;
+        return &(std::get<T>(_pollout));
     }
 
     unsigned _fd_flags;
@@ -1229,73 +1198,61 @@ public:
     using pollable_fd_state::maybe_no_more_recv;
     using pollable_fd_state::maybe_no_more_send;
 
+    void* current_pollin_op() {
+        if (_in_pollin) {
+            return &_pollin;
+        }
+        return nullptr;
+    }
+
+    void* current_pollout_op() {
+        if (_in_pollout) {
+            return &_pollout;
+        }
+        return nullptr;
+    }
+
+    template <typename T>
+    static uring_pollable_fd_state* pollin_ptr(T* ptr) {
+        auto pollin = reinterpret_cast<pollin_op*>(ptr);
+        auto pfd = boost::intrusive::get_parent_from_member(pollin, &uring_pollable_fd_state::_pollin);
+        pfd->_in_pollin = false;
+        return pfd;
+    }
+
+    template <typename T>
+    static uring_pollable_fd_state* pollout_ptr(T* ptr) {
+        auto pollout = reinterpret_cast<pollout_op*>(ptr);
+        auto pfd = boost::intrusive::get_parent_from_member(pollout, &uring_pollable_fd_state::_pollout);
+        pfd->_in_pollout = false;
+        return pfd;
+    }
+
     void forget() {
-        _refcnt.release();
+        intrusive_ptr_release(this);
     }
 
     uring_connect_completion* get_connect_desc(const socket_address& sa) {
-        return get_completion(&_connect, sa);
+        return get_pollin_completion<uring_connect_completion>(sa);
     }
 
     uring_accept_completion* get_accept_desc() {
-        return get_completion(&_accept);
-    }
-
-    uring_poll_remove_completion* get_poll_remove_desc(int events) {
-        if (events & POLLIN) {
-            return get_completion(&_pollin_remove);
-        } else {
-            return get_completion(&_pollout_remove);
-        }
+        return get_pollin_completion<uring_accept_completion>();
     }
 
     uring_poll_add_completion* get_poll_add_desc(int events) {
         if (events & POLLIN) {
-            return get_completion(&_pollin_add);
+            return get_pollin_completion<uring_pollin_add_completion>();
         } else {
-            return get_completion(&_pollout_add);
+            return get_pollout_completion<uring_pollout_add_completion>();
         }
     }
 
     uring_network_completion* get_network_desc(int events, size_t len) {
         if (events & POLLIN) {
-            return get_completion(&_network_read, len);
+            return get_pollin_completion<uring_network_read_completion>(len);
         } else {
-            return get_completion(&_network_write, len);
-        }
-    }
-
-    // The methods below will be used when we just want to peek at the address of a completion,
-    // without initiating a new operation. For example, if we are cancelling an existing operation.
-    uring_connect_completion* connect_desc_addr() {
-        return &_connect;
-    }
-
-    uring_accept_completion* accept_desc_addr() {
-        return &_accept;
-    }
-
-    uring_poll_remove_completion* poll_remove_desc_addr(int events) {
-        if (events & POLLIN) {
-            return &_pollin_remove;
-        } else {
-            return &_pollout_remove;
-        }
-    }
-
-    uring_poll_add_completion* poll_add_addr(int events) {
-        if (events & POLLIN) {
-            return &_pollin_add;
-        } else {
-            return &_pollout_add;
-        }
-    }
-
-    uring_network_completion* network_desc_addr(int events) {
-        if (events & POLLIN) {
-            return &_network_read;
-        } else {
-            return &_network_write;
+            return get_pollout_completion<uring_network_write_completion>(len);
         }
     }
 
@@ -1353,15 +1310,8 @@ public:
     uring_pollable_fd_state& operator=(const uring_pollable_fd_state&) = delete;
 };
 
-void
-uring_pollable_fd_refcnt::destroy_pollable_fd() {
-    auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_refcnt);
-    fmt::print(" - Deleting the pollable fd {:x}, fd {}\n", uint64_t(pfd), pfd->fd.get());
-    delete pfd;
-}
-
 void uring_accept_completion::complete_with(ssize_t res) {
-    uring_pollable_fd_state *listen_pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_accept);
+    uring_pollable_fd_state *listen_pfd = uring_pollable_fd_state::pollin_ptr(this);
     try {
         throw_kernel_error(res);
         auto fd = file_desc::from_fd(res);
@@ -1380,34 +1330,25 @@ void uring_connect_completion::complete_with(ssize_t res) {
     } catch (...) {
         _pr.set_exception(std::current_exception());
     }
-    auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_connect);
-    pfd->forget();
-}
-
-void uring_pollin_remove_completion::complete_with(ssize_t res) {
-    auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_pollin_remove);
-    pfd->forget();
-}
-
-void uring_pollout_remove_completion::complete_with(ssize_t res) {
-    auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_pollout_remove);
+    auto pfd = uring_pollable_fd_state::pollin_ptr(this);
+    fmt::print("Completing connect of {} with refcnt: {}\n", pfd->fd.get(), pfd->_refs);
     pfd->forget();
 }
 
 void uring_pollin_add_completion::complete_with(ssize_t res) {
-    auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_pollin_add);
+    auto pfd = uring_pollable_fd_state::pollin_ptr(this);
     _pr.set_value();
     pfd->forget();
 }
 
 void uring_pollout_add_completion::complete_with(ssize_t res) {
-    auto pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_pollout_add);
+    auto pfd = uring_pollable_fd_state::pollout_ptr(this);
     _pr.set_value();
     pfd->forget();
 }
 
 void uring_network_read_completion::complete_with(ssize_t res) {
-    auto* pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_read);
+    auto pfd = uring_pollable_fd_state::pollin_ptr(this);
     try {
         _pr.set_value(consume_response(pfd, res, _expected_size, POLLIN));
     } catch (...) {
@@ -1417,7 +1358,7 @@ void uring_network_read_completion::complete_with(ssize_t res) {
 }
 
 void uring_network_write_completion::complete_with(ssize_t res) {
-    auto* pfd = boost::intrusive::get_parent_from_member(this, &uring_pollable_fd_state::_network_write);
+    auto pfd = uring_pollable_fd_state::pollin_ptr(this);
     try {
         _pr.set_value(consume_response(pfd, res, _expected_size, POLLOUT));
     } catch (...) {
@@ -1599,15 +1540,22 @@ future<> reactor_backend_uring::readable_or_writeable(pollable_fd_state& fd) {
 //
 void reactor_backend_uring::forget(pollable_fd_state& fd) noexcept {
     auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
-    // This pfd was never successfully opened
-    if (fd.fd.get() != -1) {
-        auto ops = { POLLIN, POLLOUT };
-        for (auto& op : ops) {
-            auto* op_desc = pfd->poll_add_addr(op);
-            auto req = io_request::make_poll_remove(pfd->fd.get(), op_desc);
-            _r->submit_io(&_empty_completion, std::move(req));
-        }
+
+    fmt::print("uring forget {}, refs: {}\n", fd._refs);
+    auto desc = pfd->current_pollin_op();
+    if (desc) {
+        fmt::print("uring forget pollin remove\n");
+        auto req = internal::io_request::make_poll_remove(fd.fd.get(), desc);
+        _r->submit_io(&_empty_completion, std::move(req));
     }
+    desc = pfd->current_pollout_op();
+    if (desc) {
+        fmt::print("uring forget pollout remove\n");
+        auto req = internal::io_request::make_poll_remove(fd.fd.get(), desc);
+        _r->submit_io(&_empty_completion, std::move(req));
+    }
+
+#if 0
     // POLL_REMOVE doesn't depend on the file being open. It only uses the
     // information in the original's POLL_ADD sqe to find it and remove it from
     // the list. So we can rely on io_uring to do it in the pollers later, and we
@@ -1618,6 +1566,7 @@ void reactor_backend_uring::forget(pollable_fd_state& fd) noexcept {
     // yet, but the application believe it is. The file is closed from forget(),
     // which also decrements the reference count
     pfd->forget();
+#endif
 }
 
 future<std::tuple<pollable_fd, socket_address>>
@@ -1658,22 +1607,24 @@ reactor_backend_uring::accept(pollable_fd_state& listenfd) {
 }
 
 future<> reactor_backend_uring::connect(pollable_fd_state& fd, socket_address& sa) {
+    fmt::print("got to connect of {} with refcnt: {}\n", fd.fd.get(), fd._refs);
     auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
     auto* desc = pfd->get_connect_desc(sa);
     auto req = internal::io_request::make_connect(fd.fd.get(), &desc->sockaddr().as_posix_sockaddr(), sa.length());
     _r->submit_io(desc, std::move(req));
+    fmt::print("submitted connect of {} with refcnt: {}\n", fd.fd.get(), fd._refs);
     return desc->get_future();
 }
 
 void reactor_backend_uring::shutdown(pollable_fd_state& fd, int how) {
     auto* pfd = static_cast<uring_pollable_fd_state*>(&fd);
-    auto* connect_desc = pfd->connect_desc_addr();
-    auto connect_req = internal::io_request::make_cancel(fd.fd.get(), connect_desc);
-    _r->submit_io(&_empty_completion, std::move(connect_req));
-
-    auto* accept_desc = pfd->accept_desc_addr();
-    auto accept_req = internal::io_request::make_cancel(fd.fd.get(), accept_desc);
-    _r->submit_io(&_empty_completion, std::move(accept_req));
+    auto desc = pfd->current_pollin_op();
+    fmt::print("got to shutdown of {} with refcnt: {}\n", fd.fd.get(), fd._refs);
+    if (desc) {
+        fmt::print("Stopping a shutdown\n");
+        auto req = internal::io_request::make_cancel(fd.fd.get(), desc);
+        _r->submit_io(&_empty_completion, std::move(req));
+    }
 
     fd.fd.shutdown(how);
 }
@@ -1804,7 +1755,10 @@ void reactor_backend_uring::start_handling_signal() {
 
 pollable_fd_state_ptr
 reactor_backend_uring::make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) {
-    return std::unique_ptr<pollable_fd_state, pollable_fd_state_deleter>(new uring_pollable_fd_state(std::move(fd), std::move(speculate)));
+
+    auto x = pollable_fd_state_ptr(new uring_pollable_fd_state(std::move(fd), std::move(speculate)));
+    fmt::print("Creating of {} with refcnt: {}\n", x->fd.get(), x->_refs);
+    return x;
 }
 #endif
 

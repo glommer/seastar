@@ -1407,7 +1407,23 @@ bool reactor_backend_uring::kernel_submit_work() {
     // and not inside flush(), because in the future we may choose
     // which ring to push to (poll vs irq).
     while (!_r->_pending_io.empty()) {
-        if (!_irq_ctx.maybe_submit_request(_r->_pending_io)) {
+       bool done = false;
+
+#if 0
+        done = _irq_ctx.maybe_submit_request(_r->_pending_io);
+#else
+       auto& req = _r->_pending_io.front();
+       switch (req.opcode()) {
+       case io_request::operation::read:
+       case io_request::operation::write:
+            done = _poll_ctx.maybe_submit_request(_r->_pending_io);
+           break;
+       default:
+            done = _irq_ctx.maybe_submit_request(_r->_pending_io);
+           break;
+       }
+#endif
+        if (!done) {
             break;
         }
         _r->_pending_io.pop_front();
@@ -1424,6 +1440,7 @@ bool reactor_backend_uring::kernel_submit_work() {
 bool reactor_backend_uring::reap_kernel_completions() {
     bool did_work = _irq_ctx.poll();
     did_work |= _timer_aio_context.service_preempting_io();
+    did_work |= _poll_ctx.poll();
     return did_work;
 }
 
@@ -1454,6 +1471,7 @@ reactor_backend_uring::reactor_backend_uring(reactor* r)
     , _hrtimer_completion(_r, _hrtimer_timerfd)
     , _smp_wakeup_completion(_r, _r->_notify_eventfd)
     , _irq_ctx(uring_context::make_irq_ring([this] (io_uring_cqe* cqe) { return process_one_cqe(cqe); }, cq_ring_size))
+    , _poll_ctx(uring_context::make_poll_ring([this] (io_uring_cqe* cqe) { return process_one_cqe(cqe); }, cq_ring_size))
     , _timer_aio_context(_r, _r->_task_quota_timer, _hrtimer_timerfd)
 {
     register_uring_listener(&_smp_wakeup_completion);

@@ -378,6 +378,8 @@ class reactor_backend_uring : public reactor_backend {
     } _empty_completion;
 
     internal::uring_context _irq_ctx;
+    internal::uring_context _poll_ctx;
+
     // You are reading this code, and I know what just popped into your mind:
     // "Isn't this the uring implementation? What is this aio_context doing here?"
     //

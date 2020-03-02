@@ -56,7 +56,7 @@ void fair_queue::normalize_stats() {
     // time_delta is negative; and this may advance _base into the future
     _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
     for (auto& pc: _all_classes) {
-        pc->_accumulated *= normalize_factor();
+        pc._accumulated *= normalize_factor();
     }
 }
 
@@ -67,15 +67,28 @@ bool fair_queue::can_dispatch() const {
            (_bytes_count_executing < _config.max_bytes_count);
 }
 
+fair_queue::fair_queue(config cfg)
+    : _config(std::move(cfg))
+    , _base(std::chrono::steady_clock::now())
+{
+    for (size_t i = 0; i < _max_classes; ++i) {
+        _available_classes.push(&_all_classes[i]);
+    }
+}
+
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
-    priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
-    _all_classes.insert(pclass);
-    return pclass;
+    if (_available_classes.empty()) {
+        throw std::runtime_error("No more room for new I/O priority classes");
+    }
+
+    auto ptr = _available_classes.top();
+    ptr->update_shares(shares);
+    _available_classes.pop();
+    return ptr;
 }
 
 void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
-    assert(pclass->_queue.empty());
-    _all_classes.erase(pclass);
+    _available_classes.push(pclass);
 }
 
 size_t fair_queue::waiters() const {

@@ -27,6 +27,8 @@
 #include <queue>
 #include <chrono>
 #include <unordered_set>
+#include <stack>
+#include <boost/container/static_vector.hpp>
 
 namespace seastar {
 
@@ -48,13 +50,12 @@ class priority_class {
         fair_queue_request_descriptor desc;
     };
     friend class fair_queue;
-    uint32_t _shares = 0;
+    uint32_t _shares = 1u;
     float _accumulated = 0;
     circular_buffer<request> _queue;
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
-    explicit priority_class(uint32_t shares) : _shares(std::max(shares, 1u)) {}
 
     void update_shares(uint32_t shares) {
         _shares = (std::max(shares, 1u));
@@ -75,7 +76,7 @@ public:
 /// to the \ref fair_queue to identify a given class.
 ///
 /// \related fair_queue
-using priority_class_ptr = lw_shared_ptr<priority_class>;
+using priority_class_ptr = priority_class*;
 
 /// \brief Fair queuing class
 ///
@@ -124,9 +125,13 @@ private:
     unsigned _requests_queued = 0;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
-    using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
+
+    static constexpr unsigned _max_classes = 1024;
+
+    using prioq = std::priority_queue<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>, class_compare>;
     prioq _handles;
-    std::unordered_set<priority_class_ptr> _all_classes;
+    std::array<priority_class, _max_classes> _all_classes;
+    std::stack<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>> _available_classes;
 
     void push_priority_class(priority_class_ptr pc);
 
@@ -141,10 +146,7 @@ public:
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config
-    explicit fair_queue(config cfg)
-        : _config(std::move(cfg))
-        , _base(std::chrono::steady_clock::now())
-    {}
+    explicit fair_queue(config cfg);
 
     /// Constructs a fair queue with a given \c capacity.
     ///

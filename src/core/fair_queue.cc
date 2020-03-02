@@ -28,6 +28,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
+#include <mutex>
 
 namespace seastar {
 
@@ -77,6 +78,8 @@ fair_queue::fair_queue(config cfg)
 }
 
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
+    std::lock_guard<util::spinlock> g(_fair_queue_lock);
+
     if (_available_classes.empty()) {
         throw std::runtime_error("No more room for new I/O priority classes");
     }
@@ -88,6 +91,7 @@ priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
 }
 
 void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
+    std::lock_guard<util::spinlock> g(_fair_queue_lock);
     _available_classes.push(pclass);
 }
 

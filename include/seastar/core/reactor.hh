@@ -65,6 +65,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/file.hh>
+#include <seastar/core/io_queue.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/fair_queue.hh>
 #include <seastar/core/scattered_message.hh>
@@ -258,8 +259,8 @@ private:
     // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
     // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
     // be stored here.
-    std::vector<std::unique_ptr<io_queue>> my_io_queues;
-    std::unordered_map<dev_t, io_queue*> _io_queues;
+    std::vector<std::unique_ptr<fair_queue>> my_fair_queues;
+    std::unordered_map<dev_t, io_queue> _io_queues;
     friend io_queue;
 
     std::vector<noncopyable_function<future<> ()>> _exit_funcs;
@@ -475,9 +476,9 @@ public:
     io_queue& get_io_queue(dev_t devid = 0) {
         auto queue = _io_queues.find(devid);
         if (queue == _io_queues.end()) {
-            return *_io_queues[0];
+            return _io_queues.at(0);
         } else {
-            return *(queue->second);
+            return queue->second;
         }
     }
 

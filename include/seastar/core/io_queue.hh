@@ -59,6 +59,18 @@ using shard_id = unsigned;
 class io_priority_class;
 
 class io_queue {
+public:
+    struct config {
+        shard_id coordinator;
+        std::vector<shard_id> io_topology;
+        unsigned capacity = std::numeric_limits<unsigned>::max();
+        unsigned max_req_count = std::numeric_limits<unsigned>::max();
+        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
+        unsigned disk_req_write_to_read_multiplier = read_request_base_count;
+        unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
+        sstring mountpoint = "undefined";
+        fair_queue* fq;
+    };
 private:
     struct priority_class_data {
         priority_class_ptr ptr;
@@ -67,14 +79,14 @@ private:
         uint32_t nr_queued;
         std::chrono::duration<double> queue_time;
         metrics::metric_groups _metric_groups;
-        priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr, shard_id owner);
-        void rename(sstring new_name, sstring mountpoint, shard_id owner);
+        priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr);
+        void rename(sstring new_name, sstring mountpoint);
     private:
-        void register_stats(sstring name, sstring mountpoint, shard_id owner);
+        void register_stats(sstring name, sstring mountpoint);
     };
 
-    std::vector<std::vector<lw_shared_ptr<priority_class_data>>> _priority_classes;
-    fair_queue _fq;
+    std::vector<lw_shared_ptr<priority_class_data>> _priority_classes;
+    fair_queue* _fq;
 
     static constexpr unsigned _max_classes = 2048;
     static std::mutex _register_lock;
@@ -83,7 +95,7 @@ private:
 
     static io_priority_class register_one_priority_class(sstring name, uint32_t shares);
 
-    priority_class_data& find_or_create_class(const io_priority_class& pc, shard_id owner);
+    priority_class_data& find_or_create_class(const io_priority_class& pc);
     friend class smp;
 public:
     // We want to represent the fact that write requests are (maybe) more expensive
@@ -96,17 +108,6 @@ public:
     // writes will have an integer value lower than read_request_base_count.
     static constexpr unsigned read_request_base_count = 128;
 
-    struct config {
-        shard_id coordinator;
-        std::vector<shard_id> io_topology;
-        unsigned capacity = std::numeric_limits<unsigned>::max();
-        unsigned max_req_count = std::numeric_limits<unsigned>::max();
-        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
-        unsigned disk_req_write_to_read_multiplier = read_request_base_count;
-        unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
-        sstring mountpoint = "undefined";
-    };
-
     io_queue(config cfg);
     ~io_queue();
 
@@ -118,22 +119,22 @@ public:
     }
 
     size_t queued_requests() const {
-        return _fq.waiters();
+        return _fq->waiters();
     }
 
     // How many requests are sent to disk but not yet returned.
     size_t requests_currently_executing() const {
-        return _fq.requests_currently_executing();
+        return _fq->requests_currently_executing();
     }
 
     // Inform the underlying queue about the fact that some of our requests finished
     void notify_requests_finished(fair_queue_request_descriptor& desc) {
-        _fq.notify_requests_finished(desc);
+        _fq->notify_requests_finished(desc);
     }
 
     // Dispatch requests that are pending in the I/O queue
     void poll_io_queue() {
-        _fq.dispatch_requests();
+        _fq->dispatch_requests();
     }
 
     sstring mountpoint() const {

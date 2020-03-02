@@ -173,7 +173,7 @@ reactor::register_one_priority_class(sstring name, uint32_t shares) {
 future<>
 reactor::update_shares_for_class(io_priority_class pc, uint32_t shares) {
     return parallel_for_each(_io_queues, [pc, shares] (auto& queue) {
-        return queue.second->update_shares_for_class(pc, shares);
+        return queue.second.update_shares_for_class(pc, shares);
     });
 }
 
@@ -212,7 +212,7 @@ reactor::rename_priority_class(io_priority_class pc, sstring new_name) {
         }
         return smp::invoke_on_all([pc, new_name] {
             for (auto&& queue : engine()._io_queues) {
-                queue.second->rename_priority_class(pc, new_name);
+                queue.second.rename_priority_class(pc, new_name);
             }
         });
     });
@@ -1497,8 +1497,8 @@ reactor::submit_io(kernel_completion* desc, io_request req) {
 
 bool
 reactor::flush_pending_aio() {
-    for (auto& ioq : my_io_queues) {
-        ioq->poll_io_queue();
+    for (auto& ioq : _io_queues) {
+        ioq.second.poll_io_queue();
     }
     return false;
 }
@@ -2724,7 +2724,8 @@ int reactor::run() {
     // This is needed because the reactor is destroyed from the thread_local destructors. If
     // the I/O queue happens to use any other infrastructure that is also kept this way (for
     // instance, collectd), we will not have any way to guarantee who is destroyed first.
-    my_io_queues.clear();
+    _io_queues.clear();
+    my_fair_queues.clear();
     return _return;
 }
 
@@ -3729,7 +3730,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
 
     auto ioq_topology = std::move(resources.ioq_topology);
 
-    std::unordered_map<dev_t, std::vector<io_queue*>> all_io_queues;
+    std::unordered_map<dev_t, std::vector<io_queue::config>> all_io_queues;
 
     for (auto& id : disk_config.device_ids()) {
         auto io_info = ioq_topology.at(id);
@@ -3745,9 +3746,9 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
             struct io_queue::config cfg = disk_config.generate_config(id);
             cfg.coordinator = cid;
             cfg.io_topology = io_info.shard_to_coordinator;
+            cfg.fq = new fair_queue(io_queue::make_fair_queue_config(cfg));
             assert(vec_idx < all_io_queues[id].size());
-            assert(!all_io_queues[id][vec_idx]);
-            all_io_queues[id][vec_idx] = new io_queue(std::move(cfg));
+            all_io_queues[id][vec_idx] = std::move(cfg);
         }
     };
 
@@ -3755,10 +3756,10 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         auto io_info = ioq_topology.at(dev_id);
         auto cid = io_info.shard_to_coordinator[shard_id];
         auto queue_idx = io_info.coordinator_to_idx[cid];
-        if (all_io_queues[dev_id][queue_idx]->coordinator() == shard_id) {
-            engine().my_io_queues.emplace_back(all_io_queues[dev_id][queue_idx]);
+        if (all_io_queues[dev_id][queue_idx].coordinator == shard_id) {
+            engine().my_fair_queues.emplace_back(all_io_queues[dev_id][queue_idx].fq);
         }
-        engine()._io_queues.emplace(dev_id, all_io_queues[dev_id][queue_idx]);
+        engine()._io_queues.emplace(dev_id, io_queue(all_io_queues[dev_id][queue_idx]));
     };
 
     _all_event_loops_done.emplace(smp::count);

@@ -23,12 +23,14 @@
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/circular_buffer.hh>
+#include <seastar/core/sstring.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <queue>
 #include <chrono>
 #include <unordered_set>
 #include <stack>
 #include <boost/container/static_vector.hpp>
+#include <seastar/util/spinlock.hh>
 
 namespace seastar {
 
@@ -125,6 +127,7 @@ private:
     unsigned _requests_queued = 0;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
+    util::spinlock _fair_queue_lock;
 
     static constexpr unsigned _max_classes = 1024;
 

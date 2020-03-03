@@ -145,15 +145,16 @@ extern bool aio_nowait_supported;
 
 bool
 aio_storage_context::submit_work() {
-    size_t pending = _r->_pending_io.size();
     size_t to_submit = 0;
     bool did_work = false;
 
     _submission_queue.resize(0);
-    while ((pending > to_submit) && _iocb_pool.has_capacity()) {
-        auto& req = _r->_pending_io[to_submit++];
+    while (_r->_pending_io.read_available() && _iocb_pool.has_capacity()) {
+        auto* req = _r->_pending_io.front();
+        _r->_pending_io.pop();
+        to_submit++;
         auto& io = _iocb_pool.get_one();
-        prepare_iocb(req, io);
+        prepare_iocb(*req, io);
 
         if (_r->_aio_eventfd) {
             set_eventfd_notification(io, _r->_aio_eventfd->get_fd());
@@ -177,7 +178,6 @@ aio_storage_context::submit_work() {
         }
         submitted += nr_consumed;
     }
-    _r->_pending_io.erase(_r->_pending_io.begin(), _r->_pending_io.begin() + submitted);
 
     if (!_pending_aio_retry.empty()) {
         auto retries = std::exchange(_pending_aio_retry, {});

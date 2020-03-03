@@ -121,6 +121,8 @@ private:
         _ptr.addr = ptr;
     }
 public:
+    io_request() {}
+
     bool is_read() const {
         switch (_op) {
         case operation::read:

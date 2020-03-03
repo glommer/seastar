@@ -269,7 +269,9 @@ class smp {
     static std::vector<posix_thread> _threads;
     static std::vector<std::function<void ()>> _thread_loops; // for dpdk
     static compat::optional<boost::barrier> _all_event_loops_done;
+    public:
     static std::vector<reactor*> _reactors;
+    private:
     struct qs_deleter {
       void operator()(smp_message_queue** qs) const;
     };

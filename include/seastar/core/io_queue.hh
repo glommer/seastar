@@ -58,6 +58,33 @@ using shard_id = unsigned;
 
 class io_priority_class;
 
+class io_desc_read_write final : public kernel_completion, public fair_queue_request_descriptor {
+    io_queue* _ioq_ptr;
+    unsigned _id;
+    // FIXME: merge with fq_desc ?
+    internal::io_request _req;
+    promise<size_t> _pr;
+    unsigned _owner;
+private:
+    void notify_requests_finished();
+public:
+    io_desc_read_write() {}
+    unsigned id() {
+        return _id;
+    }
+
+    io_desc_read_write(io_queue* ioq, unsigned class_id, unsigned weight, unsigned size, internal::io_request req);
+
+    future<size_t> get_future() {
+        return _pr.get_future();
+    }
+
+    void set_exception(std::exception_ptr eptr);
+    virtual void complete_with(ssize_t ret) override;
+    virtual void operator()() override;
+};
+
+
 class io_queue {
 public:
     struct config {
@@ -81,7 +108,17 @@ private:
         metrics::metric_groups _metric_groups;
         priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr);
         void rename(sstring new_name, sstring mountpoint);
+        void free_io_desc(io_desc_read_write* desc);
+        io_desc_read_write* alloc_io_desc(io_queue* ioq_ptr, unsigned id, size_t len, internal::io_request req);
+
+        future<> wait_for_io_desc();
+
     private:
+        static constexpr unsigned max_io_desc = 128;
+        //semaphore _io_desc_sem = { max_io_desc };
+        std::array<io_desc_read_write, max_io_desc> _io_desc;
+        std::stack<io_desc_read_write*, boost::container::static_vector<io_desc_read_write*, max_io_desc>> _free_io_desc;
+
         void register_stats(sstring name, sstring mountpoint);
     };
 
@@ -97,7 +134,9 @@ private:
 
     priority_class_data& find_or_create_class(const io_priority_class& pc);
     friend class smp;
+
 public:
+    void free_io_desc(io_desc_read_write* desc);
     // We want to represent the fact that write requests are (maybe) more expensive
     // than read requests. To avoid dealing with floating point math we will scale one
     // read request to be counted by this amount.
@@ -152,7 +191,7 @@ public:
     void rename_priority_class(io_priority_class pc, sstring new_name);
 
     friend class reactor;
-private:
+public:
     config _config;
     static fair_queue::config make_fair_queue_config(config cfg);
 };

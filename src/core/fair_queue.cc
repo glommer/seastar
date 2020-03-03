@@ -24,11 +24,14 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <seastar/core/reactor.hh>
 #include <queue>
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
 #include <mutex>
+
+#include <fmt/format.h>
 
 namespace seastar {
 
@@ -62,10 +65,10 @@ void fair_queue::normalize_stats() {
 }
 
 bool fair_queue::can_dispatch() const {
-    return _requests_queued &&
-           (_requests_executing < _config.capacity) &&
-           (_req_count_executing < _config.max_req_count) &&
-           (_bytes_count_executing < _config.max_bytes_count);
+    return _requests_queued.load(std::memory_order_relaxed) &&
+           (_requests_executing.load(std::memory_order_relaxed) < _config.capacity) &&
+           (_req_count_executing.load(std::memory_order_relaxed) < _config.max_req_count) &&
+           (_bytes_count_executing.load(std::memory_order_relaxed) < _config.max_bytes_count);
 }
 
 fair_queue::fair_queue(config cfg)
@@ -96,45 +99,50 @@ void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
 }
 
 size_t fair_queue::waiters() const {
-    return _requests_queued;
+    return _requests_queued.load(std::memory_order_relaxed);
 }
 
 size_t fair_queue::requests_currently_executing() const {
-    return _requests_executing;
+    return _requests_executing.load(std::memory_order_relaxed);
 }
 
-void fair_queue::queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
+void fair_queue::queue(priority_class_ptr pc, fair_queue_request_descriptor* desc) {
+    pc->_queue.push(desc);
+    std::lock_guard<util::spinlock> g(_fair_queue_lock);
+
     // We need to return a future in this function on which the caller can wait.
     // Since we don't know which queue we will use to execute the next request - if ours or
     // someone else's, we need a separate promise at this point.
     push_priority_class(pc);
-    pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
-    _requests_queued++;
+    _requests_queued.fetch_add(1, std::memory_order_relaxed);
 }
 
 void fair_queue::notify_requests_finished(fair_queue_request_descriptor& desc) {
-    _requests_executing--;
-    _req_count_executing -= desc.weight;
-    _bytes_count_executing -= desc.size;
+    _requests_executing.fetch_sub(1, std::memory_order_relaxed);
+    _req_count_executing.fetch_sub(desc.weight, std::memory_order_relaxed);
+    _bytes_count_executing.fetch_sub(desc.size, std::memory_order_relaxed);
 }
 
 
 void fair_queue::dispatch_requests() {
+    // FIXME: move to try lock
+    std::lock_guard<util::spinlock> g(_fair_queue_lock);
     while (can_dispatch()) {
+        
         priority_class_ptr h;
         do {
             h = pop_priority_class();
         } while (h->_queue.empty());
 
         auto req = std::move(h->_queue.front());
-        h->_queue.pop_front();
-        _requests_executing++;
-        _req_count_executing += req.desc.weight;
-        _bytes_count_executing += req.desc.size;
-        _requests_queued--;
+        h->_queue.pop();
+        _requests_executing.fetch_add(1, std::memory_order_relaxed);
+        _req_count_executing.fetch_add(req->weight, std::memory_order_relaxed);
+        _bytes_count_executing.fetch_add(req->size, std::memory_order_relaxed);
+        _requests_queued.fetch_sub(1, std::memory_order_relaxed);
 
         auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-        auto req_cost  = (float(req.desc.weight) / _config.max_req_count + float(req.desc.size) / _config.max_bytes_count) / h->_shares;
+        auto req_cost  = (float(req->weight) / _config.max_req_count + float(req->size) / _config.max_bytes_count) / h->_shares;
         auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
         float next_accumulated = h->_accumulated + cost;
         while (std::isinf(next_accumulated)) {
@@ -149,7 +157,7 @@ void fair_queue::dispatch_requests() {
         if (!h->_queue.empty()) {
             push_priority_class(h);
         }
-        req.func();
+        (*req)();
     }
 }
 

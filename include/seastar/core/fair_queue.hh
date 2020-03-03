@@ -22,7 +22,6 @@
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <queue>
@@ -30,6 +29,7 @@
 #include <unordered_set>
 #include <stack>
 #include <boost/container/static_vector.hpp>
+#include <boost/lockfree/spsc_queue.hpp>
 #include <seastar/util/spinlock.hh>
 
 namespace seastar {
@@ -40,6 +40,9 @@ namespace seastar {
 struct fair_queue_request_descriptor {
     unsigned weight = 1; ///< the weight of this request for capacity purposes (IOPS).
     unsigned size = 1;        ///< the effective size of this request
+    virtual void operator()() = 0;
+    fair_queue_request_descriptor() {}
+    fair_queue_request_descriptor(unsigned weight, unsigned size) : weight(weight), size(size) {}
 };
 
 /// \addtogroup io-module
@@ -47,14 +50,16 @@ struct fair_queue_request_descriptor {
 
 /// \cond internal
 class priority_class {
-    struct request {
-        noncopyable_function<void()> func;
-        fair_queue_request_descriptor desc;
-    };
+public:
+    static constexpr unsigned queue_capacity = 128;
+private:
+    using lf_queue = boost::lockfree::spsc_queue<fair_queue_request_descriptor*,
+                                                 boost::lockfree::capacity<queue_capacity>>;
+
     friend class fair_queue;
     uint32_t _shares = 1u;
     float _accumulated = 0;
-    circular_buffer<request> _queue;
+    lf_queue _queue;
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
@@ -121,10 +126,10 @@ private:
     };
 
     config _config;
-    unsigned _requests_executing = 0;
-    unsigned _req_count_executing = 0;
-    unsigned _bytes_count_executing = 0;
-    unsigned _requests_queued = 0;
+    std::atomic<unsigned> _requests_executing = { 0 };
+    std::atomic<unsigned> _req_count_executing = { 0 };
+    std::atomic<unsigned> _bytes_count_executing = { 0 };
+    std::atomic<unsigned> _requests_queued = { 0 };
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     util::spinlock _fair_queue_lock;
@@ -181,7 +186,7 @@ public:
     ///
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
-    void queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func);
+    void queue(priority_class_ptr pc, fair_queue_request_descriptor* desc);
 
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished.

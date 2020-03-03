@@ -318,7 +318,10 @@ private:
         void register_stats();
     };
 
-    circular_buffer<internal::io_request> _pending_io;
+    using pending_io_queue = boost::lockfree::spsc_queue<internal::io_request*,
+                             boost::lockfree::capacity<1024>>;
+
+    pending_io_queue _pending_io;
     boost::container::static_vector<std::unique_ptr<task_queue>, max_scheduling_groups()> _task_queues;
     std::vector<scheduling_group_key_config> _scheduling_group_key_configs;
     int64_t _last_vruntime = 0;
@@ -533,7 +536,7 @@ public:
     // In the following three methods, prepare_io is not guaranteed to execute in the same processor
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
-    void submit_io(kernel_completion* desc, internal::io_request req);
+    void submit_io(kernel_completion* desc, internal::io_request* req);
     future<size_t> submit_io_read(io_queue* ioq,
             const io_priority_class& priority_class,
             size_t len,

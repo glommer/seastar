@@ -39,46 +39,52 @@ namespace seastar {
 using namespace std::chrono_literals;
 using namespace internal::linux_abi;
 
-class io_desc_read_write final : public kernel_completion {
-    io_queue* _ioq_ptr;
-    fair_queue_request_descriptor _fq_desc;
-    promise<size_t> _pr;
-private:
-    void notify_requests_finished() {
-        _ioq_ptr->notify_requests_finished(_fq_desc);
-    }
-public:
-    io_desc_read_write(io_queue* ioq, unsigned weight, unsigned size)
-        : _ioq_ptr(ioq)
-        , _fq_desc(fair_queue_request_descriptor{weight, size})
-    {}
+void io_desc_read_write::notify_requests_finished() {
+    _ioq_ptr->notify_requests_finished(*this);
+}
 
-    fair_queue_request_descriptor& fq_descriptor() {
-        return _fq_desc;
-    }
+void io_desc_read_write::set_exception(std::exception_ptr eptr) {
+    notify_requests_finished();
+    _pr.set_exception(eptr);
+    _ioq_ptr->free_io_desc(this);
+}
 
-    void set_exception(std::exception_ptr eptr) {
-        notify_requests_finished();
-        _pr.set_exception(eptr);
-        delete this;
-    }
+void io_desc_read_write::complete_with(ssize_t ret) {
+    notify_requests_finished();
 
-    virtual void complete_with(ssize_t ret) override {
+    if (engine().cpu_id() == _owner) {
         try {
             engine().handle_io_result(ret);
-            notify_requests_finished();
             _pr.set_value(ret);
-            delete this;
+            _ioq_ptr->free_io_desc(this);
         } catch (...) {
             set_exception(std::current_exception());
         }
+    } else {
     }
+}
 
-    future<size_t> get_future() {
-        return _pr.get_future();
+void io_desc_read_write::operator()() {
+    try {
+#if 0
+        pclass.nr_queued--;
+        pclass.ops++;
+        pclass.bytes += len;
+        pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
+#endif
+        smp::_reactors[_owner]->submit_io(this, &_req);
+    } catch (...) {
+        set_exception(std::current_exception());
     }
-};
+}
 
+io_desc_read_write::io_desc_read_write(io_queue* ioq, unsigned class_id, unsigned weight, unsigned size, internal::io_request req)
+   : fair_queue_request_descriptor(weight, size)
+   , _ioq_ptr(ioq)
+   , _id(class_id)
+   , _req(std::move(req))
+   , _owner(engine().cpu_id())
+{}
 
 fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
     fair_queue::config cfg;
@@ -92,6 +98,11 @@ io_queue::io_queue(io_queue::config cfg)
     : _priority_classes()
     , _fq(cfg.fq)
     , _config(std::move(cfg)) {
+
+}
+
+void io_queue::free_io_desc(io_desc_read_write* desc) {
+    _priority_classes[desc->id()]->free_io_desc(desc);
 }
 
 io_queue::~io_queue() {
@@ -145,6 +156,39 @@ io_queue::priority_class_data::priority_class_data(sstring name, sstring mountpo
     , queue_time(1s)
 {
     register_stats(name, mountpoint);
+
+    for (auto i = 0u; i < max_io_desc; ++i) {
+        _free_io_desc.push(&_io_desc[i]);
+    }
+}
+
+void io_queue::priority_class_data::free_io_desc(io_desc_read_write* desc) {
+    _free_io_desc.push(desc);
+//    _io_desc_sem.signal(1);
+}
+
+io_desc_read_write* io_queue::priority_class_data::alloc_io_desc(io_queue* ioq_ptr, unsigned id, size_t len, internal::io_request req) {
+    unsigned weight;
+    size_t size;
+
+    if (req.is_write()) {
+        weight = ioq_ptr->_config.disk_req_write_to_read_multiplier;
+        size = ioq_ptr->_config.disk_bytes_write_to_read_multiplier * len;
+    } else if (req.is_read()) {
+        weight = io_queue::read_request_base_count;
+        size = io_queue::read_request_base_count * len;
+    } else {
+        throw std::runtime_error(fmt::format("Unrecognized request passing through I/O queue {}", req.opname()));
+    }
+
+    // FIXME: check capacity
+//    _io_desc_sem.consume(1);
+
+    auto desc = _free_io_desc.top();
+    _free_io_desc.pop();
+
+    *desc = io_desc_read_write(ioq_ptr, id, weight, size, std::move(req));
+    return desc;
 }
 
 void
@@ -201,6 +245,7 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
     if (id >= _priority_classes.size()) {
         _priority_classes.resize(id + 1);
     }
+
     if (!_priority_classes[id]) {
         auto shares = _registered_shares.at(id);
         sstring name;
@@ -233,39 +278,14 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
 
 future<size_t>
 io_queue::queue_request(const io_priority_class& pc, size_t len, internal::io_request req) {
-    auto start = std::chrono::steady_clock::now();
-    return smp::submit_to(coordinator(), [start, &pc, len, req = std::move(req), this] () mutable {
-        // First time will hit here, and then we create the class. It is important
-        // that we create the shared pointer in the same shard it will be used at later.
-        auto& pclass = find_or_create_class(pc);
-        pclass.nr_queued++;
-        unsigned weight;
-        size_t size;
-        if (req.is_write()) {
-            weight = _config.disk_req_write_to_read_multiplier;
-            size = _config.disk_bytes_write_to_read_multiplier * len;
-        } else if (req.is_read()) {
-            weight = io_queue::read_request_base_count;
-            size = io_queue::read_request_base_count * len;
-        } else {
-            throw std::runtime_error(fmt::format("Unrecognized request passing through I/O queue {}", req.opname()));
-        }
-        auto desc = std::make_unique<io_desc_read_write>(this, weight, size);
-        auto fq_desc = desc->fq_descriptor();
-        auto fut = desc->get_future();
-        _fq->queue(pclass.ptr, std::move(fq_desc), [&pclass, start, req = std::move(req), desc = desc.release(), len] () mutable noexcept {
-            try {
-                pclass.nr_queued--;
-                pclass.ops++;
-                pclass.bytes += len;
-                pclass.queue_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - start);
-                engine().submit_io(desc, std::move(req));
-            } catch (...) {
-                desc->set_exception(std::current_exception());
-            }
-        });
-        return fut;
-    });
+    //auto start = std::chrono::steady_clock::now();
+    auto& pclass = find_or_create_class(pc);
+
+    pclass.nr_queued++;
+    auto desc = pclass.alloc_io_desc(this, pc.id(), len, std::move(req));
+
+    _fq->queue(pclass.ptr, desc);
+    return desc->get_future();
 }
 
 future<>

@@ -1490,9 +1490,9 @@ sstring io_request::opname() const {
 }
 
 void
-reactor::submit_io(kernel_completion* desc, io_request req) {
-    req.attach_kernel_completion(desc);
-    _pending_io.push_back(std::move(req));
+reactor::submit_io(kernel_completion* desc, io_request* req) {
+    req->attach_kernel_completion(desc);
+    _pending_io.push(req);
 }
 
 bool
@@ -1827,7 +1827,15 @@ reactor::fdatasync(int fd) {
             // Does not go through the I/O queue, but has to be deleted
             struct fsync_io_desc final : public kernel_completion {
                 promise<> _pr;
+                internal::io_request _req;
             public:
+
+                fsync_io_desc(int fd) : _req(io_request::make_fdatasync(fd)) {}
+
+                internal::io_request* req() {
+                    return &_req;
+                }
+
                 virtual void complete_with(ssize_t res) {
                     try {
                         engine().handle_io_result(res);
@@ -1843,11 +1851,10 @@ reactor::fdatasync(int fd) {
                 }
             };
 
-            auto desc = std::make_unique<fsync_io_desc>();
+            auto desc = std::make_unique<fsync_io_desc>(fd);
+            auto req = desc->req();
             auto fut = desc->get_future();
-
-            auto req = io_request::make_fdatasync(fd);
-            submit_io(desc.release(), std::move(req));
+            submit_io(desc.release(), req);
             return fut;
         } catch (...) {
             return make_exception_future<>(std::current_exception());
@@ -2578,7 +2585,7 @@ int reactor::run() {
     }
 
     poller reap_kernel_completions_poller(std::make_unique<reap_kernel_completions_pollfn>(*this));
-    poller io_queue_submission_poller(std::make_unique<io_queue_submission_pollfn>(*this));
+    poller submission(std::make_unique<io_queue_submission_pollfn>(*this));
     poller kernel_submit_work_poller(std::make_unique<kernel_submit_work_pollfn>(*this));
     poller final_real_kernel_completions_poller(std::make_unique<reap_kernel_completions_pollfn>(*this));
 

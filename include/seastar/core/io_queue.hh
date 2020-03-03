@@ -81,7 +81,7 @@ public:
 
     void set_exception(std::exception_ptr eptr);
     virtual void complete_with(ssize_t ret) override;
-    virtual void operator()() override;
+    virtual ticket operator()(ticket& t) override;
 };
 
 
@@ -123,8 +123,14 @@ private:
     };
 
     std::vector<lw_shared_ptr<priority_class_data>> _priority_classes;
+public:
     fair_queue* _fq;
+    fair_queue* _multishard_fq;
+    priority_class_ptr _shard_ptr;
 
+    uint64_t _nr_queued = 0;
+
+private:
     static constexpr unsigned _max_classes = 2048;
     static std::mutex _register_lock;
     static std::array<uint32_t, _max_classes> _registered_shares;
@@ -167,14 +173,10 @@ public:
     }
 
     // Inform the underlying queue about the fact that some of our requests finished
-    void notify_requests_finished(fair_queue_request_descriptor& desc) {
-        _fq->notify_requests_finished(desc);
-    }
+    void notify_requests_finished(fair_queue_request_descriptor& desc);
 
     // Dispatch requests that are pending in the I/O queue
-    void poll_io_queue() {
-        _fq->dispatch_requests();
-    }
+    void poll_io_queue();
 
     sstring mountpoint() const {
         return _config.mountpoint;

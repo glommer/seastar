@@ -3754,6 +3754,11 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
             cfg.coordinator = cid;
             cfg.io_topology = io_info.shard_to_coordinator;
             cfg.fq = new fair_queue(io_queue::make_fair_queue_config(cfg));
+            // FIXME: No no
+            cfg.max_req_count = 0;
+            cfg.max_bytes_count = 0;
+            cfg.capacity = 0;
+
             assert(vec_idx < all_io_queues[id].size());
             all_io_queues[id][vec_idx] = std::move(cfg);
         }

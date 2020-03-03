@@ -34,13 +34,20 @@
 
 namespace seastar {
 
+struct ticket {
+    int64_t quantity = 0;
+    int64_t weight = 0;
+    int64_t size = 0;
+    bool pop = true;
+};
+
 /// \brief describes a request that passes through the fair queue
 ///
 /// \related fair_queue
 struct fair_queue_request_descriptor {
     unsigned weight = 1; ///< the weight of this request for capacity purposes (IOPS).
     unsigned size = 1;        ///< the effective size of this request
-    virtual void operator()() = 0;
+    virtual ticket operator()(ticket& t) = 0;
     fair_queue_request_descriptor() {}
     fair_queue_request_descriptor(unsigned weight, unsigned size) : weight(weight), size(size) {}
 };
@@ -115,6 +122,10 @@ public:
         std::chrono::microseconds tau = std::chrono::milliseconds(100);
         unsigned max_req_count = std::numeric_limits<unsigned>::max();
         unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
+
+        unsigned natural_capacity = 2;
+        unsigned natural_max_req_count = 2;
+        unsigned natural_max_bytes_count = 1280;
     };
 private:
     friend priority_class;
@@ -130,6 +141,9 @@ private:
     std::atomic<unsigned> _req_count_executing = { 0 };
     std::atomic<unsigned> _bytes_count_executing = { 0 };
     std::atomic<unsigned> _requests_queued = { 0 };
+    std::atomic<unsigned> _req_count_queued = { 0 };
+    std::atomic<unsigned> _bytes_count_queued = { 0 };
+
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     util::spinlock _fair_queue_lock;
@@ -150,7 +164,12 @@ private:
     void normalize_stats();
 
     bool can_dispatch() const;
+
+    void update_cost(priority_class_ptr h, float weight, float size);
 public:
+    void add_capacity(ticket& t);
+    void remove_capacity(ticket& t);
+
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config
@@ -176,6 +195,12 @@ public:
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const;
 
+    ticket waiting() const;
+
+    ticket prune_excess_capacity();
+
+    ticket prune_all_capacity();
+
     /// \return the number of requests currently executing
     size_t requests_currently_executing() const;
 
@@ -188,12 +213,19 @@ public:
     /// request finishes executing - regardless of success or failure.
     void queue(priority_class_ptr pc, fair_queue_request_descriptor* desc);
 
+    void multishard_queue(priority_class_ptr pc);
+
+    void multishard_register(priority_class_ptr pc, fair_queue_request_descriptor* desc);
+
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished.
-    void notify_requests_finished(fair_queue_request_descriptor& desc);
+    /// \param requests how many requests are completing
+    void notify_requests_finished(fair_queue_request_descriptor& desc, unsigned requests = 1);
 
     /// Try to execute new requests if there is capacity left in the queue.
-    void dispatch_requests();
+    size_t dispatch_requests();
+
+    void multishard_dispatch_requests();
 
     /// Updates the current shares of this priority class
     ///

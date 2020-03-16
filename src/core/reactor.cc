@@ -2732,7 +2732,7 @@ int reactor::run() {
     // the I/O queue happens to use any other infrastructure that is also kept this way (for
     // instance, collectd), we will not have any way to guarantee who is destroyed first.
     _io_queues.clear();
-    my_fair_queues.clear();
+    my_multishard_fair_queues.clear();
     return _return;
 }
 
@@ -3753,11 +3753,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
             struct io_queue::config cfg = disk_config.generate_config(id);
             cfg.coordinator = cid;
             cfg.io_topology = io_info.shard_to_coordinator;
-            cfg.fq = new fair_queue(io_queue::make_fair_queue_config(cfg));
-            // FIXME: No no
-            cfg.max_req_count = 0;
-            cfg.max_bytes_count = 0;
-            cfg.capacity = 0;
+            cfg.multishard_fq = new multishard_fair_queue(io_queue::make_fair_queue_config(cfg));
 
             assert(vec_idx < all_io_queues[id].size());
             all_io_queues[id][vec_idx] = std::move(cfg);
@@ -3768,10 +3764,12 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         auto io_info = ioq_topology.at(dev_id);
         auto cid = io_info.shard_to_coordinator[shard_id];
         auto queue_idx = io_info.coordinator_to_idx[cid];
+        auto* multishard_fq = all_io_queues[dev_id][queue_idx].multishard_fq;
+
         if (all_io_queues[dev_id][queue_idx].coordinator == shard_id) {
-            engine().my_fair_queues.emplace_back(all_io_queues[dev_id][queue_idx].fq);
+            engine().my_multishard_fair_queues.emplace_back(multishard_fq);
         }
-        engine()._io_queues.emplace(dev_id, io_queue(all_io_queues[dev_id][queue_idx]));
+        engine()._io_queues.emplace(std::piecewise_construct, dev_id, multishard_fq);
     };
 
     _all_event_loops_done.emplace(smp::count);
@@ -3781,7 +3779,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
     unsigned i;
     for (i = 1; i < smp::count; i++) {
         auto allocation = allocations[i];
-        create_thread([configuration, &disk_config, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled, mbind, backend_selector, reactor_cfg] {
+        create_thread([configuration, &disk_config, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled, mbind, backend_selector, reactor_cfg] () {
           try {
             auto thread_name = seastar::format("reactor-{}", i);
             pthread_setname_np(pthread_self(), thread_name.c_str());

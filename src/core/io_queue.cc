@@ -88,8 +88,8 @@ io_desc_read_write::io_desc_read_write(io_queue* ioq, unsigned class_id, unsigne
    , _owner(engine().cpu_id())
 {}
 
-fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
-    fair_queue::config cfg;
+basic_fair_queue::config io_queue::make_fair_queue_config(config iocfg) {
+    basic_fair_queue::config cfg;
     cfg.capacity = std::min(iocfg.capacity, reactor::max_aio_per_queue);
     cfg.max_req_count = iocfg.max_req_count;
     cfg.max_bytes_count = iocfg.max_bytes_count;
@@ -126,75 +126,16 @@ static thread_local multishard_queue_request hack;
 
 io_queue::io_queue(io_queue::config cfg)
     : _priority_classes()
-    , _fq(new fair_queue(io_queue::make_fair_queue_config(cfg)))
-    , _multishard_fq(cfg.fq)
-    , _shard_ptr(_multishard_fq->register_priority_class(1))
+    , _fq(io_queue::make_fair_queue_config(cfg), cfg.multishard_fq)
     , _config(std::move(cfg)) {
-
-    fmt::print("Registering {:x}\n", uint64_t(&hack));
-    _multishard_fq->multishard_register(_shard_ptr, &hack);
 }
 
 void io_queue::poll_io_queue() {
-    // Step 1: Set our limits back to our natural quota. If we don't do that, once we
-    // dispatch a lot we will keep dispatching a lot and will be unfair to the other
-    // shards.
-    auto extra = _fq->prune_excess_capacity();
-    if (extra.quantity > 0 || extra.weight > 0 || extra.size > 0) {
-        multishard_queue_request fq;
-        fq.weight = extra.weight;
-        fq.size = extra.size;
-        _multishard_fq->notify_requests_finished(fq, extra.quantity);
-    }
-
-    auto had = _fq->waiters();
-    // Step 2: Dispatch the requests we currently have, within our quota.
-    auto ret = _fq->dispatch_requests();
-    if (ret || had) {
-        fmt::print("Dispatched {} requests f2, prev waiters {}\n", ret, had);
-    }
-
-    // Step 3: If we still have waiters, grab capacity from the I/O queue
-    // if possible and try to dispatch. Maybe capacity that we requested
-    // in the last poll period only got ready now and we try with that first.
-    if (_fq->waiters()) {
-        auto t = hack.get();
-        _fq->add_capacity(t);
-        auto ret = _fq->dispatch_requests();
-        fmt::print("Dispatched {} requests f3\n", ret);
-    }
-
-    // Step 3: If we still have waiters, try to acquire more capacity from
-    // the I/O queue. If there is extra capacity we will be able to dispatch
-    // more right away. If not, we may consume it in the next poll period.
-    if (_fq->waiters()) {
-        extra = _fq->waiting();
-        fmt::print("Asking for a grant of {} {} {}. Waiters {}\n", extra.quantity, extra.weight, extra.size, _fq->waiters());
-        // FIXME: the fact that this forces the request to be atomic is good enough reason to make
-        // those two queues separately.
-        hack.weight = extra.quantity;
-        hack.size = extra.size;
-
-        // FIXME: merge with dispatch
-        _multishard_fq->multishard_queue(_shard_ptr);
-        _multishard_fq->multishard_dispatch_requests();
-        auto ret = _fq->dispatch_requests();
-        fmt::print("Dispatched {} requests f4\n", ret);
-    }
-    
-    // Step 4: if we have no more waiters, give back the capacity we grabbed
-    // but didn't use
-    if (!_fq->waiters()) {
-        extra = _fq->prune_all_capacity();
-        multishard_queue_request fq;
-        fq.weight = extra.weight;
-        fq.size = extra.size;
-        _multishard_fq->notify_requests_finished(fq, extra.quantity);
-    }
+    _fq.dispatch_requests();
 }
 
 void io_queue::notify_requests_finished(fair_queue_request_descriptor& desc) {
-    _fq->notify_requests_finished(desc);
+    _fq.notify_requests_finished(desc);
 }
 
 void io_queue::free_io_desc(io_desc_read_write* desc) {
@@ -210,7 +151,7 @@ io_queue::~io_queue() {
     // that, then this has to change.
     for (auto&& pc_data : _priority_classes) {
         if (pc_data) {
-            _fq->unregister_priority_class(pc_data->ptr);
+            _fq.unregister_priority_class(pc_data->ptr);
         }
     }
 }
@@ -364,7 +305,7 @@ io_queue::priority_class_data& io_queue::find_or_create_class(const io_priority_
         //
         // This conveys all the information we need and allows one to easily group all classes from
         // the same I/O queue (by filtering by shard)
-        auto pc_ptr = _fq->register_priority_class(shares);
+        auto pc_ptr = _fq.register_priority_class(shares);
         auto pc_data = make_lw_shared<priority_class_data>(name, mountpoint(), pc_ptr);
 
         _priority_classes[id] = pc_data;
@@ -382,7 +323,7 @@ io_queue::queue_request(const io_priority_class& pc, size_t len, internal::io_re
 
     _nr_queued++;
 
-    _fq->queue(pclass.ptr, desc);
+    _fq.queue(pclass.ptr, desc);
     return desc->get_future();
 }
 
@@ -390,7 +331,7 @@ future<>
 io_queue::update_shares_for_class(const io_priority_class pc, size_t new_shares) {
     return smp::submit_to(coordinator(), [this, pc, owner = engine().cpu_id(), new_shares] {
         auto& pclass = find_or_create_class(pc);
-        _fq->update_shares(pclass.ptr, new_shares);
+        _fq.update_shares(pclass.ptr, new_shares);
     });
 }
 

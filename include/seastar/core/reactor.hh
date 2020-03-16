@@ -259,7 +259,7 @@ private:
     // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
     // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
     // be stored here.
-    std::vector<std::unique_ptr<fair_queue>> my_fair_queues;
+    std::vector<std::unique_ptr<multishard_fair_queue>> my_multishard_fair_queues;
     std::unordered_map<dev_t, io_queue> _io_queues;
     friend io_queue;
 

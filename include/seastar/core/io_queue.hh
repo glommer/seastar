@@ -96,7 +96,7 @@ public:
         unsigned disk_req_write_to_read_multiplier = read_request_base_count;
         unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
         sstring mountpoint = "undefined";
-        fair_queue* fq;
+        multishard_fair_queue* multishard_fq;
     };
 private:
     struct priority_class_data {
@@ -124,9 +124,7 @@ private:
 
     std::vector<lw_shared_ptr<priority_class_data>> _priority_classes;
 public:
-    fair_queue* _fq;
-    fair_queue* _multishard_fq;
-    priority_class_ptr _shard_ptr;
+    fair_queue _fq;
 
     uint64_t _nr_queued = 0;
 
@@ -164,12 +162,12 @@ public:
     }
 
     size_t queued_requests() const {
-        return _fq->waiters();
+        return _fq.waiters();
     }
 
     // How many requests are sent to disk but not yet returned.
     size_t requests_currently_executing() const {
-        return _fq->requests_currently_executing();
+        return _fq.requests_currently_executing();
     }
 
     // Inform the underlying queue about the fact that some of our requests finished
@@ -195,7 +193,7 @@ public:
     friend class reactor;
 public:
     config _config;
-    static fair_queue::config make_fair_queue_config(config cfg);
+    static basic_fair_queue::config make_fair_queue_config(config cfg);
 };
 
 }

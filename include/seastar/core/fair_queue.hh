@@ -34,12 +34,41 @@
 
 namespace seastar {
 
-struct ticket {
-    int64_t quantity = 0;
-    int64_t weight = 0;
-    int64_t size = 0;
-    bool pop = true;
+struct basic_priority_class {
+    uint32_t _shares = 1u;
+    float _accumulated = 0;
+    bool _queued = false;
 };
+
+struct ticket {
+    uint64_t quantity = 0;
+    uint64_t weight = 0;
+    uint64_t size = 0;
+};
+
+class multishard_fair_queue;
+
+class multishard_priority_class : public basic_priority_class {
+    // Quantities we have asked for.
+    std::atomic<uint64_t> _quantity = { 0 };
+    std::atomic<uint64_t> _weight = { 0 };
+    std::atomic<uint64_t> _size = { 0 };
+
+    // Quantities we have at our disposal.
+    std::atomic<uint64_t> _pending_quantity = { 0 };
+    std::atomic<uint64_t> _pending_weight = { 0 };
+    std::atomic<uint64_t> _pending_size = { 0 };
+
+    std::atomic<bool> _dirty = { false };
+    friend multishard_fair_queue;
+public:
+    void grant(ticket& t);
+
+    ticket receive();
+    void ask_for(ticket& t);
+};
+
+using multishard_priority_class_ptr = multishard_priority_class*;
 
 /// \brief describes a request that passes through the fair queue
 ///
@@ -56,7 +85,7 @@ struct fair_queue_request_descriptor {
 /// @{
 
 /// \cond internal
-class priority_class {
+class priority_class : public basic_priority_class {
 public:
     static constexpr unsigned queue_capacity = 128;
 private:
@@ -64,10 +93,7 @@ private:
                                                  boost::lockfree::capacity<queue_capacity>>;
 
     friend class fair_queue;
-    uint32_t _shares = 1u;
-    float _accumulated = 0;
     lf_queue _queue;
-    bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
 
@@ -92,6 +118,73 @@ public:
 /// \related fair_queue
 using priority_class_ptr = priority_class*;
 
+
+class basic_fair_queue {
+public:
+    struct config {
+        unsigned capacity = std::numeric_limits<unsigned>::max();
+        std::chrono::microseconds tau = std::chrono::milliseconds(100);
+        unsigned max_req_count = std::numeric_limits<unsigned>::max();
+        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
+    };
+protected:
+    struct class_compare {
+        bool operator() (const basic_priority_class* lhs, const basic_priority_class* rhs) const {
+            return lhs->_accumulated > rhs->_accumulated;
+        }
+    };
+
+    using prioq = std::priority_queue<basic_priority_class*, std::vector<basic_priority_class*>, class_compare>;
+    prioq _handles;
+
+    std::unordered_set<basic_priority_class*> _registered_classes;
+
+    std::chrono::microseconds _tau = std::chrono::milliseconds(100);
+
+    unsigned _requests_executing = 0;
+    unsigned _current_capacity = 0;
+
+    unsigned _req_count_executing = 0;
+    unsigned _current_max_req_count = 0;
+
+    unsigned _bytes_count_executing = 0;
+    unsigned _current_max_bytes_count = 0;
+
+
+    bool can_dispatch() const;
+    void update_cost(basic_priority_class* h, float weight, float size);
+
+    float normalize_factor() const;
+    void normalize_stats();
+
+    using clock_type = std::chrono::steady_clock::time_point;
+    clock_type _base;
+    config _config;
+
+    basic_fair_queue(config cfg);
+};
+
+class multishard_fair_queue : public basic_fair_queue {
+    // FIXME: atomic needs move constructor implemented, but maybe make the max
+    // property into smp
+    std::array<multishard_priority_class, 1024> _all_classes;
+    using dirty_queue = boost::lockfree::spsc_queue<multishard_priority_class_ptr,
+                                                 boost::lockfree::capacity<256>>;
+
+    dirty_queue _dirty;
+    util::spinlock _dispatch_lock;
+public:
+    multishard_fair_queue(config cfg);
+    multishard_priority_class_ptr get_multishard_priority_class();
+
+    void queue(multishard_priority_class_ptr pc);
+    void dispatch_requests();
+
+    void push_priority_class(basic_priority_class* pc);
+    multishard_priority_class_ptr pop_priority_class();
+    void notify_requests_finished(ticket& t);
+};
+
 /// \brief Fair queuing class
 ///
 /// This is a fair queue, allowing multiple request producers to queue requests
@@ -111,7 +204,7 @@ using priority_class_ptr = priority_class*;
 /// When the classes that lag behind start seeing requests, the fair queue will serve
 /// them first, until balance is restored. This balancing is expected to happen within
 /// a certain time window that obeys an exponential decay.
-class fair_queue {
+class fair_queue : public basic_fair_queue {
 public:
     /// \brief Fair Queue configuration structure.
     ///
@@ -122,65 +215,48 @@ public:
         std::chrono::microseconds tau = std::chrono::milliseconds(100);
         unsigned max_req_count = std::numeric_limits<unsigned>::max();
         unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
-
-        unsigned natural_capacity = 2;
-        unsigned natural_max_req_count = 2;
-        unsigned natural_max_bytes_count = 1280;
     };
 private:
+    multishard_fair_queue* _multishard_fq = nullptr;
+    multishard_priority_class_ptr _multishard_pclass = nullptr;
+
     friend priority_class;
 
-    struct class_compare {
-        bool operator() (const priority_class_ptr& lhs, const priority_class_ptr& rhs) const {
-            return lhs->_accumulated > rhs->_accumulated;
-        }
-    };
-
-    config _config;
-    std::atomic<unsigned> _requests_executing = { 0 };
-    std::atomic<unsigned> _req_count_executing = { 0 };
-    std::atomic<unsigned> _bytes_count_executing = { 0 };
-    std::atomic<unsigned> _requests_queued = { 0 };
-    std::atomic<unsigned> _req_count_queued = { 0 };
-    std::atomic<unsigned> _bytes_count_queued = { 0 };
-
-    using clock_type = std::chrono::steady_clock::time_point;
-    clock_type _base;
-    util::spinlock _fair_queue_lock;
+    unsigned _requests_queued = 0;
+    unsigned _req_count_queued = 0;
+    unsigned _bytes_count_queued = 0;
 
     static constexpr unsigned _max_classes = 1024;
 
-    using prioq = std::priority_queue<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>, class_compare>;
-    prioq _handles;
     std::array<priority_class, _max_classes> _all_classes;
     std::stack<priority_class_ptr, boost::container::static_vector<priority_class_ptr, _max_classes>> _available_classes;
 
     void push_priority_class(priority_class_ptr pc);
-
     priority_class_ptr pop_priority_class();
 
-    float normalize_factor() const;
-
-    void normalize_stats();
-
-    bool can_dispatch() const;
-
-    void update_cost(priority_class_ptr h, float weight, float size);
-public:
+    void do_dispatch_requests();
+    ticket waiting() const;
+    ticket prune_excess_capacity();
+    ticket prune_all_capacity();
     void add_capacity(ticket& t);
     void remove_capacity(ticket& t);
+public:
+    /// Constructs a fair queue with configuration parameters \c cfg, attaching it to a parent \ref multishard_fair_queue.
+    ///
+    /// \param cfg an instance of the class \ref config
+    explicit fair_queue(multishard_fair_queue *parent);
 
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config
-    explicit fair_queue(config cfg);
+    explicit fair_queue(basic_fair_queue::config cfg);
 
     /// Constructs a fair queue with a given \c capacity.
     ///
     /// \param capacity how many concurrent requests are allowed in this queue.
     /// \param tau the queue exponential decay parameter, as in exp(-1/tau * t)
     explicit fair_queue(unsigned capacity, std::chrono::microseconds tau = std::chrono::milliseconds(100))
-        : fair_queue(config{capacity, tau}) {}
+        : fair_queue(basic_fair_queue::config{capacity, tau}) {}
 
     /// Registers a priority class against this fair queue.
     ///
@@ -195,12 +271,6 @@ public:
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const;
 
-    ticket waiting() const;
-
-    ticket prune_excess_capacity();
-
-    ticket prune_all_capacity();
-
     /// \return the number of requests currently executing
     size_t requests_currently_executing() const;
 
@@ -213,19 +283,13 @@ public:
     /// request finishes executing - regardless of success or failure.
     void queue(priority_class_ptr pc, fair_queue_request_descriptor* desc);
 
-    void multishard_queue(priority_class_ptr pc);
-
-    void multishard_register(priority_class_ptr pc, fair_queue_request_descriptor* desc);
-
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_request_descriptor structure describing the request that just finished.
     /// \param requests how many requests are completing
     void notify_requests_finished(fair_queue_request_descriptor& desc, unsigned requests = 1);
 
     /// Try to execute new requests if there is capacity left in the queue.
-    size_t dispatch_requests();
-
-    void multishard_dispatch_requests();
+    void dispatch_requests();
 
     /// Updates the current shares of this priority class
     ///

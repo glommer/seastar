@@ -86,6 +86,45 @@ size_t basic_fair_queue::requests_currently_executing() const {
     return _requests_executing;
 }
 
+void basic_fair_queue::add_capacity(fair_queue_credit& c) {
+    if (((c.quantity + _current_capacity) > _config.capacity) ||
+       ((c.weight + _current_max_req_count) > _config.max_req_count) ||
+       ((c.size + _current_max_bytes_count) > _config.max_bytes_count)) {
+        throw std::out_of_range("Trying to add to basic_fair_queue more capacity than it can handle");
+    }
+
+    _current_capacity += c.quantity;
+    _current_max_req_count += c.weight;
+    _current_max_bytes_count += c.size;
+}
+
+void basic_fair_queue::remove_capacity(fair_queue_credit& c) {
+    if ((c.quantity > _current_capacity) ||
+       (c.weight > _current_max_req_count) ||
+       (c.size > _current_max_bytes_count)) {
+        throw std::out_of_range("Trying to remove to basic_fair_queue more capacity than it has");
+    }
+
+    _current_capacity -= c.quantity;
+    _current_max_req_count -= c.weight;
+    _current_max_bytes_count -= c.size;
+}
+
+fair_queue_credit basic_fair_queue::prune_unused_capacity() {
+    fair_queue_credit c;
+    assert(_current_capacity >= _requests_executing);
+    assert(_current_max_req_count >= _req_count_executing);
+    assert(_current_max_bytes_count >= _bytes_count_executing);
+
+    c.quantity = _current_capacity - _requests_executing;
+    c.weight = _current_max_req_count - _req_count_executing;
+    c.size = _current_max_bytes_count - _bytes_count_executing;
+    _current_capacity = _requests_executing;
+    _current_max_req_count = _req_count_executing;
+    _current_max_bytes_count = _bytes_count_executing;
+    return c;
+}
+
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
     priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
     _all_classes.insert(pclass);

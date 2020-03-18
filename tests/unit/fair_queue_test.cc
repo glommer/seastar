@@ -55,6 +55,45 @@ struct request {
     {}
 };
 
+class test_basic_fair_queue : public basic_fair_queue {
+    basic_priority_class _test_priority_class;
+public:
+    virtual void dispatch_requests() override {}
+    fair_queue_credit prune_unused_capacity() {
+        return basic_fair_queue::prune_unused_capacity();
+    }
+
+    void add_capacity(fair_queue_credit& c) {
+        return basic_fair_queue::add_capacity(c);
+    }
+
+    void remove_capacity(fair_queue_credit& c) {
+        return basic_fair_queue::remove_capacity(c);
+    }
+
+    unsigned current_capacity() const {
+        return _current_capacity;
+    }
+
+    unsigned current_max_req_count() const {
+        return _current_max_req_count;
+    }
+
+    unsigned current_max_bytes_count() const {
+        return _current_max_bytes_count;
+    }
+
+    bool can_dispatch() const {
+        return basic_fair_queue::can_dispatch();
+    }
+
+    test_basic_fair_queue(basic_fair_queue::config cfg)
+        : basic_fair_queue(std::move(cfg))
+        , _test_priority_class(1)
+    {
+        push_priority_class(&_test_priority_class);
+    }
+};
 
 class test_env {
     fair_queue _fq;
@@ -419,4 +458,44 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_random_run) {
     // Accept 5 % error.
     auto expected_error = std::max(1, int(round(reqs * 0.05)));
     env.verify(format("random_run ({:d} requests)", reqs), {1, 1}, expected_error);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_fair_queue_move_credit) {
+    basic_fair_queue::config cfg;
+    cfg.capacity = 1;
+    cfg.max_req_count = 10;
+    cfg.max_bytes_count = 128;
+
+    test_basic_fair_queue fq(std::move(cfg));
+    auto credit = fq.prune_unused_capacity();
+    BOOST_REQUIRE(credit.quantity == 1);
+    BOOST_REQUIRE(credit.weight == 10);
+    BOOST_REQUIRE(credit.size == 128);
+
+    BOOST_REQUIRE(fq.current_capacity() == 0);
+    BOOST_REQUIRE(fq.current_max_bytes_count() == 0);
+    BOOST_REQUIRE(fq.current_max_req_count() == 0);
+
+    credit.quantity++;
+    BOOST_REQUIRE_THROW(fq.add_capacity(credit), std::out_of_range);
+    BOOST_REQUIRE_THROW(fq.remove_capacity(credit), std::out_of_range);
+
+    // Previous failed attempts didn't change capacity.
+    BOOST_REQUIRE(fq.current_capacity() == 0);
+    BOOST_REQUIRE(fq.current_max_bytes_count() == 0);
+    BOOST_REQUIRE(fq.current_max_req_count() == 0);
+
+    credit.quantity--;
+    fq.add_capacity(credit);
+
+    BOOST_REQUIRE(fq.current_capacity() == 1);
+    BOOST_REQUIRE(fq.current_max_bytes_count() == 128);
+    BOOST_REQUIRE(fq.current_max_req_count() == 10);
+    BOOST_REQUIRE(fq.can_dispatch());
+
+    fq.remove_capacity(credit);
+    BOOST_REQUIRE(fq.current_capacity() == 0);
+    BOOST_REQUIRE(fq.current_max_bytes_count() == 0);
+    BOOST_REQUIRE(fq.current_max_req_count() == 0);
+    BOOST_REQUIRE(!fq.can_dispatch());
 }

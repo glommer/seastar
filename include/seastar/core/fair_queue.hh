@@ -51,6 +51,14 @@ struct basic_priority_class {
     {}
 };
 
+// Allow for a fair_queue to expand and/or contract its capacity by
+// amounts described in this structure.
+struct fair_queue_credit {
+    uint64_t quantity = 0;
+    uint64_t weight = 0;
+    uint64_t size = 0;
+};
+
 class priority_class : public basic_priority_class {
     struct request {
         noncopyable_function<void()> func;
@@ -141,6 +149,10 @@ protected:
     basic_fair_queue(basic_fair_queue&& fq) = delete;
     basic_fair_queue& operator=(basic_fair_queue&& fq) = delete;
     basic_fair_queue& operator=(const basic_fair_queue& fq) = delete;
+
+    fair_queue_credit prune_unused_capacity();
+    void add_capacity(fair_queue_credit& t);
+    void remove_capacity(fair_queue_credit& t);
 public:
     /// Try to execute new requests if there is capacity left in the queue.
     virtual void dispatch_requests() = 0;

@@ -31,14 +31,14 @@
 
 namespace seastar {
 
-void fair_queue::push_priority_class(priority_class_ptr pc) {
+void basic_fair_queue::push_priority_class(basic_priority_class* pc) {
     if (!pc->_queued) {
         _handles.push(pc);
         pc->_queued = true;
     }
 }
 
-priority_class_ptr fair_queue::pop_priority_class() {
+basic_priority_class* basic_fair_queue::pop_priority_class() {
     assert(!_handles.empty());
     auto h = _handles.top();
     _handles.pop();
@@ -47,50 +47,67 @@ priority_class_ptr fair_queue::pop_priority_class() {
     return h;
 }
 
-float fair_queue::normalize_factor() const {
+float basic_fair_queue::normalize_factor() const {
     return std::numeric_limits<float>::min();
 }
 
-void fair_queue::normalize_stats() {
+void basic_fair_queue::normalize_stats() {
     auto time_delta = std::log(normalize_factor()) * _config.tau;
     // time_delta is negative; and this may advance _base into the future
     _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
-    for (auto& pc: _all_classes) {
+    for (auto& pc: _registered_classes) {
         pc->_accumulated *= normalize_factor();
     }
 }
 
-bool fair_queue::can_dispatch() const {
-    return _requests_queued &&
-           (_requests_executing < _config.capacity) &&
-           (_req_count_executing < _config.max_req_count) &&
-           (_bytes_count_executing < _config.max_bytes_count);
+bool basic_fair_queue::can_dispatch() const {
+    return !_handles.empty() &&
+           (_requests_executing < _current_capacity) &&
+           (_req_count_executing < _current_max_req_count) &&
+           (_bytes_count_executing < _current_max_bytes_count);
+}
+
+void basic_fair_queue::update_cost(basic_priority_class* h, float weight, float size) {
+    auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
+    auto req_cost  = (weight / _config.max_req_count + size / _config.max_bytes_count) / h->_shares;
+    auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
+    float next_accumulated = h->_accumulated + cost;
+    while (std::isinf(next_accumulated)) {
+        normalize_stats();
+        // If we have renormalized, our time base will have changed. This should happen very infrequently
+        delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
+        cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
+        next_accumulated = h->_accumulated + cost;
+    }
+    h->_accumulated = next_accumulated;
+}
+
+size_t basic_fair_queue::requests_currently_executing() const {
+    return _requests_executing;
 }
 
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
     priority_class_ptr pclass = make_lw_shared<priority_class>(shares);
     _all_classes.insert(pclass);
+    _registered_classes.insert(&*pclass);
     return pclass;
 }
 
 void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
     assert(pclass->_queue.empty());
     _all_classes.erase(pclass);
+    _registered_classes.erase(&*pclass);
 }
 
 size_t fair_queue::waiters() const {
     return _requests_queued;
 }
 
-size_t fair_queue::requests_currently_executing() const {
-    return _requests_executing;
-}
-
 void fair_queue::queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
     // We need to return a future in this function on which the caller can wait.
     // Since we don't know which queue we will use to execute the next request - if ours or
     // someone else's, we need a separate promise at this point.
-    push_priority_class(pc);
+    push_priority_class(&*pc);
     pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
     _requests_queued++;
 }
@@ -101,12 +118,11 @@ void fair_queue::notify_requests_finished(fair_queue_request_descriptor& desc) {
     _bytes_count_executing -= desc.size;
 }
 
-
 void fair_queue::dispatch_requests() {
     while (can_dispatch()) {
-        priority_class_ptr h;
+        priority_class* h;
         do {
-            h = pop_priority_class();
+            h = static_cast<priority_class*>(pop_priority_class());
         } while (h->_queue.empty());
 
         auto req = std::move(h->_queue.front());
@@ -116,21 +132,10 @@ void fair_queue::dispatch_requests() {
         _bytes_count_executing += req.desc.size;
         _requests_queued--;
 
-        auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-        auto req_cost  = (float(req.desc.weight) / _config.max_req_count + float(req.desc.size) / _config.max_bytes_count) / h->_shares;
-        auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
-        float next_accumulated = h->_accumulated + cost;
-        while (std::isinf(next_accumulated)) {
-            normalize_stats();
-            // If we have renormalized, our time base will have changed. This should happen very infrequently
-            delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-            cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
-            next_accumulated = h->_accumulated + cost;
-        }
-        h->_accumulated = next_accumulated;
+        update_cost(h, req.desc.weight, req.desc.size);
 
         if (!h->_queue.empty()) {
-            push_priority_class(h);
+            push_priority_class(&*h);
         }
         req.func();
     }

@@ -42,19 +42,26 @@ struct fair_queue_request_descriptor {
 /// @{
 
 /// \cond internal
-class priority_class {
+struct basic_priority_class {
+    uint32_t _shares = 1u;
+    float _accumulated = 0;
+    bool _queued = false;
+    explicit basic_priority_class(uint32_t shares)
+        : _shares(std::max(shares, 1u))
+    {}
+};
+
+class priority_class : public basic_priority_class {
     struct request {
         noncopyable_function<void()> func;
         fair_queue_request_descriptor desc;
     };
     friend class fair_queue;
-    uint32_t _shares = 0;
-    float _accumulated = 0;
     circular_buffer<request> _queue;
-    bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
-    explicit priority_class(uint32_t shares) : _shares(std::max(shares, 1u)) {}
+    explicit priority_class(uint32_t shares)
+        : basic_priority_class(shares) {}
 
     void update_shares(uint32_t shares) {
         _shares = (std::max(shares, 1u));
@@ -66,6 +73,81 @@ public:
     }
 };
 /// \endcond
+
+/// \brief Basic Fair queuing class.
+///
+/// Used as a base class for all the versions of the fair queue.
+/// Not meant to be instantiated directly. See derived classes for intended usage.
+class basic_fair_queue {
+public:
+    /// \brief Fair Queue configuration structure.
+    ///
+    /// \sets the operation parameters of a \ref fair_queue
+    /// \related fair_queue
+    struct config {
+        unsigned capacity = std::numeric_limits<unsigned>::max();
+        std::chrono::microseconds tau = std::chrono::milliseconds(100);
+        unsigned max_req_count = std::numeric_limits<unsigned>::max();
+        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
+    };
+protected:
+    struct class_compare {
+        bool operator() (const basic_priority_class* lhs, const basic_priority_class* rhs) const {
+            return lhs->_accumulated > rhs->_accumulated;
+        }
+    };
+
+    using prioq = std::priority_queue<basic_priority_class*, std::vector<basic_priority_class*>, class_compare>;
+    prioq _handles;
+
+    std::unordered_set<basic_priority_class*> _registered_classes;
+
+    std::chrono::microseconds _tau = std::chrono::milliseconds(100);
+
+    unsigned _requests_executing = 0;
+    unsigned _current_capacity = 0;
+
+    unsigned _req_count_executing = 0;
+    unsigned _current_max_req_count = 0;
+
+    unsigned _bytes_count_executing = 0;
+    unsigned _current_max_bytes_count = 0;
+
+    bool can_dispatch() const;
+    void update_cost(basic_priority_class* h, float weight, float size);
+
+    float normalize_factor() const;
+    void normalize_stats();
+
+    void push_priority_class(basic_priority_class* pc);
+    basic_priority_class* pop_priority_class();
+
+    using clock_type = std::chrono::steady_clock::time_point;
+    config _config;
+    clock_type _base;
+
+    basic_fair_queue(config cfg)
+        : _current_capacity(cfg.capacity)
+        , _current_max_req_count(cfg.max_req_count)
+        , _current_max_bytes_count(cfg.max_bytes_count)
+        , _config(std::move(cfg))
+        , _base(std::chrono::steady_clock::now())
+    {}
+
+    basic_fair_queue(const basic_fair_queue& fq)
+        : _config(fq._config)
+        , _base(fq._base)
+    {}
+    basic_fair_queue(basic_fair_queue&& fq) = delete;
+    basic_fair_queue& operator=(basic_fair_queue&& fq) = delete;
+    basic_fair_queue& operator=(const basic_fair_queue& fq) = delete;
+public:
+    /// Try to execute new requests if there is capacity left in the queue.
+    virtual void dispatch_requests() = 0;
+
+    /// \return the number of requests currently executing
+    size_t requests_currently_executing() const;
+};
 
 /// \brief Priority class, to be used with a given \ref fair_queue
 ///
@@ -96,54 +178,20 @@ using priority_class_ptr = lw_shared_ptr<priority_class>;
 /// When the classes that lag behind start seeing requests, the fair queue will serve
 /// them first, until balance is restored. This balancing is expected to happen within
 /// a certain time window that obeys an exponential decay.
-class fair_queue {
+class fair_queue : public basic_fair_queue {
 public:
-    /// \brief Fair Queue configuration structure.
-    ///
-    /// \sets the operation parameters of a \ref fair_queue
-    /// \related fair_queue
-    struct config {
-        unsigned capacity = std::numeric_limits<unsigned>::max();
-        std::chrono::microseconds tau = std::chrono::milliseconds(100);
-        unsigned max_req_count = std::numeric_limits<unsigned>::max();
-        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
-    };
+    using config = basic_fair_queue::config;
 private:
     friend priority_class;
 
-    struct class_compare {
-        bool operator() (const priority_class_ptr& lhs, const priority_class_ptr& rhs) const {
-            return lhs->_accumulated > rhs->_accumulated;
-        }
-    };
-
-    config _config;
-    unsigned _requests_executing = 0;
-    unsigned _req_count_executing = 0;
-    unsigned _bytes_count_executing = 0;
     unsigned _requests_queued = 0;
-    using clock_type = std::chrono::steady_clock::time_point;
-    clock_type _base;
-    using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
-    prioq _handles;
     std::unordered_set<priority_class_ptr> _all_classes;
-
-    void push_priority_class(priority_class_ptr pc);
-
-    priority_class_ptr pop_priority_class();
-
-    float normalize_factor() const;
-
-    void normalize_stats();
-
-    bool can_dispatch() const;
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config
     explicit fair_queue(config cfg)
-        : _config(std::move(cfg))
-        , _base(std::chrono::steady_clock::now())
+        : basic_fair_queue(std::move(cfg))
     {}
 
     /// Constructs a fair queue with a given \c capacity.
@@ -166,9 +214,6 @@ public:
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const;
 
-    /// \return the number of requests currently executing
-    size_t requests_currently_executing() const;
-
     /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
     ///
     /// It is expected that \c func doesn't throw. If it does throw, it will be just removed from
@@ -183,7 +228,7 @@ public:
     void notify_requests_finished(fair_queue_request_descriptor& desc);
 
     /// Try to execute new requests if there is capacity left in the queue.
-    void dispatch_requests();
+    virtual void dispatch_requests() override;
 
     /// Updates the current shares of this priority class
     ///

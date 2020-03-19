@@ -142,12 +142,25 @@ size_t fair_queue::waiters() const {
     return _requests_queued;
 }
 
+fair_queue_credit fair_queue::credit_waiting() const {
+    fair_queue_credit c;
+    c.quantity = _requests_queued;
+    c.weight = _req_count_queued;
+    c.size = _bytes_count_queued;
+    return c;
+}
+
 void fair_queue::queue(priority_class_ptr pc, fair_queue_request_descriptor desc, noncopyable_function<void()> func) {
     // We need to return a future in this function on which the caller can wait.
     // Since we don't know which queue we will use to execute the next request - if ours or
     // someone else's, we need a separate promise at this point.
     push_priority_class(&*pc);
+    assert(desc.size);
+    assert(desc.weight);
+
     pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
+    _req_count_queued += desc.weight;
+    _bytes_count_queued += desc.size;
     _requests_queued++;
 }
 

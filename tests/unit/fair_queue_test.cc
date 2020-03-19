@@ -50,7 +50,7 @@ struct request {
     unsigned index;
 
     request(unsigned weight, unsigned index)
-        : fqdesc({weight, 0})
+        : fqdesc({weight, 4096})
         , index(index)
     {}
 };

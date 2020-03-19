@@ -197,6 +197,9 @@ private:
     friend priority_class;
 
     unsigned _requests_queued = 0;
+    unsigned _req_count_queued = 0;
+    unsigned _bytes_count_queued = 0;
+
     std::unordered_set<priority_class_ptr> _all_classes;
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
@@ -226,6 +229,8 @@ public:
     /// \return how many waiters are currently queued for all classes.
     size_t waiters() const;
 
+    /// \return how much credit would we need to execute everything that is pending
+    fair_queue_credit credit_waiting() const;
     /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
     ///
     /// It is expected that \c func doesn't throw. If it does throw, it will be just removed from

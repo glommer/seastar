@@ -24,9 +24,14 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <seastar/util/spinlock.hh>
 #include <queue>
 #include <chrono>
 #include <unordered_set>
+#include <atomic>
+#include <stack>
+#include <boost/lockfree/spsc_queue.hpp>
+#include <boost/container/static_vector.hpp>
 
 namespace seastar {
 
@@ -46,6 +51,8 @@ struct basic_priority_class {
     uint32_t _shares = 1u;
     float _accumulated = 0;
     bool _queued = false;
+
+    basic_priority_class() {}
     explicit basic_priority_class(uint32_t shares)
         : _shares(std::max(shares, 1u))
     {}
@@ -80,8 +87,36 @@ public:
         return _shares;
     }
 };
-/// \endcond
 
+class bulk_fair_queue;
+
+class bulk_priority_class : public basic_priority_class {
+    // Quantities we have asked for.
+    // Updates will always update size last with an acquire barrier
+    // Readers will know that the other quantities are at least as up2date
+    // as size (new writes could have happened by the time we read)
+    std::atomic<uint64_t> _quantity = { 0 };
+    std::atomic<uint64_t> _weight = { 0 };
+    std::atomic<uint64_t> _size = { 0 };
+
+    // Quantities we have at our disposal.
+    // Same: updates will always update size last with an acquire barrier
+    std::atomic<uint64_t> _pending_quantity = { 0 };
+    std::atomic<uint64_t> _pending_weight = { 0 };
+    std::atomic<uint64_t> _pending_size = { 0 };
+
+    std::atomic<bool> _dirty = { false };
+    friend class bulk_fair_queue;
+public:
+    void receive_grant(fair_queue_credit& c);
+    fair_queue_credit consume_credit();
+    void request_credit(fair_queue_credit& t);
+};
+
+class bulk_fair_queue;
+using bulk_priority_class_ptr = bulk_priority_class*;
+
+/// \endcond
 /// \brief Basic Fair queuing class.
 ///
 /// Used as a base class for all the versions of the fair queue.
@@ -134,6 +169,9 @@ protected:
     config _config;
     clock_type _base;
 
+    bulk_fair_queue* _reservoir = nullptr;
+    bulk_priority_class_ptr _rptr = nullptr;
+
     basic_fair_queue(config cfg)
         : _current_capacity(cfg.capacity)
         , _current_max_req_count(cfg.max_req_count)
@@ -154,11 +192,46 @@ protected:
     void add_capacity(fair_queue_credit& t);
     void remove_capacity(fair_queue_credit& t);
 public:
+    // Return capacity that is no longer used to the parent queue, if a parent
+    // queue is present
+    void return_capacity(fair_queue_credit& c);
     /// Try to execute new requests if there is capacity left in the queue.
     virtual void dispatch_requests() = 0;
 
     /// \return the number of requests currently executing
     size_t requests_currently_executing() const;
+};
+
+/// \brief Bulk Fair queuing class.
+///
+/// Used as inner nodes in nested queue environments. Updates work in bulk.
+/// Another queue that sits on top will accumulate capacity requests and at
+/// a later time we can transfer bulk credits.
+///
+/// This class is safe to use across shards with the following restrictions:
+/// - The dispatch_requests() method can be called from any shard.
+/// - The queue() method can only be called, for a given \ref bulk_priority_class, from the same shard.
+class bulk_fair_queue : public basic_fair_queue {
+    static constexpr size_t max_classes = 1024;
+    std::array<bulk_priority_class, max_classes> _all_classes;
+    std::stack<bulk_priority_class_ptr,
+        boost::container::static_vector<bulk_priority_class_ptr, max_classes>> _available_classes;
+
+    using dirty_queue = boost::lockfree::spsc_queue<bulk_priority_class_ptr,
+                                                 boost::lockfree::capacity<256>>;
+
+    dirty_queue _dirty;
+    util::spinlock _lock;
+    void reap_queued_classes();
+public:
+    using config = basic_fair_queue::config;
+
+    bulk_fair_queue(config cfg);
+    bulk_priority_class_ptr register_priority_class(uint32_t shares);
+    void unregister_priority_class(bulk_priority_class_ptr ptr);
+
+    void queue(bulk_priority_class_ptr pc);
+    virtual void dispatch_requests() override;
 };
 
 /// \brief Priority class, to be used with a given \ref fair_queue
@@ -201,7 +274,15 @@ private:
     unsigned _bytes_count_queued = 0;
 
     std::unordered_set<priority_class_ptr> _all_classes;
+    void do_dispatch_requests();
 public:
+    /// Constructs an empty fair queue nested with a \ref bulk_fair_queue
+    ///
+    /// The \ref bulk_fair_queue must be preconstructed. Many fair_queues
+    /// can (and should) be attached to the same \ref bulk_fair_queue
+    explicit fair_queue(bulk_fair_queue& fq)
+        : basic_fair_queue(fq)
+    {}
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config

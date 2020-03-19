@@ -106,9 +106,16 @@ class test_env {
         do {} while (tick() != 0);
     }
 public:
+    test_env(bulk_fair_queue& b) : _fq(b) {}
     test_env(unsigned capacity) : _fq(capacity)
     {}
 
+    // dispatch but don't collect them. That leaves the request hanging
+    // and it is useful if we want to test if the queue behaves well when
+    // it is at the limit. Later calls to tick
+    void dispatch_requests() {
+        _fq.dispatch_requests();
+    }
     // As long as there is a request sitting in the queue, tick() will process
     // at least one request. The only situation in which tick() will return nothing
     // is if no requests were sent to the fair_queue (obviously).
@@ -117,22 +124,33 @@ public:
     // method (see above) in which all requests currently sent to the queue are drained
     // before the queue is destroyed.
     unsigned tick(unsigned n = 1) {
-        unsigned processed = 0;
         _fq.dispatch_requests();
+        return reap_completions(n);
+    }
+
+    unsigned reap_completions(unsigned n = 1, bool try_dispatch_more = false) {
+        fair_queue_credit c;
 
         for (unsigned i = 0; i < n; ++i) {
             std::vector<request> curr;
             curr.swap(_inflight);
 
             for (auto& req : curr) {
-                processed++;
                 _results[req.index]++;
-                _fq.notify_requests_finished(req.fqdesc);
+                c.quantity++;
+                c.weight += req.fqdesc.weight;
+                c.size += req.fqdesc.size;
             }
 
-            _fq.dispatch_requests();
+            if (try_dispatch_more) {
+                _fq.return_capacity(c);
+                _fq.dispatch_requests();
+                c = fair_queue_credit{};
+            }
         }
-        return processed;
+
+        _fq.return_capacity(c);
+        return c.quantity;
     }
 
     ~test_env() {
@@ -140,6 +158,10 @@ public:
         for (auto& p: _classes) {
             _fq.unregister_priority_class(p);
         }
+    }
+
+    size_t inflight() {
+        return _inflight.size();
     }
 
     size_t register_priority_class(uint32_t shares) {
@@ -498,4 +520,48 @@ SEASTAR_THREAD_TEST_CASE(test_fair_queue_move_credit) {
     BOOST_REQUIRE(fq.current_max_bytes_count() == 0);
     BOOST_REQUIRE(fq.current_max_req_count() == 0);
     BOOST_REQUIRE(!fq.can_dispatch());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_fair_queue_nested) {
+    basic_fair_queue::config cfg;
+    cfg.capacity = 1;
+    cfg.max_req_count = 10;
+    cfg.max_bytes_count = 4096;
+
+    bulk_fair_queue bfq(std::move(cfg));
+    test_env env1(bfq);
+    test_env env2(bfq);
+
+    auto a = env1.register_priority_class(10);
+    auto b = env2.register_priority_class(10);
+
+    for (int i = 0; i < 100; ++i) {
+        env1.do_op(a, 1);
+        env2.do_op(b, 1);
+    }
+
+    later().get();
+
+    // the first fair queue will grab capacity to itself and will be
+    // allowed to dispatch
+    env1.dispatch_requests();
+    BOOST_REQUIRE(env1.inflight() == 1);
+
+    // The second fair queue can try as much as it wants, the capacity
+    // is all held by the first one
+    auto x = env2.tick(100);
+    BOOST_REQUIRE(x == 0);
+
+    x = env1.reap_completions();
+    BOOST_REQUIRE(x == 1);
+
+    // Second fair queue can now dispatch
+    x = env2.tick();
+    BOOST_REQUIRE(x == 1);
+
+    // Flush whatever remains.
+    for (int i = 0; i < 99; ++i) {
+        env1.tick();
+        env2.tick();
+    }
 }

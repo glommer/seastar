@@ -3799,6 +3799,18 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
 
     std::unordered_map<dev_t, std::vector<io_queue*>> all_io_queues;
 
+    init_default_smp_service_group(0);
+    auto backend_selector = configuration["reactor-backend"].as<reactor_backend_selector>();
+
+    try {
+        allocate_reactor(0, backend_selector, reactor_cfg);
+    } catch (const std::exception& e) {
+        seastar_logger.error(e.what());
+        _exit(1);
+    }
+
+    _reactors[0] = &engine();
+
     for (auto& id : disk_config.device_ids()) {
         auto io_info = ioq_topology.at(id);
         all_io_queues.emplace(id, io_info.coordinators.size());
@@ -3830,8 +3842,6 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
     };
 
     _all_event_loops_done.emplace(smp::count);
-
-    auto backend_selector = configuration["reactor-backend"].as<reactor_backend_selector>();
 
     unsigned i;
     for (i = 1; i < smp::count; i++) {
@@ -3876,15 +3886,6 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         });
     }
 
-    init_default_smp_service_group(0);
-    try {
-        allocate_reactor(0, backend_selector, reactor_cfg);
-    } catch (const std::exception& e) {
-        seastar_logger.error(e.what());
-        _exit(1);
-    }
-
-    _reactors[0] = &engine();
     for (auto& dev_id : disk_config.device_ids()) {
         alloc_io_queue(0, dev_id);
     }

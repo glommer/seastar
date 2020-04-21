@@ -27,6 +27,7 @@
 #include <queue>
 #include <chrono>
 #include <unordered_set>
+#include <stack>
 
 namespace seastar {
 
@@ -101,13 +102,10 @@ class priority_class {
         fair_queue_ticket desc;
     };
     friend class fair_queue;
-    uint32_t _shares = 0;
+    uint32_t _shares = 1u;
     float _accumulated = 0;
     circular_buffer<request> _queue;
     bool _queued = false;
-
-    friend struct shared_ptr_no_esft<priority_class>;
-    explicit priority_class(uint32_t shares) : _shares(std::max(shares, 1u)) {}
 
     void update_shares(uint32_t shares) {
         _shares = (std::max(shares, 1u));
@@ -128,7 +126,7 @@ public:
 /// to the \ref fair_queue to identify a given class.
 ///
 /// \related fair_queue
-using priority_class_ptr = lw_shared_ptr<priority_class>;
+using priority_class_ptr = priority_class*;
 
 /// \brief Fair queuing class
 ///
@@ -180,7 +178,12 @@ private:
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
-    std::unordered_set<priority_class_ptr> _all_classes;
+
+    static constexpr size_t max_classes = 1024;
+    // We won't use an array or other static storage to save on stack space. It can grow pretty big pretty quick
+    std::vector<priority_class> _all_classes;
+    std::unordered_set<priority_class_ptr> _registered_classes;
+    std::stack<priority_class_ptr> _available_classes;
 
     void push_priority_class(priority_class_ptr pc);
 

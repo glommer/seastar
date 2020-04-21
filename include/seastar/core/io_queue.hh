@@ -115,15 +115,6 @@ public:
     future<size_t>
     queue_request(const io_priority_class& pc, size_t len, internal::io_request req) noexcept;
 
-    size_t queued_requests() const {
-        return _fq.waiters();
-    }
-
-    // How many requests are sent to disk but not yet returned.
-    size_t requests_currently_executing() const {
-        return _fq.requests_currently_executing();
-    }
-
     void notify_requests_finished(fair_queue_ticket& desc);
 
     // Inform the underlying queue about the fact that some of our requests finished

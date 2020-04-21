@@ -31,6 +31,42 @@
 
 namespace seastar {
 
+fair_queue_ticket::fair_queue_ticket(uint32_t weight, uint32_t size)
+    : _weight(weight)
+    , _size(size)
+{}
+
+float fair_queue_ticket::operator/(fair_queue_ticket& rhs) const {
+    return float(_weight) / rhs._weight + float(_size) / rhs._size;
+}
+
+fair_queue_ticket& fair_queue_ticket::operator+=(const fair_queue_ticket& desc) {
+    _weight += desc._weight;
+    _size += desc._size;
+    return *this;
+}
+
+fair_queue_ticket& fair_queue_ticket::operator-=(const fair_queue_ticket& desc) {
+    _weight -= desc._weight;
+    _size -= desc._size;
+    return *this;
+}
+
+bool fair_queue_ticket::operator<(const fair_queue_ticket& rhs) const {
+    return (_weight < rhs._weight) && (_size < rhs._size);
+}
+
+fair_queue_ticket::operator bool() const {
+    return (_weight > 0) || (_size > 0);
+}
+
+fair_queue::fair_queue(config cfg)
+    : _config(std::move(cfg))
+    , _maximum_capacity(_config.max_req_count, _config.max_bytes_count)
+    , _current_capacity(_config.max_req_count, _config.max_bytes_count)
+    , _base(std::chrono::steady_clock::now())
+{}
+
 void fair_queue::push_priority_class(priority_class_ptr pc) {
     if (!pc->_queued) {
         _handles.push(pc);
@@ -61,9 +97,7 @@ void fair_queue::normalize_stats() {
 }
 
 bool fair_queue::can_dispatch() const {
-    return _requests_queued &&
-           (_req_count_executing < _config.max_req_count) &&
-           (_bytes_count_executing < _config.max_bytes_count);
+    return _resources_queued && (_resources_executing < _current_capacity);
 }
 
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
@@ -77,12 +111,12 @@ void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
     _all_classes.erase(pclass);
 }
 
-size_t fair_queue::waiters() const {
-    return _requests_queued;
+fair_queue_ticket fair_queue::resources_currently_waiting() const {
+    return _resources_queued;
 }
 
-size_t fair_queue::requests_currently_executing() const {
-    return _requests_executing;
+fair_queue_ticket fair_queue::resources_currently_executing() const {
+    return _resources_executing;
 }
 
 void fair_queue::queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyable_function<void()> func) {
@@ -90,15 +124,13 @@ void fair_queue::queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyabl
     // Since we don't know which queue we will use to execute the next request - if ours or
     // someone else's, we need a separate promise at this point.
     push_priority_class(pc);
+    _resources_queued += desc;
     pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
-    _requests_queued++;
 }
 
 void fair_queue::notify_requests_finished(fair_queue_ticket desc) {
-    _req_count_executing -= desc.weight;
-    _bytes_count_executing -= desc.size;
+    _resources_executing -= desc;
 }
-
 
 void fair_queue::dispatch_requests() {
     while (can_dispatch()) {
@@ -109,13 +141,11 @@ void fair_queue::dispatch_requests() {
 
         auto req = std::move(h->_queue.front());
         h->_queue.pop_front();
-        _requests_executing++;
-        _req_count_executing += req.desc.weight;
-        _bytes_count_executing += req.desc.size;
-        _requests_queued--;
+        _resources_executing += req.desc;;
+        _resources_queued -= req.desc;
 
         auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-        auto req_cost  = (float(req.desc.weight) / _config.max_req_count + float(req.desc.size) / _config.max_bytes_count) / h->_shares;
+        auto req_cost  = (req.desc / _maximum_capacity) / h->_shares;
         auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
         float next_accumulated = h->_accumulated + cost;
         while (std::isinf(next_accumulated)) {

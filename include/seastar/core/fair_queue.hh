@@ -30,17 +30,53 @@
 
 namespace seastar {
 
-/// \brief describes a request that passes through the fair queue
+/// \brief describes a request that passes through the fair queue.
+///
+/// A ticket is specified by a weight and a size. For example, one can specify a request of weight
+/// 1 and size 16kB. If the fair queue accepts one such request per second, it will sustain 1 IOPS
+/// at 16kB/s bandwidth.
 ///
 /// \related fair_queue
-struct fair_queue_ticket {
-    uint32_t weight = 0; ///< the total weight of these requests for capacity purposes (IOPS).
-    uint32_t size = 0;        ///< the total effective size of these requests
-    fair_queue_ticket& operator+=(const fair_queue_ticket& desc) {
-        weight += desc.weight;
-        size += desc.size;
-        return *this;
-    }
+class fair_queue_ticket {
+    uint32_t _weight = 0; ///< the total weight of these requests for capacity purposes (IOPS).
+    uint32_t _size = 0;        ///< the total effective size of these requests
+public:
+    /// Constructs a fair_queue_ticket with a given \c weight and a given \c size
+    ///
+    /// \param weight the weight of the request
+    /// \param size the size of the request
+    fair_queue_ticket(uint32_t weight, uint32_t size);
+    fair_queue_ticket() {}
+    /// Increase the quantity represented in this ticket by the amount represented by \c desc
+    fair_queue_ticket& operator+=(const fair_queue_ticket& desc);
+    /// Decreases the quantity represented in this ticket by the amount represented by \c desc
+    fair_queue_ticket& operator-=(const fair_queue_ticket& desc);
+
+    /// \returns true if this fair_queue_ticket is less than \c rhs.
+    ///
+    /// For a fair_queue_ticket to be considered less than another, both its quantities need to be
+    /// less than the other. Note that there is no total ordering between two fair_queue_tickets
+    bool operator<(const fair_queue_ticket& rhs) const;
+
+    /// \returns true if the fair_queue_ticket represents a non-zero quantity.
+    ///
+    /// For a fair_queue ticket to be non-zero, at least one of its represented quantities need to
+    /// be non-zero
+    explicit operator bool() const;
+
+    /// \returns the relative cost of this request in relationship to another request
+    ///
+    /// The cost function itself is an implementation detail, but one can expect either weight or
+    /// size to have more or less relative importance depending on which of the dimensions in the
+    /// denominator is relatively higher. For example, given this request a, and two other requests
+    /// b and c, such that that c has the same \c weight but a higher \c size than b, one can expect
+    /// the \c size component of this request to play a larger role.
+    ///
+    /// It is legal for the numerator to have one of the quantities set to zero, in which case only
+    /// the other quantity is taken into consideration.
+    ///
+    /// It is however not legal for the denominator to have any quantity set to zero.
+    float operator/(fair_queue_ticket& rhs) const;
 };
 static_assert(sizeof(fair_queue_ticket) == sizeof(uint64_t));
 
@@ -123,10 +159,10 @@ private:
     };
 
     config _config;
-    unsigned _requests_executing = 0;
-    unsigned _req_count_executing = 0;
-    unsigned _bytes_count_executing = 0;
-    unsigned _requests_queued = 0;
+    fair_queue_ticket _maximum_capacity;
+    fair_queue_ticket _current_capacity;
+    fair_queue_ticket _resources_executing;
+    fair_queue_ticket _resources_queued;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
@@ -146,10 +182,7 @@ public:
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config
-    explicit fair_queue(config cfg)
-        : _config(std::move(cfg))
-        , _base(std::chrono::steady_clock::now())
-    {}
+    explicit fair_queue(config cfg);
 
     /// Constructs a fair queue with a given \c capacity, expressed in IOPS.
     ///
@@ -169,10 +202,10 @@ public:
     void unregister_priority_class(priority_class_ptr pclass);
 
     /// \return how many waiters are currently queued for all classes.
-    size_t waiters() const;
+    fair_queue_ticket resources_currently_waiting() const;
 
     /// \return the number of requests currently executing
-    size_t requests_currently_executing() const;
+    fair_queue_ticket resources_currently_executing() const;
 
     /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
     ///

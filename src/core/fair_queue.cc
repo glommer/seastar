@@ -36,7 +36,7 @@ namespace seastar {
 
 static_assert(sizeof(fair_queue_ticket) == sizeof(uint64_t), "unexpected fair_queue_ticket size");
 
-fair_queue_ticket::fair_queue_ticket(uint32_t weight, uint32_t size)
+fair_queue_ticket::fair_queue_ticket(uint32_t weight, uint32_t size) noexcept
     : _weight(weight)
     , _size(size)
 {}

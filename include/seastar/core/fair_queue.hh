@@ -45,8 +45,8 @@ public:
     ///
     /// \param weight the weight of the request
     /// \param size the size of the request
-    fair_queue_ticket(uint32_t weight, uint32_t size);
-    fair_queue_ticket() {}
+    fair_queue_ticket(uint32_t weight, uint32_t size) noexcept;
+    fair_queue_ticket() noexcept {}
     fair_queue_ticket operator+(fair_queue_ticket desc) const;
     fair_queue_ticket operator-(fair_queue_ticket desc) const;
     /// Increase the quantity represented in this ticket by the amount represented by \c desc

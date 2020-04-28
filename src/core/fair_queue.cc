@@ -28,6 +28,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
+#include <mutex>
 
 #include "fmt/format.h"
 #include "fmt/ostream.h"
@@ -128,6 +129,7 @@ bool fair_queue::can_dispatch() const {
 }
 
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
+    std::lock_guard<util::spinlock> g(_fq_lock);
     assert(!_available_classes.empty());
     priority_class_ptr pclass = _available_classes.top();
     pclass->update_shares(shares);
@@ -137,6 +139,7 @@ priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
 }
 
 void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
+    std::lock_guard<util::spinlock> g(_fq_lock);
     assert(pclass->_queue.empty());
     _available_classes.push(pclass);
     _registered_classes.erase(pclass);

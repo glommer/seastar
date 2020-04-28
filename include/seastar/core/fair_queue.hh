@@ -24,6 +24,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <seastar/util/spinlock.hh>
 #include <queue>
 #include <chrono>
 #include <unordered_set>
@@ -178,6 +179,7 @@ private:
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
     prioq _handles;
+    util::spinlock _fq_lock;
 
     static constexpr size_t max_classes = 1024;
     // We won't use an array or other static storage to save on stack space. It can grow pretty big pretty quick

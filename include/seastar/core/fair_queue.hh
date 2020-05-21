@@ -193,6 +193,8 @@ private:
 
     float normalize_factor() const;
 
+    void update_cost(priority_class_ptr h, const fair_queue_ticket& t);
+
     void normalize_stats();
 
     bool can_dispatch() const;

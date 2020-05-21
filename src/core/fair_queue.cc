@@ -175,6 +175,22 @@ void fair_queue::notify_requests_finished(fair_queue_ticket desc) {
     _resources_executing -= desc;
 }
 
+void basic_fair_queue::update_cost(priority_class_ptr h, const fair_queue_ticket& t) {
+    auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
+    auto req_cost  = t.normalize(_maximum_capacity) / h->_shares;
+    auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
+    float next_accumulated = h->_accumulated + cost;
+    while (std::isinf(next_accumulated)) {
+        normalize_stats();
+        // If we have renormalized, our time base will have changed. This should happen very infrequently
+        delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
+        cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
+        next_accumulated = h->_accumulated + cost;
+    }
+    h->_accumulated = next_accumulated;
+
+}
+
 void fair_queue::dispatch_requests() {
     while (can_dispatch()) {
         priority_class_ptr h;
@@ -189,18 +205,7 @@ void fair_queue::dispatch_requests() {
         _requests_executing++;
         _requests_queued--;
 
-        auto delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-        auto req_cost  = req.desc.normalize(_maximum_capacity) / h->_shares;
-        auto cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
-        float next_accumulated = h->_accumulated + cost;
-        while (std::isinf(next_accumulated)) {
-            normalize_stats();
-            // If we have renormalized, our time base will have changed. This should happen very infrequently
-            delta = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _base);
-            cost  = expf(1.0f/_config.tau.count() * delta.count()) * req_cost;
-            next_accumulated = h->_accumulated + cost;
-        }
-        h->_accumulated = next_accumulated;
+        update_cost(h, req.desc);
 
         if (!h->_queue.empty()) {
             push_priority_class(h);

@@ -86,6 +86,9 @@ public:
     /// It is however not legal for the axis to have any quantity set to zero.
     /// \param axis another \ref fair_queue_ticket to be used as a a base vector against which to normalize this fair_queue_ticket.
     float normalize(fair_queue_ticket axis) const;
+
+    /// clamps the the quantities in this \ref fair_queue_ticket so that none of them are lower than \c lo or bigger than \c hi
+    void clamp(fair_queue_ticket lo, fair_queue_ticket hi);
 };
 
 /// \addtogroup io-module

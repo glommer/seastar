@@ -45,6 +45,11 @@ float fair_queue_ticket::normalize(fair_queue_ticket denominator) const {
     return float(_weight) / denominator._weight + float(_size) / denominator._size;
 }
 
+void fair_queue_ticket::clamp(fair_queue_ticket lo, fair_queue_ticket hi) {
+    _weight = std::clamp(_weight, lo._weight, hi._weight);
+    _size = std::clamp(_size, lo._size, hi._size);
+}
+
 fair_queue_ticket fair_queue_ticket::operator+(fair_queue_ticket desc) const {
     return fair_queue_ticket(_weight + desc._weight, _size + desc._size);
 }

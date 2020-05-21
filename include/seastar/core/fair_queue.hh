@@ -102,6 +102,7 @@ class priority_class {
         noncopyable_function<void()> func;
         fair_queue_ticket desc;
     };
+    friend class multishard_fair_queue;
     friend class fair_queue;
     friend class basic_fair_queue;
     uint32_t _shares = 1u;
@@ -112,6 +113,9 @@ class priority_class {
     void update_shares(uint32_t shares) {
         _shares = (std::max(shares, 1u));
     }
+
+    std::atomic<fair_queue_ticket> _ticket_ask;
+    std::atomic<fair_queue_ticket> _ticket_grant;
 public:
     /// \brief return the current amount of shares for this priority class
     uint32_t shares() const {
@@ -196,8 +200,18 @@ protected:
     virtual void release_executing_resources(fair_queue_ticket t) = 0;
     virtual void dispatch_local_requests() = 0;
     virtual fair_queue_ticket resources_currently_waiting() const = 0;
+    virtual void add_capacity(fair_queue_ticket t) = 0;
+    virtual void remove_capacity(fair_queue_ticket t) = 0;
 
     basic_fair_queue(config cfg);
+    explicit basic_fair_queue(basic_fair_queue& bfq, uint32_t shares);
+private:
+    basic_fair_queue* _reservoir = nullptr;
+    priority_class_ptr _rptr = nullptr;
+
+    basic_fair_queue(config cfg, basic_fair_queue* reservoir, uint32_t shares);
+    void consume_grant();
+    void publish_ask(priority_class_ptr pc, fair_queue_ticket desc);
 public:
     /// Registers a priority class against this fair queue.
     ///
@@ -222,6 +236,8 @@ public:
     static void update_shares(priority_class_ptr pc, uint32_t new_shares);
 };
 
+class multishard_fair_queue;
+
 class fair_queue : public basic_fair_queue {
     fair_queue_ticket _resources_queued;
     fair_queue_ticket _current_capacity;
@@ -234,11 +250,22 @@ class fair_queue : public basic_fair_queue {
 
     virtual void release_executing_resources(fair_queue_ticket t) override;
     virtual void dispatch_local_requests() override;
+    virtual void add_capacity(fair_queue_ticket t) override;
+    virtual void remove_capacity(fair_queue_ticket t) override;
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
     /// \param cfg an instance of the class \ref config
     explicit fair_queue(config cfg);
+
+    /// Constructs a fair queue connected to a \ref multishard_fair_queue.
+    ///
+    /// The \ref multishard_fair_queue will lend capacity to this fair_queue and
+    /// a group of others connected to it.
+    ///
+    /// \param reservoir a reference to the multishard_fair_queue
+    /// \param shares number of shares this fair_queue has
+    explicit fair_queue(multishard_fair_queue& reservoir, uint32_t shares = 1);
 
     /// Constructs a fair queue with a given \c capacity, expressed in IOPS.
     ///
@@ -270,6 +297,28 @@ public:
     /// request finishes executing - regardless of success or failure.
     void queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyable_function<void()> func);
 };
-/// @}
 
+class multishard_fair_queue : public basic_fair_queue {
+    std::atomic<fair_queue_ticket> _resources_queued;
+    std::atomic<fair_queue_ticket> _current_capacity;
+    std::atomic<fair_queue_ticket> _resources_executing;
+
+    fair_queue_ticket available_resources() const;
+
+    friend class fair_queue;
+
+    static void atomic_add(std::atomic<fair_queue_ticket>& t, fair_queue_ticket rhs,
+            std::memory_order memory_order_success = std::memory_order_relaxed);
+    static void atomic_sub(std::atomic<fair_queue_ticket>& t, fair_queue_ticket rhs,
+            std::memory_order memory_order_success = std::memory_order_relaxed);
+
+    virtual void add_capacity(fair_queue_ticket t) override;
+    virtual void remove_capacity(fair_queue_ticket t) override;
+    virtual void release_executing_resources(fair_queue_ticket t) override;
+    virtual void dispatch_local_requests() override;
+    virtual fair_queue_ticket resources_currently_waiting() const override;
+public:
+    explicit multishard_fair_queue(config cfg);
+};
+/// @}
 }

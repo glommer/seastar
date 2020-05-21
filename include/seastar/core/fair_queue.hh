@@ -103,6 +103,7 @@ class priority_class {
         fair_queue_ticket desc;
     };
     friend class fair_queue;
+    friend class basic_fair_queue;
     uint32_t _shares = 1u;
     float _accumulated = 0;
     circular_buffer<request> _queue;
@@ -148,7 +149,7 @@ using priority_class_ptr = priority_class*;
 /// When the classes that lag behind start seeing requests, the fair queue will serve
 /// them first, until balance is restored. This balancing is expected to happen within
 /// a certain time window that obeys an exponential decay.
-class fair_queue {
+class basic_fair_queue {
 public:
     /// \brief Fair Queue configuration structure.
     ///
@@ -159,7 +160,7 @@ public:
         unsigned max_req_count = std::numeric_limits<unsigned>::max();
         unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
     };
-private:
+protected:
     friend priority_class;
 
     struct class_compare {
@@ -170,11 +171,6 @@ private:
 
     config _config;
     fair_queue_ticket _maximum_capacity;
-    fair_queue_ticket _current_capacity;
-    fair_queue_ticket _resources_executing;
-    fair_queue_ticket _resources_queued;
-    unsigned _requests_executing = 0;
-    unsigned _requests_queued = 0;
     using clock_type = std::chrono::steady_clock::time_point;
     clock_type _base;
     using prioq = std::priority_queue<priority_class_ptr, std::vector<priority_class_ptr>, class_compare>;
@@ -197,7 +193,47 @@ private:
 
     void normalize_stats();
 
+    virtual void release_executing_resources(fair_queue_ticket t) = 0;
+    virtual void dispatch_local_requests() = 0;
+    virtual fair_queue_ticket resources_currently_waiting() const = 0;
+
+    basic_fair_queue(config cfg);
+public:
+    /// Registers a priority class against this fair queue.
+    ///
+    /// \param shares, how many shares to create this class with
+    priority_class_ptr register_priority_class(uint32_t shares);
+
+    /// Unregister a priority class.
+    ///
+    /// It is illegal to unregister a priority class that still have pending requests.
+    void unregister_priority_class(priority_class_ptr pclass);
+
+    /// Notifies that ont request finished
+    /// \param desc an instance of \c fair_queue_ticket structure describing the request that just finished.
+    void notify_requests_finished(fair_queue_ticket desc);
+
+    /// Try to execute new requests if there is capacity left in the queue.
+    void dispatch_requests();
+
+    /// Updates the current shares of this priority class
+    ///
+    /// \param new_shares the new number of shares for this priority class
+    static void update_shares(priority_class_ptr pc, uint32_t new_shares);
+};
+
+class fair_queue : public basic_fair_queue {
+    fair_queue_ticket _resources_queued;
+    fair_queue_ticket _current_capacity;
+    fair_queue_ticket _resources_executing;
+
+    unsigned _requests_executing = 0;
+    unsigned _requests_queued = 0;
+
     bool can_dispatch() const;
+
+    virtual void release_executing_resources(fair_queue_ticket t) override;
+    virtual void dispatch_local_requests() override;
 public:
     /// Constructs a fair queue with configuration parameters \c cfg.
     ///
@@ -211,15 +247,11 @@ public:
     explicit fair_queue(unsigned capacity, std::chrono::microseconds tau = std::chrono::milliseconds(100))
         : fair_queue(config{tau, capacity}) {}
 
-    /// Registers a priority class against this fair queue.
-    ///
-    /// \param shares, how many shares to create this class with
-    priority_class_ptr register_priority_class(uint32_t shares);
+    /// \return how much resources (weight, size) are currently queued for all classes.
+    virtual fair_queue_ticket resources_currently_waiting() const override;
 
-    /// Unregister a priority class.
-    ///
-    /// It is illegal to unregister a priority class that still have pending requests.
-    void unregister_priority_class(priority_class_ptr pclass);
+    /// \return the amount of resources (weight, size) currently executing
+    fair_queue_ticket resources_currently_executing() const;
 
     /// \return how many waiters are currently queued for all classes.
     [[deprecated("fair_queue users should not track individual requests, but resources (weight, size) passing through the queue")]]
@@ -229,12 +261,6 @@ public:
     [[deprecated("fair_queue users should not track individual requests, but resources (weight, size) passing through the queue")]]
     size_t requests_currently_executing() const;
 
-    /// \return how much resources (weight, size) are currently queued for all classes.
-    fair_queue_ticket resources_currently_waiting() const;
-
-    /// \return the amount of resources (weight, size) currently executing
-    fair_queue_ticket resources_currently_executing() const;
-
     /// Queue the function \c func through this class' \ref fair_queue, with weight \c weight
     ///
     /// It is expected that \c func doesn't throw. If it does throw, it will be just removed from
@@ -243,18 +269,6 @@ public:
     /// The user of this interface is supposed to call \ref notify_requests_finished when the
     /// request finishes executing - regardless of success or failure.
     void queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyable_function<void()> func);
-
-    /// Notifies that ont request finished
-    /// \param desc an instance of \c fair_queue_ticket structure describing the request that just finished.
-    void notify_requests_finished(fair_queue_ticket desc);
-
-    /// Try to execute new requests if there is capacity left in the queue.
-    void dispatch_requests();
-
-    /// Updates the current shares of this priority class
-    ///
-    /// \param new_shares the new number of shares for this priority class
-    static void update_shares(priority_class_ptr pc, uint32_t new_shares);
 };
 /// @}
 

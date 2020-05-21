@@ -83,10 +83,9 @@ std::ostream& operator<<(std::ostream& os, fair_queue_ticket t) {
     return os << t._weight << ":" << t._size;
 }
 
-fair_queue::fair_queue(config cfg)
+basic_fair_queue::basic_fair_queue(config cfg)
     : _config(std::move(cfg))
     , _maximum_capacity(_config.max_req_count, _config.max_bytes_count)
-    , _current_capacity(_config.max_req_count, _config.max_bytes_count)
     , _base(std::chrono::steady_clock::now())
     , _all_classes(max_classes)
 {
@@ -95,14 +94,14 @@ fair_queue::fair_queue(config cfg)
     }
 }
 
-void fair_queue::push_priority_class(priority_class_ptr pc) {
+void basic_fair_queue::push_priority_class(priority_class_ptr pc) {
     if (!pc->_queued) {
         _handles.push(pc);
         pc->_queued = true;
     }
 }
 
-priority_class_ptr fair_queue::pop_priority_class() {
+priority_class_ptr basic_fair_queue::pop_priority_class() {
     assert(!_handles.empty());
     auto h = _handles.top();
     _handles.pop();
@@ -111,11 +110,15 @@ priority_class_ptr fair_queue::pop_priority_class() {
     return h;
 }
 
-float fair_queue::normalize_factor() const {
+void basic_fair_queue::notify_requests_finished(fair_queue_ticket desc) {
+    release_executing_resources(desc);
+}
+
+float basic_fair_queue::normalize_factor() const {
     return std::numeric_limits<float>::min();
 }
 
-void fair_queue::normalize_stats() {
+void basic_fair_queue::normalize_stats() {
     auto time_delta = std::log(normalize_factor()) * _config.tau;
     // time_delta is negative; and this may advance _base into the future
     _base -= std::chrono::duration_cast<clock_type::duration>(time_delta);
@@ -128,7 +131,7 @@ bool fair_queue::can_dispatch() const {
     return _resources_queued && (_resources_executing < _current_capacity);
 }
 
-priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
+priority_class_ptr basic_fair_queue::register_priority_class(uint32_t shares) {
     std::lock_guard<util::spinlock> g(_fq_lock);
     assert(!_available_classes.empty());
     priority_class_ptr pclass = _available_classes.top();
@@ -138,12 +141,25 @@ priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
     return pclass;
 }
 
-void fair_queue::unregister_priority_class(priority_class_ptr pclass) {
+void basic_fair_queue::unregister_priority_class(priority_class_ptr pclass) {
     std::lock_guard<util::spinlock> g(_fq_lock);
     assert(pclass->_queue.empty());
     _available_classes.push(pclass);
     _registered_classes.erase(pclass);
 }
+
+void basic_fair_queue::update_shares(priority_class_ptr pc, uint32_t new_shares) {
+    pc->update_shares(new_shares);
+}
+
+void basic_fair_queue::dispatch_requests() {
+    dispatch_local_requests();
+}
+
+fair_queue::fair_queue(config cfg)
+    : basic_fair_queue(std::move(cfg))
+    , _current_capacity(_config.max_req_count, _config.max_bytes_count)
+{}
 
 size_t fair_queue::waiters() const {
     return _requests_queued;
@@ -171,7 +187,7 @@ void fair_queue::queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyabl
     _requests_queued++;
 }
 
-void fair_queue::notify_requests_finished(fair_queue_ticket desc) {
+void fair_queue::release_executing_resources(fair_queue_ticket desc) {
     _resources_executing -= desc;
 }
 
@@ -191,7 +207,7 @@ void basic_fair_queue::update_cost(priority_class_ptr h, const fair_queue_ticket
 
 }
 
-void fair_queue::dispatch_requests() {
+void fair_queue::dispatch_local_requests() {
     while (can_dispatch()) {
         priority_class_ptr h;
         do {
@@ -212,10 +228,6 @@ void fair_queue::dispatch_requests() {
         }
         req.func();
     }
-}
-
-void fair_queue::update_shares(priority_class_ptr pc, uint32_t new_shares) {
-    pc->update_shares(new_shares);
 }
 
 }
